@@ -2,7 +2,7 @@
   "schema": 1,
   "description": "Only the current Rust voucher tool and its effective specifications may be published.",
   "patterns": [
-    ".gitignore", "README.md", "LICENSE",
+    ".gitignore", ".gitattributes", "README.md", "LICENSE",
     ".github/workflows/windows.yml",
     "tools/public-source.json", "tools/prepare-source.py",
     "docs/windows-release.md",
