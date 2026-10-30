@@ -3,9 +3,9 @@ name: Windows x64 checks and test package
 on:
   push:
     branches: [main]
-    paths: ['app/**', '.github/workflows/windows.yml']
+    paths: ['app/**', '.github/workflows/windows.yml', '.gitattributes']
   pull_request:
-    paths: ['app/**', '.github/workflows/windows.yml']
+    paths: ['app/**', '.github/workflows/windows.yml', '.gitattributes']
   workflow_dispatch:
 
 permissions:

@@ -658,8 +658,13 @@ pub fn build_voucher(
         let catalog = document.add_object(dictionary! {"Type"=>"Catalog", "Pages"=>page_root});
         document.trailer.set("Root", catalog);
         document.prune_objects();
-        document.save(&temporary)?;
-        fs::File::open(&temporary)?.sync_all()?;
+        // Windows FlushFileBuffers requires write access. Keep the writer's
+        // handle instead of reopening the saved PDF as read-only for sync.
+        document
+            .save(&temporary)
+            .context("临时PDF写入失败")?
+            .sync_all()
+            .context("临时PDF同步到磁盘失败")?;
         cancelled(cancel)?;
         let verify = Document::load(&temporary)?;
         if verify.get_pages().len() as u32 != manifest.pages {
