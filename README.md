@@ -6,7 +6,7 @@
 
 ## Windows使用
 
-目标为Windows10/11 x64，第一版采用ZIP测试包。解压整个目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
+目标为Windows10/11 x64，第一版采用ZIP测试包。[0.4.0测试构件](https://github.com/thising/voucher-workbench/actions/runs/41095798149/artifacts/12996932068)已通过Windows CI，客户Windows10实机验收待完成。构件需登录GitHub下载，保留14天；内含程序ZIP和校验值，详见[发行说明](docs/windows-release.md)。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
 
 随包提供CPU OCR模型和ONNX Runtime；方向识别仍默认关闭。Windows VC++运行库要求及缺失处理见[发行说明](docs/windows-release.md)。处理记录默认保存在 `%LOCALAPPDATA%\VoucherWorkbench`，移动或替换程序目录不会删除记录；输入与PDF输出仍在选择的资料目录。
 

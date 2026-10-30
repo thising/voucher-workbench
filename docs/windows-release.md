@@ -2,7 +2,22 @@
 
 当前发布目标：0.4.0，Windows10/11 x64，CPU OCR，ZIP测试包。功能基线采用默认关闭方向识别、启用时明确同意且全部待输出图片人工确认的流程。
 
-当前状态：本地实现和59项自动测试通过，PowerShell脚本解析、验包正例及4项拒绝用例、actionlint通过；Windows CI、ZIP产物及客户Windows10验收分别待验证。此页是唯一发布状态入口，更新结果时不把源码检查、CI配置文件或本机macOS运行当作Windows成品。
+当前状态（2026-10-31）：Windows MSVC检查、完整打包及随包程序冒烟均已通过，ZIP测试包已生成并下载独立核验；客户Windows10实际验收待完成。此页是唯一发布状态入口，CI的Windows Server 2022环境不能替代客户Windows10实测。
+
+## 已验证测试包
+
+- 公开源码：[thising/voucher-workbench](https://github.com/thising/voucher-workbench)，仅包含当前工具与有效规格。
+- 完整构建与验证：[Windows CI #4](https://github.com/thising/voucher-workbench/actions/runs/41095798149)。构建源码为 [`f36b69a`](https://github.com/thising/voucher-workbench/commit/f36b69a2abfb5103d4cf01ec6d6ab1e7b0632dcb)；后续文档更新不改变该包内容。
+- 下载：[Windows x64测试构件](https://github.com/thising/voucher-workbench/actions/runs/41095798149/artifacts/12996932068)，需登录GitHub，构件保留14天。下载得到的Actions归档内包含程序ZIP及SHA256文件；尚未创建公开Release。
+- 程序包：`voucher-workbench-0.4.0-windows-x64.zip`，28,749,639字节（约27.4MiB）。SHA256如下，校验对象是程序包而非外层Actions归档：
+
+```text
+864960551432973f47931bf624528e51ae701c6320795d92bf235ca50d3169f7
+```
+
+Windows CI通过60项测试，另1项依赖本地私有资料的OCR测试按设计忽略。格式、Clippy及JS语法检查通过。实际解压包从中文含空格路径及不同工作目录启动，成功加载随包OCR，验证原向合并、未同意/未人工确认时禁止生成、人工旋转修正、生成4页PDF、退出重启及结果复用。
+
+下载后已独立核对ZIP校验值、429个有效载荷文件的大小与hash、模型固定hash、三个PE文件的x64架构及两份DLL与官方原包的一致性；没有清单外文件。主程序静态链接Rust CRT；OCR DLL仍依赖微软VC++运行库。macOS另有59项测试、PowerShell解析、验包正例及4项拒绝用例和actionlint通过。
 
 ## 交付方式
 
