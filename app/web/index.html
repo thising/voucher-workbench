@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>凭证工作台 · 本地 PDF 整理</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#" aria-label="凭证工作台首页"><span class="brand-mark">凭</span><span>凭证工作台<small>VOUCHER WORKBENCH</small></span></a>
+      <div class="sidebar-label">本地资料整理</div>
+      <nav aria-label="主导航">
+        <button class="nav-button active" id="nav-work" type="button"><span data-icon="layers"></span>工作台<span class="nav-dot"></span></button>
+        <button class="nav-button" id="nav-history" type="button"><span data-icon="history"></span>处理记录<span class="nav-count" id="history-count">0</span></button>
+      </nav>
+      <div class="workflow-map"><div class="sidebar-label">处理流程</div><ol><li class="current" id="step-source"><span>1</span><div>选择资料<small>明细账与分项文件夹</small></div></li><li id="step-review"><span>2</span><div>核对内容<small>匹配凭证 · 检查方向</small></div></li><li id="step-export"><span>3</span><div>生成 PDF<small>每个凭证单独交付</small></div></li></ol></div>
+      <div class="local-note"><span data-icon="shield"></span><strong>资料只在本机处理</strong><p>不上传文件，不连接云端。<br>关闭页面不会丢失处理记录。</p><span id="server-version">本地服务</span></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><span class="eyebrow">DOCUMENT WORKSPACE</span><h1 id="page-title">让凭证各就其位</h1><p id="page-subtitle">选择资料，核对方向，按明细账生成独立 PDF。</p></div><span class="connection" id="connection"><i></i>正在连接</span></header>
+      <div id="global-alert" class="alert error" role="alert" hidden></div>
+      <section id="work-view">
+        <section class="card source-card" aria-labelledby="source-title">
+          <div class="section-heading"><div><span class="section-number">01</span><h2 id="source-title">资料来源</h2></div><button id="collapse-source" class="text-button" type="button" hidden>收起设置</button></div>
+          <form id="source-form">
+            <div class="source-fields"><label class="field"><span>资料文件夹 <em>必填</em></span><div class="input-with-button"><input id="root-path" name="root" placeholder="选择批次目录，或一个分项文件夹" required autocomplete="off"><button type="button" class="input-button" id="browse-root" title="选择资料文件夹"><span data-icon="folder"></span>浏览</button></div></label>
+            <label class="field"><span>明细账 <small>留空时自动查找</small></span><div class="input-with-button"><input id="ledger-path" name="ledger" placeholder="选择 .xls 或 .xlsx 文件" autocomplete="off"><button type="button" class="input-button" id="browse-ledger" title="选择明细账文件"><span data-icon="file"></span>浏览</button></div></label></div>
+            <div class="source-sheet-row" id="source-sheet-row" hidden><label for="source-sheet-select">指定工作表</label><select id="source-sheet-select"></select><span id="source-sheet-note">默认第一个工作表</span></div>
+            <div class="source-footer"><p><span data-icon="info"></span>默认读取第一个工作表；同号凭证采用表内第一条科目名称。</p><button class="primary-button" id="scan-button" type="submit"><span data-icon="search"></span>扫描资料</button></div>
+          </form>
+          <div id="source-summary" class="source-summary" hidden></div>
+        </section>
+        <section id="welcome" class="welcome"><div class="welcome-illustration" aria-hidden="true"><div class="paper back"></div><div class="paper front"><span></span><span></span><span></span><i>PDF</i></div><span class="check-seal">✓</span></div><h2>从一份明细账开始</h2><p>图片与 PDF 按数字序号整理，默认按原图方向生成。<br>可选标题方向识别；启用后须人工核对全部图片。<br>完成后，文件会保存在各分项同级的「分项-PDF」文件夹。</p><div class="welcome-tags"><span>本地运行</span><span>自动命名</span><span>方向识别可选</span></div></section>
+        <div id="workspace" hidden>
+          <section class="stats" aria-label="资料概况"><article class="stat"><span>凭证匹配</span><strong id="stat-match">—</strong><small id="stat-match-note">按所选工作表</small></article><article class="stat"><span>源文档页数</span><strong id="stat-pages">—</strong><small id="stat-files">—</small></article><article class="stat attention"><span>待人工确认</span><strong id="stat-review">—</strong><small id="stat-unprocessed">—</small></article><article class="stat"><span>需处理的问题</span><strong id="stat-errors">—</strong><small id="stat-ignored">—</small></article></section>
+          <section class="card batch-bar"><div class="sheet-field"><label for="sheet-select">匹配工作表</label><select id="sheet-select"></select><span id="sheet-status"></span></div><div class="batch-actions"><button class="primary-button" id="generate-button" type="button"><span data-icon="download"></span>批量生成 PDF</button></div></section>
+          <section class="card orientation-card" aria-labelledby="orientation-title">
+            <div class="orientation-heading"><h2 id="orientation-title">可选：标题方向识别</h2><span id="orientation-mode" class="status-pill">默认关闭</span></div>
+            <label class="orientation-choice"><input type="checkbox" id="orientation-enabled" aria-describedby="orientation-disclaimer"><span>启用标题方向识别，并同意以下免责声明</span></label>
+            <div id="orientation-disclaimer" class="orientation-disclaimer"><strong>使用须知与免责声明</strong><ul>
+              <li>历史样本（3,270 张图片）的 4 并行评估约需 23 分钟；当前界面串行执行可能更久，实际耗时随设备和资料变化。</li>
+              <li>识别可能误转、漏转或遇到混排。样本中 39 / 3,270（1.19%）为未决率，不是准确率；240 张方向明确样本抽查未见错误，不代表全批或新资料 100% 正确。</li>
+              <li>启用后须等识别完成，再逐页核对、修正并确认全部图片；也可明确勾选已核对的页面后确认。同意本说明不构成准确性保证。</li>
+            </ul></div>
+            <ol class="orientation-steps" id="orientation-steps" aria-label="方向识别阶段" hidden><li id="orientation-step-consent">1 · 同意说明</li><li id="orientation-step-analysis">2 · 完成识别</li><li id="orientation-step-review">3 · 人工核对全部图片</li></ol>
+            <div class="orientation-actions"><p id="orientation-stage" role="status"></p><div><button class="text-button" id="disable-orientation" type="button" hidden>关闭识别，按原方向生成</button><button class="secondary-button" id="analyze-button" type="button"><span data-icon="scan"></span>识别标题方向</button></div></div>
+          </section>
+          <details class="card issue-panel" id="issue-panel" hidden><summary><span data-icon="alert"></span><span id="issue-summary">扫描问题</span></summary><div id="issue-list"></div></details>
+          <p class="orientation-method"><span data-icon="scan"></span><span id="orientation-method">方向识别默认关闭，可按原图方向生成，也可手动旋转。</span></p>
+          <section class="review-workspace" aria-label="凭证与页面复核">
+            <aside class="card voucher-panel"><div class="panel-title"><h2>凭证清单</h2><span id="voucher-count" class="count-pill">0</span></div><label class="search-input"><span data-icon="search"></span><input id="voucher-search" placeholder="搜索编号或科目" aria-label="搜索凭证"></label><div id="voucher-list" class="voucher-list"></div></aside>
+            <section class="card review-panel"><div class="review-heading"><div><div class="overline" id="voucher-item">分项</div><h2 id="voucher-title">选择凭证</h2><p id="voucher-subject">—</p></div><button id="generate-one" class="secondary-button compact" type="button"><span data-icon="download"></span>生成此凭证</button></div>
+              <div id="voucher-note" class="voucher-note"></div>
+              <div class="preview-layout"><div class="preview-column"><div class="preview-toolbar"><span id="preview-filename">请选择文件</span><button id="open-original" class="icon-button" title="在新窗口打开原件" aria-label="打开原件" type="button"><span data-icon="external"></span></button></div><div class="preview-stage" id="preview-stage"><div class="empty-inline">选择页面，检查内容方向</div></div><div class="rotation-toolbar"><div class="rotation-buttons"><button type="button" id="rotate-left" title="逆时针旋转90°，并人工确认此页"><span data-icon="rotate-left"></span><span>左转并确认</span></button><button type="button" id="rotate-flip" title="旋转180°，并人工确认此页"><span data-icon="flip"></span><span>180°并确认</span></button><button type="button" id="rotate-right" title="顺时针旋转90°，并人工确认此页"><span data-icon="rotate-right"></span><span>右转并确认</span></button></div><button type="button" id="confirm-file" class="secondary-button compact"><span data-icon="check"></span>确认方向</button></div><div class="file-detail" id="file-detail"></div></div>
+              <div class="pages-column"><div class="pages-heading"><label for="page-filter">页面复核</label><select id="page-filter"><option value="all">全部文件</option><option value="review">待人工确认</option><option value="unprocessed">待识别标题</option><option value="rotated">已旋转</option><option value="error">有问题</option></select></div><p id="review-guidance" class="review-guidance"></p><div class="selection-bar"><label><input type="checkbox" id="select-visible">选择本页</label><button id="confirm-selection" type="button" class="text-button" disabled>确认所选</button></div><div class="thumbnails" id="thumbnails"></div><div class="pagination"><button type="button" id="prev-page" class="icon-button" title="上一页" aria-label="上一页"><span data-icon="chevron-left"></span></button><span id="page-count">0 / 0</span><button type="button" id="next-page" class="icon-button" title="下一页" aria-label="下一页"><span data-icon="chevron-right"></span></button></div></div></div>
+            </section>
+          </section>
+        </div>
+        <section class="card job-panel" id="job-panel" hidden><div class="job-heading"><div><span class="section-number">03</span><h2 id="job-title">处理进度</h2><span class="status-pill" id="job-status"></span></div><div class="job-actions"><button id="cancel-job" type="button" class="secondary-button compact">取消任务</button><button id="retry-job" type="button" class="secondary-button compact" hidden>继续 / 重试</button><button id="download-report" type="button" class="text-button" hidden><span data-icon="download"></span>下载报告</button></div></div><div class="progress-meta"><span id="job-current">准备中</span><strong id="job-progress-text">0 / 0</strong></div><div class="progress-track"><div id="job-progress"></div></div><div id="job-error" class="alert error" hidden></div><div id="job-results" class="job-results"></div><div id="output-actions" class="output-actions"></div></section>
+      </section>
+      <section id="history-view" hidden><div class="history-intro"><h2>可接着上次继续</h2><p>扫描计划、方向复核与处理结果均保存在本机。</p><button type="button" id="refresh-history" class="secondary-button compact"><span data-icon="refresh"></span>刷新记录</button></div><div id="history-list"></div></section>
+      <footer class="page-footer"><span>凭证工作台</span><span>一份凭证，一份清楚的交付。</span></footer>
+    </main>
+  </div>
+  <dialog id="browser-dialog" class="dialog browser-dialog"><div class="dialog-heading"><div><span class="eyebrow">LOCAL FILES</span><h2 id="browser-title">选择资料文件夹</h2></div><button type="button" class="icon-button" id="close-browser" aria-label="关闭"><span data-icon="close"></span></button></div><form id="browser-path-form" class="browser-path"><button type="button" id="browser-up" class="icon-button" title="上一级" aria-label="上一级"><span data-icon="up"></span></button><input id="browser-path-input" aria-label="当前路径" autocomplete="off"><button class="secondary-button compact" type="submit">前往</button></form><div id="browser-error" class="alert error" hidden></div><div id="browser-entries" class="browser-entries"></div><div class="dialog-footer"><span id="browser-selected">选择文件夹后点击确定</span><button id="browser-choose" type="button" class="primary-button">选择此文件夹</button></div></dialog>
+  <dialog id="generate-dialog" class="dialog"><div class="dialog-heading"><div><span class="eyebrow">EXPORT PDF</span><h2>准备生成 PDF</h2></div><button type="button" id="close-generate" class="icon-button" aria-label="关闭"><span data-icon="close"></span></button></div><div id="generate-summary" class="generate-summary"></div><div class="dialog-footer"><span>源文件保持不变</span><button type="button" id="start-generate" class="primary-button"><span data-icon="download"></span>开始生成</button></div></dialog>
+  <dialog id="confirm-dialog" class="dialog small-dialog"><div class="dialog-heading"><h2>确认页面方向</h2></div><p id="confirm-message"></p><div class="dialog-footer"><button type="button" id="confirm-cancel" class="secondary-button">返回检查</button><button type="button" id="confirm-accept" class="primary-button">确认所选方向</button></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "crate": "atoi_simd",
+  "version": "0.16.1",
+  "source_commit": "a07b61bc6d7cd704fe31ddb7db9f804436ed7a0f",
+  "evidence": "crates.io package .cargo_vcs_info.json; published crate omits its license files",
+  "files": [
+    {
+      "file": "LICENSE-MIT",
+      "sha256": "f155f18a8148391a82157dae8f5a300bb32fec6a338ae19dcb52de6f2f3dbe21",
+      "url": "https://raw.githubusercontent.com/RoDmitry/atoi_simd/a07b61bc6d7cd704fe31ddb7db9f804436ed7a0f/LICENSE-MIT"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "sha256": "18d98423c078c531baafb7ed6248639fca1a45c718f2fd2bbf249c56127b2e3b",
+      "url": "https://raw.githubusercontent.com/RoDmitry/atoi_simd/a07b61bc6d7cd704fe31ddb7db9f804436ed7a0f/LICENSE-APACHE"
+    }
+  ]
+}

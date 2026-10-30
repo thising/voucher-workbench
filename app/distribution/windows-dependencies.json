@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "rust_toolchain": "1.99.1",
+  "target": "x86_64-pc-windows-msvc",
+  "runtime": {
+    "name": "ONNX Runtime CPU",
+    "version": "1.23.2",
+    "archive": "onnxruntime-win-x64-1.23.2.zip",
+    "directory": "onnxruntime-win-x64-1.23.2",
+    "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip",
+    "sha256": "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd",
+    "bytes": 78127794,
+    "source": "https://github.com/microsoft/onnxruntime/releases/tag/v1.23.2",
+    "license": "MIT"
+  }
+}
