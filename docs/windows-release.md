@@ -2,22 +2,22 @@
 
 当前发布目标：0.4.1，Windows10/11 x64，CPU OCR，ZIP测试包。PDF处理记录迁入程序数据目录；默认关闭方向识别、启用时明确同意且全部待输出图片人工确认的流程不变。
 
-当前状态（2026-10-31）：0.4.1的记录路径变更已实现，本地69项测试、Clippy、格式及PowerShell语法检查通过，另1项私有OCR测试按设计忽略；Windows CI和新版ZIP待验证。下列0.4.0构建结果仅为历史基线，不代表0.4.1已通过。客户Windows10实际验收仍待完成。此页是唯一发布状态入口，CI的Windows Server 2022环境不能替代客户Windows10实测。
+当前状态（2026-10-31）：0.4.1记录路径变更、本地回归、Windows MSVC检查、完整打包及随包程序冒烟均已通过；新版ZIP已下载并独立核验。客户Windows10实际验收待完成。此页是唯一发布状态入口，CI的Windows Server 2022环境不能替代客户Windows10实测。
 
-## 0.4.0测试包（历史基线）
+## 已验证的0.4.1测试包
 
 - 公开源码：[thising/voucher-workbench](https://github.com/thising/voucher-workbench)，仅包含当前工具与有效规格。
-- 完整构建与验证：[Windows CI #4](https://github.com/thising/voucher-workbench/actions/runs/41095798149)。构建源码为 [`f36b69a`](https://github.com/thising/voucher-workbench/commit/f36b69a2abfb5103d4cf01ec6d6ab1e7b0632dcb)；后续文档更新不改变该包内容。
-- 下载：[Windows x64测试构件](https://github.com/thising/voucher-workbench/actions/runs/41095798149/artifacts/12996932068)，需登录GitHub，构件保留14天。下载得到的Actions归档内包含程序ZIP及SHA256文件；尚未创建公开Release。
-- 程序包：`voucher-workbench-0.4.0-windows-x64.zip`，28,749,639字节（约27.4MiB）。SHA256如下，校验对象是程序包而非外层Actions归档：
+- 完整构建与验证：[Windows CI #6](https://github.com/thising/voucher-workbench/actions/runs/41160637785)。构建源码为 [`1188e17`](https://github.com/thising/voucher-workbench/commit/1188e17604fbf6d82125fbb3a4c6ba90cd389591)；后续文档更新不改变该包内容。
+- 下载：[Windows x64测试构件](https://github.com/thising/voucher-workbench/actions/runs/41160637785/artifacts/13026908712)，需登录GitHub，构件保留14天。下载得到的Actions归档内包含程序ZIP及SHA256文件；尚未创建公开Release。
+- 程序包：`voucher-workbench-0.4.1-windows-x64.zip`，28,767,405字节（约27.4MiB）。SHA256如下，校验对象是程序包而非外层Actions归档：
 
 ```text
-864960551432973f47931bf624528e51ae701c6320795d92bf235ca50d3169f7
+f37d3789c93b50b518cf296707a15e5e280f8f06d05ffacb1b07bda9d0290ff0
 ```
 
-Windows CI通过60项测试，另1项依赖本地私有资料的OCR测试按设计忽略。格式、Clippy及JS语法检查通过。实际解压包从中文含空格路径及不同工作目录启动，成功加载随包OCR，验证原向合并、未同意/未人工确认时禁止生成、人工旋转修正、生成4页PDF、退出重启及结果复用。
+Windows CI通过70项测试，另1项依赖本地私有资料的OCR测试按设计忽略。格式、Clippy及JS语法检查通过。实际解压包从中文含空格路径及不同工作目录启动，成功加载随包OCR，验证原向合并、未同意/未人工确认时禁止生成、人工旋转修正、生成4页PDF、退出重启及结果复用。新增验证覆盖旧旁置记录及.previous残留迁移、冲突/篡改保护、同名输出隔离；随包冒烟确认输出及新历史目录只有PDF，报告快照在重生成和重启后保持正确。
 
-下载后已独立核对ZIP校验值、429个有效载荷文件的大小与hash、模型固定hash、三个PE文件的x64架构及两份DLL与官方原包的一致性；没有清单外文件。主程序静态链接Rust CRT；OCR DLL仍依赖微软VC++运行库。macOS另有59项测试、PowerShell解析、验包正例及4项拒绝用例和actionlint通过。
+下载后已独立核对ZIP校验值、429个有效载荷文件的大小与hash、模型固定hash、三个PE文件的x64架构及两份DLL与官方原包的一致性；没有清单外文件。主程序静态链接Rust CRT；OCR DLL仍依赖微软VC++运行库。macOS通过69项测试和PowerShell语法检查，并在两个不同文件系统上实测生成、OCR、归档、旧记录迁移、报告及重启复用。验包正负例及actionlint沿用未改动构建流程的0.4.0基线结果。
 
 ## 交付方式
 

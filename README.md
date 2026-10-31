@@ -6,7 +6,7 @@
 
 ## Windows使用
 
-目标为Windows10/11 x64，采用ZIP测试包。当前0.4.1将PDF处理记录移入程序数据目录，构建与验证状态见[发行说明](docs/windows-release.md)。此前通过CI的0.4.0测试包仍将记录写在PDF旁，不包含这次变更。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
+目标为Windows10/11 x64，采用ZIP测试包。[0.4.1测试构件](https://github.com/thising/voucher-workbench/actions/runs/41160637785/artifacts/13026908712)已通过Windows CI，将PDF处理记录移入程序数据目录；客户Windows10实机验收待完成。构件需登录GitHub下载，保留14天，校验值及验证范围见[发行说明](docs/windows-release.md)。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
 
 随包提供CPU OCR模型和ONNX Runtime；方向识别仍默认关闭。Windows VC++运行库要求及缺失处理见[发行说明](docs/windows-release.md)。处理记录默认保存在 `%LOCALAPPDATA%\VoucherWorkbench`，移动或替换程序目录不会删除记录；输入与PDF输出仍在选择的资料目录。
 
