@@ -30,6 +30,8 @@ enum Command {
         root: std::path::PathBuf,
         #[arg(value_enum)]
         mode: Mode,
+        #[arg(long)]
+        state_dir: std::path::PathBuf,
     },
 }
 
@@ -42,7 +44,11 @@ enum Mode {
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Create { root } => create(&root),
-        Command::Verify { root, mode } => verify(&root, mode),
+        Command::Verify {
+            root,
+            mode,
+            state_dir,
+        } => verify(&root, mode, &state_dir),
     }
 }
 
@@ -215,10 +221,26 @@ fn page_box(document: &Document, id: ObjectId) -> Result<Vec<f32>> {
         .collect()
 }
 
-fn verify(root: &Path, mode: Mode) -> Result<()> {
+fn verify(root: &Path, mode: Mode, state_dir: &Path) -> Result<()> {
     let output = root.join(OUTPUT);
     let manifest: pdf::Manifest =
-        serde_json::from_slice(&fs::read(output.with_extension("manifest.json"))?)?;
+        serde_json::from_slice(&fs::read(pdf::manifest_path(state_dir, &output)?)?)?;
+    fn check_output_tree(directory: &Path) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                check_output_tree(&path)?;
+            } else {
+                ensure!(
+                    path.extension().is_some_and(|extension| extension == "pdf"),
+                    "Output directory contains non-PDF bookkeeping: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+    check_output_tree(output.parent().unwrap())?;
     ensure!(
         manifest.producer == "voucher-workbench",
         "Unexpected output producer"
@@ -387,6 +409,7 @@ mod tests {
     fn generated_inputs_support_both_workflows_and_detect_output_tampering() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("中文 路径");
+        let state_dir = temp.path().join("隔离 状态");
         create(&root)?;
         ensure!(
             create(&root).is_err(),
@@ -407,13 +430,14 @@ mod tests {
             "Synthetic batch invalid"
         );
         pdf::build_voucher(
+            &state_dir,
             &plan,
             &plan.vouchers[0],
             false,
             &AtomicBool::new(false),
             |_| {},
         )?;
-        verify(&root, Mode::Disabled)?;
+        verify(&root, Mode::Disabled, &state_dir)?;
         plan.orientation_workflow = OrientationWorkflow {
             enabled: true,
             consent_version: Some(ORIENTATION_DISCLAIMER_VERSION.into()),
@@ -429,16 +453,17 @@ mod tests {
             file.rotation_cw = if file.sequence == 2 { 270 } else { 0 };
         }
         pdf::build_voucher(
+            &state_dir,
             &plan,
             &plan.vouchers[0],
             false,
             &AtomicBool::new(false),
             |_| {},
         )?;
-        verify(&root, Mode::Enabled)?;
+        verify(&root, Mode::Enabled, &state_dir)?;
         fs::write(root.join(OUTPUT), b"tampered")?;
         ensure!(
-            verify(&root, Mode::Enabled).is_err(),
+            verify(&root, Mode::Enabled, &state_dir).is_err(),
             "Tampered PDF must fail verification"
         );
         Ok(())

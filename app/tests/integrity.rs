@@ -14,6 +14,7 @@ use lopdf::{
     content::{Content, Operation},
     dictionary, Dictionary, Document, Object, ObjectId, Stream,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use voucher_workbench::{
     jobs::{AppState, GenerateRequest, Job},
@@ -189,8 +190,17 @@ fn output_path(plan: &Plan) -> PathBuf {
     Path::new(&plan.root).join(plan.vouchers[0].output_relative_path.as_ref().unwrap())
 }
 
+fn state_dir(plan: &Plan) -> PathBuf {
+    Path::new(&plan.root).join("state")
+}
+
+fn record_path(plan: &Plan) -> PathBuf {
+    pdf::manifest_path(&state_dir(plan), &output_path(plan)).unwrap()
+}
+
 fn build(plan: &Plan) -> anyhow::Result<BuildResult> {
     pdf::build_voucher(
+        &state_dir(plan),
         plan,
         &plan.vouchers[0],
         false,
@@ -354,9 +364,14 @@ fn cancellation_leaves_no_formal_or_partial_new_output() {
         let fixture = Fixture::new();
         let plan = fixture.plan((1..=page_count).map(|n| fixture.image(n, 40, 20)).collect());
         let cancel = AtomicBool::new(false);
-        let result = pdf::build_voucher(&plan, &plan.vouchers[0], false, &cancel, |_| {
-            cancel.store(true, Ordering::Relaxed)
-        });
+        let result = pdf::build_voucher(
+            &state_dir(&plan),
+            &plan,
+            &plan.vouchers[0],
+            false,
+            &cancel,
+            |_| cancel.store(true, Ordering::Relaxed),
+        );
         assert!(error(result).contains("取消"));
         assert!(!output_path(&plan).exists());
         assert!(!output_path(&plan).with_extension("manifest.json").exists());
@@ -393,9 +408,19 @@ fn correct_outputs_are_reused_and_changed_directions_are_archived() {
         .path();
     let old_pdf = archive.join(first.path.file_name().unwrap());
     assert_eq!(fs::read(&old_pdf).unwrap(), bytes);
-    let old_manifest: Manifest =
-        serde_json::from_slice(&fs::read(old_pdf.with_extension("manifest.json")).unwrap())
-            .unwrap();
+    let old_manifest: Manifest = serde_json::from_slice(
+        &fs::read(
+            record_path(&plan)
+                .parent()
+                .unwrap()
+                .join(".history")
+                .join(archive.file_name().unwrap())
+                .join(first.path.file_name().unwrap())
+                .with_extension("manifest.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(old_manifest.output_sha256, first.manifest.output_sha256);
 }
 
@@ -405,18 +430,20 @@ fn cancellation_during_rebuild_preserves_previous_deliverable() {
     let mut plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
     let original = build(&plan).unwrap();
     let pdf_bytes = fs::read(&original.path).unwrap();
-    let manifest_bytes = fs::read(original.path.with_extension("manifest.json")).unwrap();
+    let manifest_bytes = fs::read(record_path(&plan)).unwrap();
     plan.vouchers[0].files[0].rotation_cw = 90;
     let cancel = AtomicBool::new(false);
-    let result = pdf::build_voucher(&plan, &plan.vouchers[0], false, &cancel, |_| {
-        cancel.store(true, Ordering::Relaxed)
-    });
+    let result = pdf::build_voucher(
+        &state_dir(&plan),
+        &plan,
+        &plan.vouchers[0],
+        false,
+        &cancel,
+        |_| cancel.store(true, Ordering::Relaxed),
+    );
     assert!(error(result).contains("取消"));
     assert_eq!(fs::read(&original.path).unwrap(), pdf_bytes);
-    assert_eq!(
-        fs::read(original.path.with_extension("manifest.json")).unwrap(),
-        manifest_bytes
-    );
+    assert_eq!(fs::read(record_path(&plan)).unwrap(), manifest_bytes);
 }
 
 #[test]
@@ -439,6 +466,250 @@ fn unknown_or_modified_existing_outputs_are_never_overwritten() {
     let altered = fs::read(&path).unwrap();
     assert!(error(build(&plan)).contains("拒绝覆盖"));
     assert_eq!(fs::read(&path).unwrap(), altered);
+}
+
+#[test]
+fn generated_output_has_only_pdf_and_keeps_records_in_state() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+    let output = build(&plan).unwrap();
+    let names: Vec<_> = fs::read_dir(output.path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [output.path.file_name().unwrap()]);
+    let record = record_path(&plan);
+    assert!(record.starts_with(fixture.root.join("state/outputs")));
+    let saved: Manifest = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+    assert_eq!(saved.output_sha256, output.manifest.output_sha256);
+    assert!(build(&plan).unwrap().skipped);
+}
+
+#[test]
+fn owned_legacy_sidecar_migrates_and_reuses_pdf_even_after_interrupted_copy() {
+    for keep_copied_record in [false, true] {
+        let fixture = Fixture::new();
+        let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+        let first = build(&plan).unwrap();
+        let pdf_bytes = fs::read(&first.path).unwrap();
+        let current = record_path(&plan);
+        let legacy = first.path.with_extension("manifest.json");
+        let original = fs::read(&current).unwrap();
+        fs::write(&legacy, &original).unwrap();
+        if !keep_copied_record {
+            fs::remove_file(&current).unwrap();
+        }
+        let next = build(&plan).unwrap();
+        assert!(next.skipped);
+        assert_eq!(fs::read(&first.path).unwrap(), pdf_bytes);
+        assert_eq!(fs::read(&current).unwrap(), original);
+        assert!(!legacy.exists());
+        assert!(build(&plan).unwrap().skipped);
+    }
+}
+
+#[test]
+fn equivalent_legacy_previous_copy_is_removed_before_it_can_be_restored() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+    let first = build(&plan).unwrap();
+    let current = record_path(&plan);
+    let legacy = first.path.with_extension("manifest.json");
+    let previous = legacy.with_extension("json.previous");
+    let original = fs::read(&current).unwrap();
+    // Different JSON whitespace must not turn equivalent records into a conflict.
+    let compact = serde_json::to_vec(&first.manifest).unwrap();
+    assert_ne!(original, compact);
+    fs::write(&legacy, &original).unwrap();
+    fs::write(&previous, compact).unwrap();
+    fs::remove_file(&current).unwrap();
+    for _ in 0..2 {
+        assert!(build(&plan).unwrap().skipped);
+        assert_eq!(fs::read(&current).unwrap(), original);
+        assert_eq!(
+            pdf::sha256_file(&first.path).unwrap(),
+            first.manifest.output_sha256
+        );
+        assert!(!legacy.exists());
+        assert!(!previous.exists());
+    }
+}
+
+#[test]
+fn lone_legacy_previous_copy_is_recovered_and_migrated() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+    let first = build(&plan).unwrap();
+    let current = record_path(&plan);
+    let legacy = first.path.with_extension("manifest.json");
+    let previous = legacy.with_extension("json.previous");
+    let original = fs::read(&current).unwrap();
+    fs::write(&previous, &original).unwrap();
+    fs::remove_file(&current).unwrap();
+    for _ in 0..2 {
+        assert!(build(&plan).unwrap().skipped);
+        assert_eq!(fs::read(&current).unwrap(), original);
+        assert_eq!(
+            pdf::sha256_file(&first.path).unwrap(),
+            first.manifest.output_sha256
+        );
+        assert!(!legacy.exists());
+        assert!(!previous.exists());
+    }
+}
+
+#[test]
+fn conflicting_or_invalid_legacy_previous_copy_preserves_both_originals() {
+    for invalid_json in [false, true] {
+        let fixture = Fixture::new();
+        let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+        let first = build(&plan).unwrap();
+        let current = record_path(&plan);
+        let legacy = first.path.with_extension("manifest.json");
+        let previous = legacy.with_extension("json.previous");
+        let original = fs::read(&current).unwrap();
+        let mut conflicting = first.manifest.clone();
+        conflicting.created_at = "different historical record".into();
+        let previous_bytes = if invalid_json {
+            b"invalid previous JSON".to_vec()
+        } else {
+            serde_json::to_vec(&conflicting).unwrap()
+        };
+        fs::write(&legacy, &original).unwrap();
+        fs::write(&previous, &previous_bytes).unwrap();
+        fs::remove_file(&current).unwrap();
+        for _ in 0..2 {
+            assert!(build(&plan).is_err());
+            assert!(!current.exists(), "conflicting record must not be adopted");
+            assert_eq!(fs::read(&legacy).unwrap(), original);
+            assert_eq!(fs::read(&previous).unwrap(), previous_bytes);
+            assert_eq!(
+                pdf::sha256_file(&first.path).unwrap(),
+                first.manifest.output_sha256
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_legacy_records_are_preserved_without_adopting_outputs() {
+    for invalid in [
+        "producer",
+        "root",
+        "folder",
+        "output_sha256",
+        "invalid-json",
+    ] {
+        let fixture = Fixture::new();
+        let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+        let first = build(&plan).unwrap();
+        let pdf_bytes = fs::read(&first.path).unwrap();
+        let current = record_path(&plan);
+        let legacy = first.path.with_extension("manifest.json");
+        let mut value = serde_json::to_value(&first.manifest).unwrap();
+        value[invalid] = "not this output".into();
+        let bytes = if invalid == "invalid-json" {
+            b"not valid json".to_vec()
+        } else {
+            serde_json::to_vec_pretty(&value).unwrap()
+        };
+        fs::write(&legacy, &bytes).unwrap();
+        fs::remove_file(&current).unwrap();
+        assert!(build(&plan).is_err(), "accepted {invalid}");
+        assert_eq!(fs::read(&first.path).unwrap(), pdf_bytes);
+        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+        assert!(!current.exists());
+    }
+}
+
+#[test]
+fn conflicting_current_and_legacy_records_preserve_both_copies() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+    let first = build(&plan).unwrap();
+    let pdf_bytes = fs::read(&first.path).unwrap();
+    let current = record_path(&plan);
+    let current_bytes = fs::read(&current).unwrap();
+    let legacy = first.path.with_extension("manifest.json");
+    let mut old = first.manifest.clone();
+    old.created_at = "conflicting-history".into();
+    let legacy_bytes = serde_json::to_vec_pretty(&old).unwrap();
+    fs::write(&legacy, &legacy_bytes).unwrap();
+    assert!(error(build(&plan)).contains("冲突"));
+    assert_eq!(fs::read(&current).unwrap(), current_bytes);
+    assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+    assert_eq!(fs::read(&first.path).unwrap(), pdf_bytes);
+}
+
+#[test]
+fn legacy_committed_pdf_journal_recovers_before_record_migration() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(vec![fixture.image(1, 40, 20)]);
+    let first = build(&plan).unwrap();
+    let bytes = fs::read(&first.path).unwrap();
+    fs::remove_file(record_path(&plan)).unwrap();
+    let name = first.path.file_name().unwrap().to_str().unwrap();
+    let journal = first.path.parent().unwrap().join(format!(
+        ".voucher-{}.transaction.json",
+        hex::encode(Sha256::digest(name.as_bytes()))
+    ));
+    pdf::atomic_json(
+        &journal,
+        &serde_json::json!({
+            "temporary": ".already-committed.partial.pdf",
+            "output": name,
+            "backup": null,
+            "previous_hash": null,
+            "manifest": first.manifest,
+        }),
+    )
+    .unwrap();
+    let previous_journal = journal.with_extension("json.previous");
+    fs::copy(&journal, &previous_journal).unwrap();
+    assert!(build(&plan).unwrap().skipped);
+    assert_eq!(fs::read(&first.path).unwrap(), bytes);
+    assert!(record_path(&plan).exists());
+    assert!(!journal.exists());
+    assert!(!previous_journal.exists());
+    assert!(!first.path.with_extension("manifest.json").exists());
+    assert!(build(&plan).unwrap().skipped);
+    assert!(!journal.exists());
+    assert!(!previous_journal.exists());
+}
+
+#[test]
+fn same_named_outputs_in_different_directories_use_separate_records() {
+    let state = tempfile::tempdir().unwrap();
+    let left = Fixture::new();
+    let right = Fixture::new();
+    let left_plan = left.plan(vec![left.image(1, 40, 20)]);
+    let mut right_plan = right.plan(vec![right.image(1, 20, 40)]);
+    let shared_build = |plan: &Plan| {
+        pdf::build_voucher(
+            state.path(),
+            plan,
+            &plan.vouchers[0],
+            false,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap()
+    };
+    let left_output = shared_build(&left_plan);
+    let right_output = shared_build(&right_plan);
+    assert_eq!(left_output.path.file_name(), right_output.path.file_name());
+    let left_record = pdf::manifest_path(state.path(), &left_output.path).unwrap();
+    let right_record = pdf::manifest_path(state.path(), &right_output.path).unwrap();
+    assert_ne!(left_record, right_record);
+    let left_bytes = fs::read(&left_record).unwrap();
+    right_plan.vouchers[0].files[0].rotation_cw = 180;
+    assert!(!shared_build(&right_plan).skipped);
+    assert!(shared_build(&left_plan).skipped);
+    assert_eq!(fs::read(left_record).unwrap(), left_bytes);
+    assert_eq!(
+        pdf::sha256_file(&left_output.path).unwrap(),
+        left_output.manifest.output_sha256
+    );
 }
 
 #[test]
@@ -543,6 +814,7 @@ fn enabled_generation_never_bypasses_manual_review() {
         analysis_completed: true,
     };
     let result = pdf::build_voucher(
+        &state_dir(&plan),
         &plan,
         &plan.vouchers[0],
         true,
@@ -566,6 +838,7 @@ fn enabled_generation_never_bypasses_manual_review() {
     });
     assert!(build(&plan).is_err());
     let bypass = pdf::build_voucher(
+        &state_dir(&plan),
         &plan,
         &plan.vouchers[0],
         true,

@@ -69,6 +69,174 @@ fn transaction_path(directory: &Path, output: &str) -> PathBuf {
     ))
 }
 
+/// Stable across rescans and jobs, but distinct for identically named PDFs in
+/// different directories. Resolving the existing parent also normalizes the
+/// Windows extended-path prefix used by the scanner.
+pub fn manifest_path(state_dir: &Path, output: &Path) -> Result<PathBuf> {
+    let output = output
+        .parent()
+        .context("输出目录无效")?
+        .canonicalize()?
+        .join(output.file_name().context("输出文件名无效")?);
+    let identity = output.to_string_lossy();
+    #[cfg(windows)]
+    let identity = identity.to_lowercase();
+    let key = hex::encode(Sha256::digest(identity.as_bytes()));
+    Ok(state_dir.join("outputs").join(key).join("manifest.json"))
+}
+
+struct OutputRecords {
+    output: PathBuf,
+    // None is only used to finish an interrupted pre-0.4.1 transaction before
+    // its verified sidecar is migrated. New transactions always use state_dir.
+    directory: Option<PathBuf>,
+}
+
+impl OutputRecords {
+    fn new(state_dir: &Path, output: &Path) -> Result<Self> {
+        fs::create_dir_all(state_dir)?;
+        let state = state_dir.canonicalize()?;
+        let manifest = manifest_path(&state, output)?;
+        let directory = manifest.parent().context("输出记录目录无效")?;
+        for path in [state.join("outputs"), directory.to_owned()] {
+            reject_symlink(&path)?;
+            fs::create_dir_all(path)?;
+        }
+        let records = Self {
+            output: output.to_owned(),
+            directory: Some(directory.to_owned()),
+        };
+        recover_atomic_record(&records.manifest())?;
+        recover_atomic_record(&records.journal())?;
+        Ok(records)
+    }
+
+    fn legacy(output: &Path) -> Self {
+        Self {
+            output: output.to_owned(),
+            directory: None,
+        }
+    }
+
+    fn manifest(&self) -> PathBuf {
+        self.directory.as_ref().map_or_else(
+            || self.output.with_extension("manifest.json"),
+            |directory| directory.join("manifest.json"),
+        )
+    }
+
+    fn journal(&self) -> PathBuf {
+        self.directory.as_ref().map_or_else(
+            || {
+                transaction_path(
+                    self.output.parent().unwrap(),
+                    self.output.file_name().unwrap().to_str().unwrap(),
+                )
+            },
+            |directory| directory.join("transaction.json"),
+        )
+    }
+
+    fn archive(&self, backup: &Path) -> Result<PathBuf> {
+        let path = if let Some(directory) = &self.directory {
+            let relative = backup
+                .strip_prefix(self.output.parent().context("输出目录无效")?)?
+                .with_extension("manifest.json");
+            checked_output_child(directory, relative.to_str().context("历史记录路径无效")?)?
+        } else {
+            backup.with_extension("manifest.json")
+        };
+        reject_symlink(&path)?;
+        Ok(path)
+    }
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    // symlink_metadata also detects dangling links, unlike Path::exists().
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!("输出及记录不能是符号链接"),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn recover_atomic_record(path: &Path) -> Result<()> {
+    let previous = path.with_extension("json.previous");
+    reject_symlink(path)?;
+    reject_symlink(&previous)?;
+    if !path.exists() && previous.exists() {
+        fs::rename(previous, path)?;
+    }
+    Ok(())
+}
+
+fn validate_owned_manifest(
+    plan: &Plan,
+    voucher: &Voucher,
+    output: &Path,
+    manifest: &Manifest,
+) -> Result<()> {
+    if manifest.producer != "voucher-workbench"
+        || manifest.root != plan.root
+        || manifest.folder != voucher.folder
+        || sha256_file(output)? != manifest.output_sha256
+    {
+        bail!("已有输出被修改或不属于此任务，拒绝覆盖");
+    }
+    Ok(())
+}
+
+fn migrate_legacy_manifest(records: &OutputRecords, plan: &Plan, voucher: &Voucher) -> Result<()> {
+    let legacy = records.output.with_extension("manifest.json");
+    recover_atomic_record(&legacy)?;
+    if !legacy.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&legacy)?;
+    let old: Manifest = serde_json::from_slice(&bytes).context("旧输出记录无法验证，保留原文件")?;
+    validate_owned_manifest(plan, voucher, &records.output, &old)?;
+    let previous = legacy.with_extension("json.previous");
+    let previous_bytes = if previous.exists() {
+        let bytes = fs::read(&previous)?;
+        let saved: Manifest =
+            serde_json::from_slice(&bytes).context("旧输出残留记录无法验证，保留原文件")?;
+        if serde_json::to_value(&saved)? != serde_json::to_value(&old)? {
+            bail!("旧输出记录与替换前副本冲突，保留双方记录，请核对后再生成");
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let target = records.manifest();
+    if target.exists() {
+        let current: Manifest = serde_json::from_slice(&fs::read(&target)?)?;
+        if serde_json::to_value(&current)? != serde_json::to_value(&old)? {
+            bail!("本地记录与旧输出记录冲突，保留双方记录，请核对后再生成");
+        }
+    } else {
+        atomic_json(&target, &old)?;
+    }
+    // The old sidecar is removed only after a durable, verified copy exists.
+    // Copying (rather than renaming) also works when state and PDFs are on
+    // different drives. If interrupted, the next attempt repeats this check.
+    let saved: Manifest = serde_json::from_slice(&fs::read(&target)?)?;
+    if serde_json::to_value(&saved)? != serde_json::to_value(&old)? || fs::read(&legacy)? != bytes {
+        bail!("旧输出记录迁移校验失败，保留原文件");
+    }
+    validate_owned_manifest(plan, voucher, &records.output, &saved)?;
+    if let Some(bytes) = previous_bytes {
+        if fs::read(&previous)? != bytes {
+            bail!("旧输出残留记录在迁移期间变化，保留原文件");
+        }
+        // Remove the verified duplicate first: a crash can then leave only
+        // the valid sidecar, never a stale .previous that revives next time.
+        fs::remove_file(previous)?;
+    }
+    fs::remove_file(legacy)?;
+    Ok(())
+}
+
 fn checked_output_child(directory: &Path, relative: &str) -> Result<PathBuf> {
     let rel = Path::new(relative);
     if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
@@ -77,17 +245,16 @@ fn checked_output_child(directory: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = directory.to_owned();
     for part in rel.components() {
         path.push(part.as_os_str());
-        if path.exists() && fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            bail!("输出事务路径不能包含符号链接");
-        }
+        reject_symlink(&path)?;
     }
     Ok(path)
 }
 
 // A tiny write-ahead journal makes the PDF + manifest pair recoverable on both
 // Windows and Unix. Once commit starts, cancellation only stops the next voucher.
-fn recover_transaction(directory: &Path, output_name: &str) -> Result<()> {
-    let journal = transaction_path(directory, output_name);
+fn recover_transaction(directory: &Path, output_name: &str, records: &OutputRecords) -> Result<()> {
+    let journal = records.journal();
+    recover_atomic_record(&journal)?;
     if !journal.exists() {
         return Ok(());
     }
@@ -97,10 +264,8 @@ fn recover_transaction(directory: &Path, output_name: &str) -> Result<()> {
     }
     let output = checked_output_child(directory, &transaction.output)?;
     let temporary = checked_output_child(directory, &transaction.temporary)?;
-    let report = output.with_extension("manifest.json");
-    if report.exists() && fs::symlink_metadata(&report)?.file_type().is_symlink() {
-        bail!("输出记录不能是符号链接");
-    }
+    let report = records.manifest();
+    recover_atomic_record(&report)?;
     let backup = transaction
         .backup
         .as_deref()
@@ -133,7 +298,7 @@ fn recover_transaction(directory: &Path, output_name: &str) -> Result<()> {
             }
             if !report.exists() {
                 if let Some(backup) = &backup {
-                    let previous = backup.with_extension("manifest.json");
+                    let previous = records.archive(backup)?;
                     if previous.exists() {
                         fs::rename(previous, &report)?;
                     }
@@ -150,8 +315,9 @@ fn recover_transaction(directory: &Path, output_name: &str) -> Result<()> {
                 fs::rename(&output, backup)?;
             }
             if report.exists() {
-                let saved = backup.with_extension("manifest.json");
+                let saved = records.archive(backup)?;
                 if !saved.exists() {
+                    fs::create_dir_all(saved.parent().context("历史记录目录无效")?)?;
                     fs::rename(&report, saved)?;
                 }
             }
@@ -165,6 +331,10 @@ fn recover_transaction(directory: &Path, output_name: &str) -> Result<()> {
     atomic_json(&report, &transaction.manifest)?;
     if temporary.exists() {
         fs::remove_file(temporary)?;
+    }
+    let previous_journal = journal.with_extension("json.previous");
+    if previous_journal.exists() {
+        fs::remove_file(previous_journal)?;
     }
     fs::remove_file(journal)?;
     Ok(())
@@ -490,6 +660,7 @@ pub fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn build_voucher(
+    state_dir: &Path,
     plan: &Plan,
     voucher: &Voucher,
     allow_unreviewed: bool,
@@ -542,19 +713,24 @@ pub fn build_voucher(
     }
     fs::create_dir_all(&directory)?;
     let path = root.join(relative);
-    let report_path = path.with_extension("manifest.json");
-    for p in [&path, &report_path] {
-        if p.exists() && fs::symlink_metadata(p)?.file_type().is_symlink() {
-            bail!("输出不能是符号链接");
+    reject_symlink(&path)?;
+    let output_name = path
+        .file_name()
+        .context("输出文件名无效")?
+        .to_str()
+        .context("输出文件名非UTF8")?;
+    let records = OutputRecords::new(state_dir, &path)?;
+    let legacy = OutputRecords::legacy(&path);
+    recover_atomic_record(&legacy.journal())?;
+    if legacy.journal().exists() {
+        if records.journal().exists() || records.manifest().exists() {
+            bail!("发现新旧输出事务记录冲突，保留记录，请核对后再生成");
         }
+        recover_transaction(&directory, output_name, &legacy)?;
     }
-    recover_transaction(
-        &directory,
-        path.file_name()
-            .context("输出文件名无效")?
-            .to_str()
-            .context("输出文件名非UTF8")?,
-    )?;
+    recover_transaction(&directory, output_name, &records)?;
+    migrate_legacy_manifest(&records, plan, voucher)?;
+    let report_path = records.manifest();
     let mut sources = Vec::new();
     let mut next_page = 1u32;
     for file in &voucher.files {
@@ -595,13 +771,7 @@ pub fn build_voucher(
             &fs::read(&report_path).context("输出已存在且无工具生成记录，拒绝覆盖")?,
         )
         .context("输出记录无法验证，拒绝覆盖")?;
-        if old.producer != "voucher-workbench"
-            || old.root != plan.root
-            || old.folder != voucher.folder
-            || sha256_file(&path)? != old.output_sha256
-        {
-            bail!("已有输出被修改或不属于此任务，拒绝覆盖");
-        }
+        validate_owned_manifest(plan, voucher, &path, &old)?;
         if old.sources == manifest.sources
             && old.orientation_workflow == manifest.orientation_workflow
             && old.ledger_sha256 == manifest.ledger_sha256
@@ -692,17 +862,15 @@ pub fn build_voucher(
         if let Some(backup) = &transaction.backup {
             checked_output_child(&directory, backup)?;
         }
-        atomic_json(&transaction_path(&directory, &output_name), &transaction)?;
-        recover_transaction(&directory, &output_name)?;
+        atomic_json(&records.journal(), &transaction)?;
+        recover_transaction(&directory, &output_name, &records)?;
         Ok(BuildResult {
             path: path.clone(),
             manifest,
             skipped: false,
         })
     })();
-    if result.is_err()
-        && !transaction_path(&directory, path.file_name().unwrap().to_str().unwrap()).exists()
-    {
+    if result.is_err() && !records.journal().exists() {
         let _ = fs::remove_file(&temporary);
     }
     result
@@ -734,13 +902,23 @@ mod transaction_tests {
 
     #[test]
     fn interrupted_pdf_report_commit_recovers_at_every_boundary() {
-        for stage in 0..=3 {
+        for (central, stage) in [false, true]
+            .into_iter()
+            .flat_map(|central| (0..=3).map(move |stage| (central, stage)))
+        {
             let temp = tempfile::tempdir().unwrap();
             let dir = temp.path();
             let output = dir.join("result.pdf");
-            let report = output.with_extension("manifest.json");
+            let records = if central {
+                OutputRecords::new(&dir.join("state"), &output).unwrap()
+            } else {
+                OutputRecords::legacy(&output)
+            };
+            let report = records.manifest();
             let pending = dir.join(".pending.pdf");
             let backup = dir.join(".history/revision/result.pdf");
+            let archived_report = records.archive(&backup).unwrap();
+            fs::create_dir_all(archived_report.parent().unwrap()).unwrap();
             fs::create_dir_all(backup.parent().unwrap()).unwrap();
             fs::write(&output, b"old verified output").unwrap();
             fs::write(&report, b"old report").unwrap();
@@ -754,26 +932,23 @@ mod transaction_tests {
                 previous_hash: Some(old_hash),
                 manifest: manifest(new_hash.clone()),
             };
-            atomic_json(&transaction_path(dir, "result.pdf"), &txn).unwrap();
+            atomic_json(&records.journal(), &txn).unwrap();
             if stage >= 1 {
                 fs::rename(&output, &backup).unwrap();
             }
             if stage >= 2 {
-                fs::rename(&report, backup.with_extension("manifest.json")).unwrap();
+                fs::rename(&report, &archived_report).unwrap();
             }
             if stage >= 3 {
                 fs::rename(&pending, &output).unwrap();
             }
-            recover_transaction(dir, "result.pdf").unwrap();
+            recover_transaction(dir, "result.pdf", &records).unwrap();
             assert_eq!(sha256_file(&output).unwrap(), new_hash);
             let saved: Manifest = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
             assert_eq!(saved.output_sha256, new_hash);
             assert_eq!(fs::read(&backup).unwrap(), b"old verified output");
-            assert_eq!(
-                fs::read(backup.with_extension("manifest.json")).unwrap(),
-                b"old report"
-            );
-            assert!(!transaction_path(dir, "result.pdf").exists());
+            assert_eq!(fs::read(&archived_report).unwrap(), b"old report");
+            assert!(!records.journal().exists());
         }
     }
     #[test]
@@ -781,6 +956,7 @@ mod transaction_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         let output = dir.join("result.pdf");
+        let records = OutputRecords::new(&dir.join("state"), &output).unwrap();
         fs::write(&output, b"new verified output").unwrap();
         let hash = sha256_file(&output).unwrap();
         let txn = Transaction {
@@ -790,22 +966,31 @@ mod transaction_tests {
             previous_hash: None,
             manifest: manifest(hash.clone()),
         };
-        atomic_json(&transaction_path(dir, "result.pdf"), &txn).unwrap();
-        recover_transaction(dir, "result.pdf").unwrap();
+        atomic_json(&records.journal(), &txn).unwrap();
+        recover_transaction(dir, "result.pdf", &records).unwrap();
         let saved: Manifest =
-            serde_json::from_slice(&fs::read(output.with_extension("manifest.json")).unwrap())
-                .unwrap();
+            serde_json::from_slice(&fs::read(records.manifest()).unwrap()).unwrap();
         assert_eq!(saved.output_sha256, hash);
     }
     #[test]
     fn identical_pdf_bytes_preserve_manifest_history_across_recovery() {
-        for stage in 0..=4 {
+        for (central, stage) in [false, true]
+            .into_iter()
+            .flat_map(|central| (0..=4).map(move |stage| (central, stage)))
+        {
             let temp = tempfile::tempdir().unwrap();
             let dir = temp.path();
             let output = dir.join("result.pdf");
-            let report = output.with_extension("manifest.json");
+            let records = if central {
+                OutputRecords::new(&dir.join("state"), &output).unwrap()
+            } else {
+                OutputRecords::legacy(&output)
+            };
+            let report = records.manifest();
             let pending = dir.join(".pending.pdf");
             let backup = dir.join(".history/revision/result.pdf");
+            let archived_report = records.archive(&backup).unwrap();
+            fs::create_dir_all(archived_report.parent().unwrap()).unwrap();
             fs::create_dir_all(backup.parent().unwrap()).unwrap();
             fs::write(&output, b"same PDF bytes").unwrap();
             fs::write(&pending, b"same PDF bytes").unwrap();
@@ -825,13 +1010,13 @@ mod transaction_tests {
                 previous_hash: Some(hash.clone()),
                 manifest: new.clone(),
             };
-            let journal = transaction_path(dir, "result.pdf");
+            let journal = records.journal();
             atomic_json(&journal, &txn).unwrap();
             if stage >= 1 {
                 fs::rename(&output, &backup).unwrap();
             }
             if stage >= 2 {
-                fs::rename(&report, backup.with_extension("manifest.json")).unwrap();
+                fs::rename(&report, &archived_report).unwrap();
             }
             if stage >= 3 {
                 fs::rename(&pending, &output).unwrap();
@@ -839,16 +1024,13 @@ mod transaction_tests {
             if stage >= 4 {
                 atomic_json(&report, &new).unwrap();
             }
-            recover_transaction(dir, "result.pdf").unwrap();
+            recover_transaction(dir, "result.pdf", &records).unwrap();
             // Replaying the same committed journal cannot overwrite the old
             // consent record with the now-current manifest.
             atomic_json(&journal, &txn).unwrap();
-            recover_transaction(dir, "result.pdf").unwrap();
+            recover_transaction(dir, "result.pdf", &records).unwrap();
             assert_eq!(fs::read(&backup).unwrap(), b"same PDF bytes");
-            assert_eq!(
-                fs::read(backup.with_extension("manifest.json")).unwrap(),
-                old_report_bytes
-            );
+            assert_eq!(fs::read(&archived_report).unwrap(), old_report_bytes);
             assert_eq!(sha256_file(&output).unwrap(), hash);
             let saved: Manifest = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
             assert_eq!(saved.orientation_workflow, new.orientation_workflow);
@@ -860,6 +1042,7 @@ mod transaction_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         let output = dir.join("result.pdf");
+        let records = OutputRecords::new(&dir.join("state"), &output).unwrap();
         fs::write(&output, b"external changes").unwrap();
         fs::write(dir.join(".pending.pdf"), b"new").unwrap();
         let txn = Transaction {
@@ -869,8 +1052,8 @@ mod transaction_tests {
             previous_hash: None,
             manifest: manifest(sha256_file(&dir.join(".pending.pdf")).unwrap()),
         };
-        atomic_json(&transaction_path(dir, "result.pdf"), &txn).unwrap();
-        assert!(recover_transaction(dir, "result.pdf").is_err());
+        atomic_json(&records.journal(), &txn).unwrap();
+        assert!(recover_transaction(dir, "result.pdf", &records).is_err());
         assert_eq!(fs::read(output).unwrap(), b"external changes");
     }
 }

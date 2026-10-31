@@ -132,6 +132,7 @@ fn cache_current_titles(plan: &mut Plan, angle: u16) {
 
 fn build(plan: &Plan, voucher: usize, bypass: bool) -> anyhow::Result<pdf::BuildResult> {
     pdf::build_voucher(
+        &Path::new(&plan.root).join("state"),
         plan,
         &plan.vouchers[voucher],
         bypass,
@@ -252,7 +253,8 @@ fn disabled_generation_needs_no_model_and_ignores_old_automatic_rotation() {
     assert_eq!(completed.status, "completed", "{:?}", completed.results);
     let path = Path::new(completed.results[0].output_path.as_ref().unwrap());
     let manifest: Manifest =
-        serde_json::from_slice(&fs::read(path.with_extension("manifest.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(pdf::manifest_path(&state.dir, path).unwrap()).unwrap())
+            .unwrap();
     assert!(!manifest.orientation_workflow.enabled);
     assert_eq!(manifest.sources[0].rotation_cw, 0);
     assert_eq!(manifest.sources[1].rotation_cw, 270);
@@ -603,7 +605,11 @@ fn manifest_mode_and_consent_changes_create_history_without_changing_sources() {
     plan.orientation_workflow.consented_at = Some("2026-01-02T01:02:03Z".into());
     let reenabled = build(&plan, 0, false).unwrap();
     assert!(!reenabled.skipped);
-    let history = first.path.parent().unwrap().join(".history");
+    let history = pdf::manifest_path(&fixture.root.join("state"), &first.path)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".history");
     let mut archived = Vec::new();
     for entry in fs::read_dir(history).unwrap() {
         let path = entry
@@ -650,6 +656,73 @@ async fn api(state: &Arc<AppState>, method: &str, uri: &str, body: Value) -> (u1
     let status = response.status().as_u16();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn separate_metadata_preserves_report_snapshots_and_download_integrity_after_restart() {
+    let fixture = Fixture::new(1, 1);
+    let plan = &fixture.plan;
+    let state = fixture.state();
+    state.insert_plan(plan.clone()).unwrap();
+    let first = state
+        .start(&plan.id, "generate", GenerateRequest::default())
+        .unwrap();
+    assert_eq!(wait_job(&state, &first.id).status, "completed");
+    let report_route = format!("/api/jobs/{}/report", first.id);
+    let (status, original_report) = api(&state, "GET", &report_route, Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        original_report["manifests"][0]["sources"][0]["rotation_cw"],
+        0
+    );
+    state
+        .edit_files(&plan.id, &[plan.vouchers[0].files[0].id.clone()], Some(90))
+        .unwrap();
+    let second = state
+        .start(&plan.id, "generate", GenerateRequest::default())
+        .unwrap();
+    let completed = wait_job(&state, &second.id);
+    assert_eq!(completed.status, "completed");
+    let output = Path::new(completed.results[0].output_path.as_ref().unwrap());
+    assert!(!output.with_extension("manifest.json").exists());
+    assert!(pdf::manifest_path(&state.dir, output).unwrap().exists());
+    drop(state);
+
+    let state = fixture.state();
+    let (status, historic_report) = api(&state, "GET", &report_route, Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(historic_report["manifests"], original_report["manifests"]);
+    let (status, current_report) = api(
+        &state,
+        "GET",
+        &format!("/api/jobs/{}/report", second.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        current_report["manifests"][0]["sources"][0]["rotation_cw"],
+        90
+    );
+    for (job, expected_status) in [(&first.id, 400), (&second.id, 200)] {
+        let response = server::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/jobs/{job}/outputs/{}", plan.vouchers[0].id))
+                    .header("host", "127.0.0.1:43127")
+                    .header("x-session-token", &state.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected_status);
+        if expected_status == 200 {
+            assert_eq!(response.headers()["content-type"], "application/pdf");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(bytes.as_ref(), fs::read(output).unwrap());
+        }
+    }
 }
 
 #[tokio::test]

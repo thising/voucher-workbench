@@ -24,6 +24,10 @@
 
 Plan.requested_root 保留原先单分项/批次选择，换表重扫使用此字段；Plan.root 是规范后的批次目录。SourceFile.sha256 在扫描时确定，方向和复核绑定此内容指纹。任务报告使用当次固定快照；旧任务的输出文件若已更新，下载提示使用最新任务，历史归档仍保留。工具拥有且未被外部修改的旧输出，在方向改变后归档 `.history` 再生成；其他已存在文件仍拒绝覆盖。
 
+输出记录统一保存在 `state-dir/outputs/<规范化输出路径的SHA256>/manifest.json`，事务记录及新归档的历史manifest保存在同一记录目录下；不同输出路径的同名PDF独立管理。旧PDF仍归档到输出目录 `.history`。新的生成不在PDF旁写manifest或事务JSON；任务报告快照继续保存在 `state-dir/reports/{job_id}/{voucher_id}.json`，报告与PDF下载API保持不变。
+
+旧版旁置manifest在对应输出再次生成/复用时迁移：核验producer、root、folder和PDF SHA256，复制并核验到state-dir后才删除旁置文件。遇到未知、冲突或篡改记录时保留文件并拒绝覆盖；旧事务先按兼容流程恢复再迁移，既有历史归档不批量移动。记录目录缺失时不得仅因同名PDF存在就复用或覆盖。`--state-dir`修改整个处理记录目录，不自动移动原状态；使用已有记录应迁移或恢复整个状态目录。
+
 Plan.orientation_workflow为`{enabled,consent_version,consented_at,analysis_completed}`，manifest同步保存当次值。缺字段旧计划默认enabled、无同意记录且分析阶段未确认完成，保留旧图片证据和人工确认；不会代用户接受新免责声明。启用后所有图片均需要人工确认，算法自身Orientation.needs_review仅代表模型未决。取消/重启中断不能冒充已完成分析。
 
 Job 字段：`{id,plan_id,kind:"analyze"|"generate",status:"queued"|"running"|"completed"|"completed_with_errors"|"cancelled"|"interrupted"|"failed",created_at,updated_at,total,done,current,error:null|string,results:[]}`。

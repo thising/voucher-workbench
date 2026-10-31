@@ -543,10 +543,16 @@ impl AppState {
                 }
                 self.update_job(&job.id, |j| j.current = voucher.folder.clone())?;
                 let before = self.job(&job.id)?.done;
-                let outcome =
-                    pdf::build_voucher(&plan, voucher, job.request.allow_unreviewed, cancel, |n| {
+                let outcome = pdf::build_voucher(
+                    &self.dir,
+                    &plan,
+                    voucher,
+                    job.request.allow_unreviewed,
+                    cancel,
+                    |n| {
                         let _ = self.update_job(&job.id, |j| j.done += n);
-                    });
+                    },
+                );
                 if cancel.load(Ordering::Relaxed) && outcome.is_err() {
                     break;
                 }

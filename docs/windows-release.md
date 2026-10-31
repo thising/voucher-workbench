@@ -1,10 +1,10 @@
 # Windows构建、打包与验收
 
-当前发布目标：0.4.0，Windows10/11 x64，CPU OCR，ZIP测试包。功能基线采用默认关闭方向识别、启用时明确同意且全部待输出图片人工确认的流程。
+当前发布目标：0.4.1，Windows10/11 x64，CPU OCR，ZIP测试包。PDF处理记录迁入程序数据目录；默认关闭方向识别、启用时明确同意且全部待输出图片人工确认的流程不变。
 
-当前状态（2026-10-31）：Windows MSVC检查、完整打包及随包程序冒烟均已通过，ZIP测试包已生成并下载独立核验；客户Windows10实际验收待完成。此页是唯一发布状态入口，CI的Windows Server 2022环境不能替代客户Windows10实测。
+当前状态（2026-10-31）：0.4.1的记录路径变更已实现，本地69项测试、Clippy、格式及PowerShell语法检查通过，另1项私有OCR测试按设计忽略；Windows CI和新版ZIP待验证。下列0.4.0构建结果仅为历史基线，不代表0.4.1已通过。客户Windows10实际验收仍待完成。此页是唯一发布状态入口，CI的Windows Server 2022环境不能替代客户Windows10实测。
 
-## 已验证测试包
+## 0.4.0测试包（历史基线）
 
 - 公开源码：[thising/voucher-workbench](https://github.com/thising/voucher-workbench)，仅包含当前工具与有效规格。
 - 完整构建与验证：[Windows CI #4](https://github.com/thising/voucher-workbench/actions/runs/41095798149)。构建源码为 [`f36b69a`](https://github.com/thising/voucher-workbench/commit/f36b69a2abfb5103d4cf01ec6d6ab1e7b0632dcb)；后续文档更新不改变该包内容。
@@ -23,7 +23,7 @@ Windows CI通过60项测试，另1项依赖本地私有资料的OCR测试按设�
 
 第一阶段采用ZIP，包含主程序、中文启动脚本、OCR模型/字典、Windows原生运行库、使用说明、完整第三方许可和逐文件hash清单。用户解压整个目录后双击启动，不单独移动EXE。
 
-程序数据默认在 `%LOCALAPPDATA%\VoucherWorkbench`；旧开发状态可通过 `--state-dir` 显式选取，不自动搬迁。程序控制台保持可见，重复启动同一状态目录会提示已有实例；关闭网页不会退出服务，`Ctrl+C`等待当前页/提交收尾。脚本会保留启动错误，避免窗口闪退。
+程序数据默认在 `%LOCALAPPDATA%\VoucherWorkbench`；旧开发状态可通过 `--state-dir` 显式选取，不自动搬迁。0.4.1的输出manifest、事务及新历史manifest存入数据目录的 `outputs` 子目录，PDF旁不再新建记录JSON；旧PDF仍归档至输出目录 `.history`。旧旁置manifest仅在对应PDF再次生成/复用时，经验证复制到数据目录后移除；既有历史归档不批量迁移。备份或换电脑时应保留整个数据目录，缺少可验证记录时不得自动复用或覆盖已有PDF。程序控制台保持可见，重复启动同一状态目录会提示已有实例；关闭网页不会退出服务，`Ctrl+C`等待当前页/提交收尾。脚本会保留启动错误，避免窗口闪退。
 
 OCR功能仍默认关闭；缺少或损坏的模型/原生库不阻止原向合并。随包OCR使用CPU，不要求CUDA或独立显卡。ONNX Runtime官方Windows包要求VC++运行库；运行库缺失时按包内说明从微软官方安装，不能因CI机器已经装有开发环境就宣称任何客户电脑都零依赖。第一版不静默安装系统组件。[ONNX Runtime官方要求](https://onnxruntime.ai/docs/install/#requirements)
 
@@ -47,7 +47,7 @@ GitHub Actions是本项目推荐的Windows构建环境；也可在已装相应�
 ```powershell
 rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
 pwsh -File app/tools/build-windows.ps1
-pwsh -File app/tools/smoke-windows.ps1 -ZipPath dist/voucher-workbench-0.4.0-windows-x64.zip -FixtureExecutable app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe
+pwsh -File app/tools/smoke-windows.ps1 -ZipPath dist/voucher-workbench-0.4.1-windows-x64.zip -FixtureExecutable app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe
 ```
 
 完整构建包括格式、Clippy、全部测试、release、固定依赖下载/hash检查、完整许可与白名单组包；不覆盖已有ZIP。可用 `-OutputDirectory`、`-CacheDirectory` 指定路径，`-CheckOnly`仅执行检查。冒烟从中文含空格路径及不同工作目录运行真正随包程序，完成实载OCR、合成账表匹配、原向生成、同意和人工门禁、修正及重启复用。
@@ -68,6 +68,6 @@ python3 tools/prepare-source.py --verify-staged
 
 ## 客户验收
 
-需要一台客户Windows10 x64电脑和少量可供本人核对的资料。在普通用户权限、中文含空格路径中解压，检查启动/浏览器、明细账匹配、关闭识别生成、开启识别同意、人工旋转确认、输出打开和退出重启。缺少VC++运行库时按提示处理，再验证识别可用。客户数据无需上传GitHub，也不需要远程管理员权限。
+需要一台客户Windows10 x64电脑和少量可供本人核对的资料。在普通用户权限、中文含空格路径中解压，检查启动/浏览器、明细账匹配、关闭识别生成、开启识别同意、人工旋转确认、输出打开和退出重启；确认新PDF旁没有manifest JSON、报告仍能下载，重试能复用已有结果。使用旧版测试资料时另核对旁置记录迁移成功，且PDF内容不变。缺少VC++运行库时按提示处理，再验证识别可用。客户数据无需上传GitHub，也不需要远程管理员权限。
 
 通过后再决定是否制作安装器、签名和公开Release；这些状态与CI构件是否生成分开记录。

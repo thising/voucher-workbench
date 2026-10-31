@@ -141,9 +141,10 @@ function Wait-SmokeJob($Service, $Job) {
     return $Job
 }
 
-function Invoke-Fixture([string]$Command, [string]$Root, [string]$Mode = '') {
+function Invoke-Fixture([string]$Command, [string]$Root, [string]$Mode = '', [string]$StateDirectory = '') {
     $arguments = @($Command, $Root)
     if ($Mode) { $arguments += $Mode }
+    if ($StateDirectory) { $arguments += @('--state-dir', $StateDirectory) }
     $output = & $script:FixtureExecutable @arguments
     Assert-True ($LASTEXITCODE -eq 0) "Synthetic fixture $Command failed."
     return ($output -join "`n") | ConvertFrom-Json -Depth 30
@@ -209,7 +210,7 @@ try {
     [void](Invoke-SmokeApi $service 'POST' "/plans/$planId/analyze" $null 400)
     $offJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{})
     Assert-True ($offJob.total -eq 4 -and @($offJob.results).Count -eq 1) 'Disabled-mode generation returned wrong page/result counts.'
-    [void](Invoke-Fixture 'verify' $fixtureRoot 'disabled')
+    [void](Invoke-Fixture 'verify' $fixtureRoot 'disabled' $stateDirectory)
     $report.checks += 'disabled-workflow-original-orientation-and-native-pdf'
 
     [void](Invoke-SmokeApi $service 'PATCH' "/plans/$planId/orientation" @{ enabled = $true; accept_disclaimer = $false } 400)
@@ -240,7 +241,7 @@ try {
     }
     $onJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{})
     Assert-True ($onJob.total -eq 4) 'Confirmed-mode output has unexpected page count.'
-    [void](Invoke-Fixture 'verify' $fixtureRoot 'enabled')
+    [void](Invoke-Fixture 'verify' $fixtureRoot 'enabled' $stateDirectory)
     $report.checks += 'consent-analysis-inference-manual-gates-and-corrected-output'
 
     Stop-SmokeProcess $service.Process
@@ -251,8 +252,14 @@ try {
     Assert-True (@($resumed.vouchers[0].files | Where-Object { $_.kind -eq 'image' -and $_.reviewed }).Count -eq 2) 'Manual confirmations did not survive restart.'
     $reuseJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{})
     Assert-True (@($reuseJob.results).Count -eq 1 -and $reuseJob.results[0].status -eq 'skipped') 'Restart did not reuse the verified existing output.'
-    [void](Invoke-Fixture 'verify' $fixtureRoot 'enabled')
+    [void](Invoke-Fixture 'verify' $fixtureRoot 'enabled' $stateDirectory)
     $report.checks += 'restart-preserves-state-and-reuses-verified-output'
+    $originalReport = Invoke-SmokeApi $service 'GET' "/jobs/$($offJob.id)/report"
+    $latestReport = Invoke-SmokeApi $service 'GET' "/jobs/$($reuseJob.id)/report"
+    Assert-True (@($originalReport.manifests).Count -eq 1 -and $originalReport.manifests[0].orientation_workflow.enabled -eq $false) 'Original report snapshot changed after regeneration or restart.'
+    Assert-True (@($latestReport.manifests).Count -eq 1 -and $latestReport.manifests[0].orientation_workflow.enabled -eq $true) 'Latest report download failed after metadata separation.'
+    Assert-True (@($latestReport.manifests[0].sources).Count -eq 3 -and $latestReport.manifests[0].pages -eq 4) 'Latest report lost source/page mappings.'
+    $report.checks += 'metadata-outside-output-and-job-report-snapshots'
     $report.passed = $true
 }
 finally {
@@ -262,5 +269,5 @@ finally {
     $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $WorkDirectory 'smoke-summary.json') -Encoding utf8
 }
 
-Write-Host 'Windows package smoke passed: synthetic 2 images + 2 native PDF pages; runtime, consent, confirmation, correction, restart and reuse verified.'
+Write-Host 'Windows package smoke passed: synthetic 2 images + 2 native PDF pages; runtime, consent, confirmation, correction, restart, reuse and separate metadata/report snapshots verified.'
 Write-Output (Join-Path $WorkDirectory 'smoke-summary.json')
