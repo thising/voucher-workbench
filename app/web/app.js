@@ -52,9 +52,10 @@ if (fragment.has('token')) {
 const state = {
   plan:null, voucherId:null, fileId:null, page:0, filter:'all', search:'', selected:new Set(),
   status:null, job:null, jobs:[], plans:[], polling:null, pollCount:0, busy:false, mutating:false,
-  browser:{mode:'root',path:'',parent:null,selected:null}, generateIds:null,
+  browser:{mode:'root',path:'',parent:null,selected:null}, generateIds:null, generateRetry:null,
   thumbUrls:[], previewUrl:null, previewRequest:0, thumbsRequest:0, sourceCollapsed:false,
-  confirming:null, toastTimer:null, loadingHistory:false, ledgerSheets:[], ledgerSheetPath:'', syncTimer:null, syncing:false
+  confirming:null, toastTimer:null, loadingHistory:false, ledgerSheets:[], ledgerSheetPath:'', syncTimer:null, syncing:false,
+  settings:{threads:1}, settingsLoaded:false, settingsSaving:false, settingsDraft:null, settingsError:'', settingsRevision:0, startingJob:false
 };
 const PAGE_SIZE = 8;
 const activeStatuses = new Set(['queued','running']);
@@ -79,8 +80,12 @@ const fileIssue = file => !orientationEnabled() && file.error?.startsWith('方�
 const effectiveRotation = file => file.kind === 'image' && !orientationEnabled() && !file.reviewed ? 0 : file.rotation_cw;
 const filePresentation = file => JSON.stringify(file ? [file.id,file.rotation_cw,file.reviewed,file.error,file.orientation] : null);
 const ocrScore = value => Number.isFinite(Number(value)) ? `${(100*Math.max(0,Math.min(1,Number(value)))).toFixed(1)}%` : '—';
-const locked = () => state.busy || state.mutating || (state.job && activeStatuses.has(state.job.status));
+const locked = () => state.busy || state.mutating || state.settingsSaving || state.startingJob || (state.job && activeStatuses.has(state.job.status));
 const editingLocked = () => locked() || (orientationEnabled() && (!hasOrientationConsent() || !analysisCompleted()));
+const jobThreads = job => Number.isInteger(job?.threads) && job.threads >= 1 && job.threads <= 10 ? job.threads : 1;
+$('processing-threads').replaceChildren(...Array.from({length:10},(_,index)=>{
+  const option=el('option','',`${index+1} 线程`);option.value=index+1;return option;
+}));
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -122,6 +127,51 @@ function loading(container, message = '正在读取…') {
 function action(fn) {
   return async event => { try { await fn(event); } catch (error) { showError(error); } };
 }
+function acceptSettings(settings) {
+  if(!Number.isInteger(settings?.threads) || settings.threads<1 || settings.threads>10)throw new Error('并行设置无效，请刷新页面后重试。');
+  state.settings={threads:settings.threads};state.settingsLoaded=true;
+}
+function renderProcessingSettings() {
+  $('processing-threads').value=state.settingsDraft??state.settings.threads;
+  $('processing-threads').disabled=locked() || !state.settingsLoaded;
+  const status=$('processing-settings-status');status.classList.toggle('error',Boolean(state.settingsError));
+  if(state.settingsSaving)status.textContent=`正在保存 ${state.settingsDraft} 线程…`;
+  else if(state.settingsError)status.textContent=state.settingsError;
+  else if(!state.settingsLoaded)status.textContent='正在读取设置…';
+  else if(state.job && activeStatuses.has(state.job.status))status.textContent=`当前任务使用 ${jobThreads(state.job)} 线程；结束后可修改。`;
+  else if(state.startingJob)status.textContent='正在启动任务…';
+  else status.textContent=`已保存 · 新任务使用 ${state.settings.threads} 线程，重试沿用原任务设置。`;
+}
+async function saveThreadSelection() {
+  if(locked() || !state.settingsLoaded){renderProcessingSettings();return;}
+  const threads=Number($('processing-threads').value);
+  if(!Number.isInteger(threads) || threads<1 || threads>10){renderProcessingSettings();throw new Error('并行线程数须为 1–10 的整数。');}
+  if(threads===state.settings.threads)return;
+  state.settingsSaving=true;state.settingsDraft=threads;state.settingsError='';state.settingsRevision++;clearError();controls();
+  try {
+    acceptSettings(await api('/settings',{method:'PATCH',body:{threads}}));
+    toast(`已保存 ${state.settings.threads} 线程，下一次新任务生效`);
+  } catch(error) {
+    // A lost PATCH response may still have saved the setting. Re-read before
+    // enabling tasks instead of assuming the previous browser value is current.
+    try {
+      acceptSettings(await api('/settings'));
+      state.settingsError=`已重新读取设置：当前为 ${state.settings.threads} 线程。`;
+    } catch(_) {
+      state.settingsLoaded=false;
+      state.settingsError='未能确认设置，请刷新页面后重试。';
+    }
+    throw error;
+  } finally {state.settingsSaving=false;state.settingsDraft=null;controls();}
+}
+async function requestJob(path,options) {
+  if(locked())return null;
+  if(!state.settingsLoaded)throw new Error('并行设置尚未读取成功，请刷新页面后重试。');
+  if(Number($('processing-threads').value)!==state.settings.threads)throw new Error('请先保存并行设置，再启动任务。');
+  state.startingJob=true;controls();
+  try {const job=await api(path,options);trackJob(job);return job;}
+  finally {state.startingJob=false;controls();}
+}
 function controls() {
   const busy = locked();
   $('scan-button').disabled = busy;
@@ -133,10 +183,13 @@ function controls() {
   $('disable-orientation').hidden = !orientationEnabled() || hasOrientationConsent();
   $('disable-orientation').disabled = busy || !state.plan;
   $('analyze-button').hidden = !orientationEnabled();
-  $('analyze-button').disabled = busy || !state.plan || !hasOrientationConsent() || analysisModelBlocked();
+  $('analyze-button').disabled = busy || !state.settingsLoaded || !state.plan || !hasOrientationConsent() || analysisModelBlocked();
   $('analyze-button').title = !hasOrientationConsent() ? '请先勾选启用并同意免责声明' : analysisModelBlocked() ? state.status?.model_error || '标题文字识别尚未就绪' : requiresInference() ? '依据标题文字的阅读方向提出旋转建议，完成后须人工确认全部图片' : '复用已有当前版本结果和人工确认，无需重新推理即可完成本轮识别阶段';
-  $('generate-button').disabled = busy || !state.plan || !state.plan.vouchers.length;
-  $('generate-one').disabled = busy || !voucher();
+  $('generate-button').disabled = busy || !state.settingsLoaded || !state.plan || !state.plan.vouchers.length;
+  $('generate-one').disabled = busy || !state.settingsLoaded || !voucher();
+  const selectedVouchers=state.plan?.vouchers.filter(item=>!state.generateIds || state.generateIds.includes(item.id)) || [];
+  $('start-generate').disabled=busy || !state.settingsLoaded || !state.plan || Boolean(generationBlock(selectedVouchers));
+  $('retry-job').disabled=busy || !state.settingsLoaded;
   for (const id of ['rotate-left','rotate-flip','rotate-right','confirm-file','open-original']) {
     $(id).disabled = !activeFile() || (id !== 'open-original' && editingLocked());
   }
@@ -146,6 +199,7 @@ function controls() {
   $('thumbnails').querySelectorAll('input[type="checkbox"]').forEach(input=>{input.disabled=editingLocked();});
   $('browse-root').disabled = busy;
   $('browse-ledger').disabled = busy;
+  renderProcessingSettings();
   renderOrientationWorkflow();
 }
 function renderOrientationWorkflow() {
@@ -615,9 +669,10 @@ async function analyze() {
   if(!orientationEnabled() || !hasOrientationConsent())throw new Error('请先勾选启用标题方向识别，并同意免责声明。');
   if(analysisModelBlocked())throw new Error(state.status?.model_error||'标题文字识别尚未就绪，请检查本地模型。');
   clearError();
-  const job=await api(`/plans/${state.plan.id}/analyze`,{method:'POST'});
+  const job=await requestJob(`/plans/${state.plan.id}/analyze`,{method:'POST'});
+  if(!job)return;
   state.selected.clear();
-  trackJob(job);toast('已开始本地标题文字方向识别');
+  toast(`已开始标题方向识别 · ${jobThreads(job)} 线程`);
 }
 function generationBlock(vouchers) {
   if(!orientationEnabled())return '';
@@ -626,14 +681,16 @@ function generationBlock(vouchers) {
   const pending=vouchers.flatMap(item=>item.files).filter(needsReview).length;
   return pending?`本次所选凭证还有 ${fmt(pending)} 张图片未经人工确认。请逐页核对、修正并确认，或明确勾选已核对的页面后确认。`:'';
 }
-function prepareGenerate(ids) {
-  if (!state.plan || locked()) return;
+function prepareGenerate(ids,retry=null) {
+  if (!state.plan || locked() || !state.settingsLoaded) return;
   state.generateIds=ids;
+  state.generateRetry=retry;
   const vouchers=ids?state.plan.vouchers.filter(item=>ids.includes(item.id)):state.plan.vouchers;
   const files=vouchers.flatMap(item=>item.files);
   const summary=$('generate-summary');summary.replaceChildren();
   const headline=el('div','summary-line');headline.append(document.createTextNode('本次生成 '),el('strong','',vouchers.length),document.createTextNode(' 份 PDF，共 '),el('strong','',fmt(files.reduce((sum,file)=>sum+file.pages,0))),document.createTextNode(' 页。'));
   summary.append(headline,el('div','summary-line',`使用工作表：${state.plan.sheet}`),el('div','summary-line','输出到各分项同级的「分项-PDF」文件夹。工具生成的结果更新前会保留历史；未知或已被外部修改的文件不会覆盖。'));
+  summary.append(el('div','summary-line',retry?`并行上限：${jobThreads(retry)} 线程 · 沿用原任务的设置。`:`并行上限：${state.settings.threads} 线程 · 不同凭证并行，每份 PDF 内的页序保持不变。`));
   const block=generationBlock(vouchers);
   const images=files.filter(file=>file.kind==='image');
   summary.append(el('div','summary-line',orientationEnabled()?`标题识别已启用 · 所选 ${fmt(images.length)} 张图片中 ${fmt(images.filter(file=>file.reviewed).length)} 张已人工确认。`:'标题识别未启用：按原图方向（含照片自身方向信息）与人工旋转生成，无需分析或强制确认。'));
@@ -652,9 +709,11 @@ async function startGenerate() {
   try {
     const body={};
     if (state.generateIds) body.voucher_ids=state.generateIds;
-    const job=await api(`/plans/${state.plan.id}/generate`,{method:'POST',body});
-    $('generate-dialog').close();trackJob(job);toast('生成任务已开始');
-  } finally { $('start-generate').disabled=Boolean(generationBlock(vouchers)); }
+    const path=state.generateRetry?`/jobs/${state.generateRetry.id}/retry`:`/plans/${state.plan.id}/generate`;
+    const job=await requestJob(path,{method:'POST',body});
+    if(!job)return;
+    $('generate-dialog').close();toast(`生成任务已开始 · ${jobThreads(job)} 线程`);
+  } finally { controls(); }
 }
 function trackJob(job) {
   if (state.polling) clearTimeout(state.polling);
@@ -699,6 +758,7 @@ function renderJob() {
   $('job-panel').hidden=false;
   $('job-title').textContent=job.kind==='analyze'?'标题文字方向识别':'PDF 生成进度';
   $('job-status').textContent=statusLabels[job.status]||job.status;
+  $('job-threads').textContent=`并行上限 ${jobThreads(job)} 线程`;
   $('job-status').className='status-pill'+(['failed','completed_with_errors'].includes(job.status)?' error':['cancelled','interrupted'].includes(job.status)?' warning':'');
   const active=activeStatuses.has(job.status);
   $('cancel-job').hidden=!active;
@@ -737,11 +797,11 @@ async function cancelJob() {
 }
 async function retryJob() {
   if (!state.job || locked()) return;
-  if(state.job.kind==='generate'){prepareGenerate(state.job.request?.voucher_ids||null);return;}
+  if(state.job.kind==='generate'){prepareGenerate(state.job.request?.voucher_ids||null,state.job);return;}
   if(!orientationEnabled() || !hasOrientationConsent())throw new Error('请先启用标题方向识别并同意当前说明，再继续识别任务。');
   if(analysisModelBlocked())throw new Error(state.status?.model_error||'标题文字识别尚未就绪，请检查本地模型。');
   state.selected.clear();
-  clearError();trackJob(await api(`/jobs/${state.job.id}/retry`,{method:'POST'}));
+  clearError();await requestJob(`/jobs/${state.job.id}/retry`,{method:'POST'});
 }
 async function downloadBlob(path,name) {
   const blob=await api(path,{blob:true});
@@ -769,12 +829,14 @@ async function refreshHistory(render=true) {
   } finally {state.loadingHistory=false;}
 }
 async function syncExternalJobs() {
-  if(state.syncing || state.busy || state.mutating || (state.job && activeStatuses.has(state.job.status)))return;
+  if(state.syncing || locked())return;
   state.syncing=true;
+  const revision=state.settingsRevision;
   try {
-    const jobs=await api('/jobs');state.jobs=jobs;
+    const [jobs,settings]=await Promise.all([api('/jobs'),api('/settings')]);state.jobs=jobs;
+    if(revision===state.settingsRevision && !locked() && state.settingsLoaded){acceptSettings(settings);state.settingsError='';renderProcessingSettings();}
     const running=jobs.find(job=>activeStatuses.has(job.status));
-    if(running && running.id!==state.job?.id)trackJob(running);
+    if(running && !locked() && running.id!==state.job?.id)trackJob(running);
   } catch(_) { /* The foreground operation reports service errors. */ }
   finally {state.syncing=false;}
 }
@@ -799,7 +861,7 @@ function renderHistory() {
     const block=el('section','history-jobs');block.append(el('h2','','最近任务'));const rows=el('div','card');
     for(const job of state.jobs.slice(0,40)) {
       const row=el('div','history-job');const info=el('div');
-      info.append(document.createTextNode(`${job.kind==='analyze'?'方向识别':'PDF 生成'} · ${statusLabels[job.status]||job.status}`),el('small','',`${time(job.created_at)} · ${fmt(job.done)} / ${fmt(job.total)}`));
+      info.append(document.createTextNode(`${job.kind==='analyze'?'方向识别':'PDF 生成'} · ${statusLabels[job.status]||job.status}`),el('small','',`${time(job.created_at)} · ${fmt(job.done)} / ${fmt(job.total)} · ${jobThreads(job)} 线程`));
       const button=el('button','text-button','查看任务');button.type='button';
       button.addEventListener('click',action(async()=>{
         if(locked()&&state.job?.id!==job.id)throw new Error('请先等待当前任务完成或取消后，再查看其他任务。');
@@ -816,7 +878,8 @@ async function initialize() {
     controls();return;
   }
   try {
-    state.status=await api('/status');
+    const [status,settings]=await Promise.all([api('/status'),api('/settings')]);
+    state.status=status;acceptSettings(settings);state.settingsError='';
     if(state.plan){renderStats();renderVouchers();renderVoucher();}
     $('connection').replaceChildren(el('i'),document.createTextNode('本地服务已连接'));
     $('server-version').textContent=`v${state.status.version} · 离线工作台`;
@@ -825,13 +888,14 @@ async function initialize() {
     if(running){acceptPlan(await api(`/plans/${running.plan_id}`));trackJob(running);}
     state.syncTimer=setInterval(syncExternalJobs,5000);
     controls();
-  }catch(error){$('connection').classList.add('offline');$('connection').replaceChildren(el('i'),document.createTextNode('连接失败'));showError(error);controls();}
+  }catch(error){$('connection').classList.add('offline');$('connection').replaceChildren(el('i'),document.createTextNode('连接失败'));state.settingsError='设置尚未就绪，请刷新页面后重试。';showError(error);controls();}
 }
 
 $('nav-work').addEventListener('click',()=>setView('work'));
 $('nav-history').addEventListener('click',()=>setView('history'));
 document.querySelector('.brand').addEventListener('click',event=>{event.preventDefault();setView('work');});
 $('source-form').addEventListener('submit',action(async event=>{event.preventDefault();await scan();}));
+$('processing-threads').addEventListener('change',action(saveThreadSelection));
 $('collapse-source').addEventListener('click',()=>setSourceCollapsed(!state.sourceCollapsed));
 $('browse-root').addEventListener('click',action(()=>browse('root')));
 $('browse-ledger').addEventListener('click',action(()=>browse('ledger')));

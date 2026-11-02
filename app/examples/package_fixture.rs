@@ -11,7 +11,7 @@ use serde_json::json;
 use std::{fs, io::Write, path::Path};
 use voucher_workbench::{model::ORIENTATION_DISCLAIMER_VERSION, pdf};
 
-const VOUCHER: &str = "合成分项/260101-00001";
+#[cfg(test)]
 const OUTPUT: &str = "合成分项-PDF/260101-00001-合成科目.pdf";
 
 #[derive(Parser)]
@@ -73,7 +73,7 @@ fn ledger(path: &Path) -> Result<()> {
         ),
         (
             "xl/worksheets/sheet1.xml",
-            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>凭证编号</t></is></c><c r="B1" t="inlineStr"><is><t>科目名称</t></is></c><c r="C1" t="inlineStr"><is><t>无关字段</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>(c)00001</t></is></c><c r="B2" t="inlineStr"><is><t>合成科目</t></is></c><c r="C2" t="inlineStr"><is><t>不进入PDF</t></is></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>(c)00001</t></is></c><c r="B3" t="inlineStr"><is><t>重号后行不采用</t></is></c></row></sheetData></worksheet>"#,
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>凭证编号</t></is></c><c r="B1" t="inlineStr"><is><t>科目名称</t></is></c><c r="C1" t="inlineStr"><is><t>无关字段</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>(c)00001</t></is></c><c r="B2" t="inlineStr"><is><t>合成科目</t></is></c><c r="C2" t="inlineStr"><is><t>不进入PDF</t></is></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>(c)00001</t></is></c><c r="B3" t="inlineStr"><is><t>重号后行不采用</t></is></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>(c)00002</t></is></c><c r="B4" t="inlineStr"><is><t>合成科目</t></is></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>(c)00002</t></is></c><c r="B5" t="inlineStr"><is><t>第二凭证重号后行</t></is></c></row></sheetData></worksheet>"#,
         ),
     ];
     for (name, contents) in entries {
@@ -194,20 +194,26 @@ fn create(root: &Path) -> Result<()> {
         !root.exists(),
         "Fixture target already exists; refusing to overwrite"
     );
-    fs::create_dir_all(root.join(VOUCHER))?;
+    fs::create_dir_all(root)?;
     ledger(&root.join("明细账.xlsx"))?;
-    let directory = root.join(VOUCHER);
-    synthetic_image(1200, 900).save(directory.join("2601_00001_1.jpg"))?;
-    image::imageops::rotate90(&synthetic_image(900, 1200))
-        .save(directory.join("2601_00001_2.jpg"))?;
-    native_pdf(&directory.join("2601_00001_3.pdf"))?;
-    fs::write(directory.join("index.html"), "SYNTHETIC IGNORED HTML")?;
-    fs::create_dir(directory.join("indexImg"))?;
-    fs::write(
-        directory.join("indexImg/not-an-image.jpg"),
-        "SYNTHETIC IGNORED RESOURCE",
-    )?;
-    println!("{}", json!({"synthetic":true,"files":3,"pages":4}));
+    for code in 1..=2 {
+        let directory = root.join(format!("合成分项/260101-{code:05}"));
+        fs::create_dir_all(&directory)?;
+        synthetic_image(1200, 900).save(directory.join(format!("2601_{code:05}_1.jpg")))?;
+        image::imageops::rotate90(&synthetic_image(900, 1200))
+            .save(directory.join(format!("2601_{code:05}_2.jpg")))?;
+        native_pdf(&directory.join(format!("2601_{code:05}_3.pdf")))?;
+        fs::write(directory.join("index.html"), "SYNTHETIC IGNORED HTML")?;
+        fs::create_dir(directory.join("indexImg"))?;
+        fs::write(
+            directory.join("indexImg/not-an-image.jpg"),
+            "SYNTHETIC IGNORED RESOURCE",
+        )?;
+    }
+    println!(
+        "{}",
+        json!({"synthetic":true,"vouchers":2,"files":6,"pages":8})
+    );
     Ok(())
 }
 
@@ -222,7 +228,19 @@ fn page_box(document: &Document, id: ObjectId) -> Result<Vec<f32>> {
 }
 
 fn verify(root: &Path, mode: Mode, state_dir: &Path) -> Result<()> {
-    let output = root.join(OUTPUT);
+    for code in 1..=2 {
+        verify_voucher(root, mode, state_dir, code)?;
+    }
+    println!(
+        "{}",
+        json!({"verified":true,"synthetic":true,"vouchers":2,"images":4,"native_pdf_pages":4,"pages":8,"enabled":mode == Mode::Enabled,"source_bytes_preserved":true})
+    );
+    Ok(())
+}
+
+fn verify_voucher(root: &Path, mode: Mode, state_dir: &Path, code: u32) -> Result<()> {
+    let voucher = format!("合成分项/260101-{code:05}");
+    let output = root.join(format!("合成分项-PDF/260101-{code:05}-合成科目.pdf"));
     let manifest: pdf::Manifest =
         serde_json::from_slice(&fs::read(pdf::manifest_path(state_dir, &output)?)?)?;
     fn check_output_tree(directory: &Path) -> Result<()> {
@@ -258,7 +276,7 @@ fn verify(root: &Path, mode: Mode, state_dir: &Path) -> Result<()> {
         "Ledger naming mismatch"
     );
     ensure!(
-        manifest.ledger_row == Some(2) && manifest.duplicate_rows == [3],
+        manifest.ledger_row == Some(code * 2) && manifest.duplicate_rows == [code * 2 + 1],
         "First duplicate row not retained"
     );
     ensure!(
@@ -294,7 +312,7 @@ fn verify(root: &Path, mode: Mode, state_dir: &Path) -> Result<()> {
     );
     for (index, mapping) in manifest.sources.iter().enumerate() {
         let suffix = if index < 2 { "jpg" } else { "pdf" };
-        let expected = format!("{VOUCHER}/2601_00001_{}.{suffix}", index + 1);
+        let expected = format!("{voucher}/2601_{code:05}_{}.{suffix}", index + 1);
         ensure!(mapping.source == expected, "Source order mismatch");
         ensure!(
             mapping.sha256 == pdf::sha256_file(&root.join(&expected))?,
@@ -363,7 +381,7 @@ fn verify(root: &Path, mode: Mode, state_dir: &Path) -> Result<()> {
             }
         }
     }
-    let original = Document::load(root.join(VOUCHER).join("2601_00001_3.pdf"))?;
+    let original = Document::load(root.join(voucher).join(format!("2601_{code:05}_3.pdf")))?;
     for (number, id) in original.get_pages() {
         let target = pages[&(number + 2)];
         ensure!(
@@ -389,10 +407,6 @@ fn verify(root: &Path, mode: Mode, state_dir: &Path) -> Result<()> {
             "Native PDF content changed"
         );
     }
-    println!(
-        "{}",
-        json!({"verified":true,"synthetic":true,"images":2,"native_pdf_pages":2,"pages":4,"enabled":enabled,"source_bytes_preserved":true})
-    );
     Ok(())
 }
 
@@ -421,22 +435,24 @@ mod tests {
             sheet: None,
         })?;
         ensure!(
-            plan.vouchers.len() == 1 && plan.vouchers[0].files.len() == 3,
+            plan.vouchers.len() == 2 && plan.vouchers.iter().all(|v| v.files.len() == 3),
             "Unexpected scan result"
         );
-        ensure!(plan.ignored == 2, "Ignored exports were not excluded");
+        ensure!(plan.ignored == 4, "Ignored exports were not excluded");
         ensure!(
             !plan.issues.iter().any(|issue| issue.severity == "error"),
             "Synthetic batch invalid"
         );
-        pdf::build_voucher(
-            &state_dir,
-            &plan,
-            &plan.vouchers[0],
-            false,
-            &AtomicBool::new(false),
-            |_| {},
-        )?;
+        for voucher in &plan.vouchers {
+            pdf::build_voucher(
+                &state_dir,
+                &plan,
+                voucher,
+                false,
+                &AtomicBool::new(false),
+                |_| {},
+            )?;
+        }
         verify(&root, Mode::Disabled, &state_dir)?;
         plan.orientation_workflow = OrientationWorkflow {
             enabled: true,
@@ -444,22 +460,25 @@ mod tests {
             consented_at: Some("2026-01-01T00:00:00Z".into()),
             analysis_completed: true,
         };
-        for file in plan.vouchers[0]
-            .files
+        for file in plan
+            .vouchers
             .iter_mut()
+            .flat_map(|voucher| &mut voucher.files)
             .filter(|f| f.kind == "image")
         {
             file.reviewed = true;
             file.rotation_cw = if file.sequence == 2 { 270 } else { 0 };
         }
-        pdf::build_voucher(
-            &state_dir,
-            &plan,
-            &plan.vouchers[0],
-            false,
-            &AtomicBool::new(false),
-            |_| {},
-        )?;
+        for voucher in &plan.vouchers {
+            pdf::build_voucher(
+                &state_dir,
+                &plan,
+                voucher,
+                false,
+                &AtomicBool::new(false),
+                |_| {},
+            )?;
+        }
         verify(&root, Mode::Enabled, &state_dir)?;
         fs::write(root.join(OUTPUT), b"tampered")?;
         ensure!(

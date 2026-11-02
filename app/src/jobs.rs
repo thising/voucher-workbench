@@ -1,4 +1,4 @@
-use crate::{model::*, orientation::Engine, pdf};
+use crate::{model::*, orientation::Engine, pdf, workers};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,6 +10,31 @@ use std::{
         Arc, Mutex,
     },
 };
+
+pub const MAX_THREADS: usize = 10;
+fn default_threads() -> usize {
+    1
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingSettings {
+    pub threads: usize,
+}
+impl Default for ProcessingSettings {
+    fn default() -> Self {
+        Self {
+            threads: default_threads(),
+        }
+    }
+}
+impl ProcessingSettings {
+    fn validate(&self) -> Result<()> {
+        if !(1..=MAX_THREADS).contains(&self.threads) {
+            bail!("并行线程数必须是1到10之间的整数");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GenerateRequest {
@@ -41,6 +66,8 @@ pub struct Job {
     pub error: Option<String>,
     pub results: Vec<JobResult>,
     pub request: GenerateRequest,
+    #[serde(default = "default_threads")]
+    pub threads: usize,
 }
 impl Job {
     pub fn active(&self) -> bool {
@@ -51,6 +78,7 @@ pub struct Data {
     pub plans: HashMap<String, Plan>,
     pub jobs: HashMap<String, Job>,
     pub cancels: HashMap<String, Arc<AtomicBool>>,
+    pub settings: ProcessingSettings,
 }
 pub struct AppState {
     pub data: Mutex<Data>,
@@ -58,6 +86,8 @@ pub struct AppState {
     pub token: String,
     pub engine: Mutex<Option<Engine>>,
     pub model_error: Option<String>,
+    model_path: PathBuf,
+    runtime_path: Option<PathBuf>,
 }
 
 pub fn now() -> String {
@@ -85,10 +115,20 @@ impl AppState {
         fs::create_dir_all(dir.join("reports"))?;
         recover_json_directory(&dir.join("plans"))?;
         recover_json_directory(&dir.join("jobs"))?;
+        recover_json_directory(&dir)?;
+        let settings_path = dir.join("settings.json");
+        let settings: ProcessingSettings = if settings_path.exists() {
+            serde_json::from_slice(&fs::read(&settings_path)?)
+                .context("并行设置文件损坏，请检查状态目录中的settings.json")?
+        } else {
+            ProcessingSettings::default()
+        };
+        settings.validate()?;
         let mut data = Data {
             plans: HashMap::new(),
             jobs: HashMap::new(),
             cancels: HashMap::new(),
+            settings,
         };
         for entry in fs::read_dir(dir.join("plans"))? {
             let path = entry?.path();
@@ -106,6 +146,7 @@ impl AppState {
             }
             let mut j: Job = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("任务文件损坏：{}", path.display()))?;
+            ProcessingSettings { threads: j.threads }.validate()?;
             if j.active() {
                 if j.kind == "analyze" {
                     if let Some(plan) = data.plans.get_mut(&j.plan_id) {
@@ -137,7 +178,22 @@ impl AppState {
             ),
             engine: Mutex::new(engine),
             model_error: error,
+            model_path: model.to_owned(),
+            runtime_path: runtime.map(Path::to_owned),
         }))
+    }
+    pub fn settings(&self) -> ProcessingSettings {
+        self.data.lock().unwrap().settings
+    }
+    pub fn set_settings(&self, settings: ProcessingSettings) -> Result<ProcessingSettings> {
+        settings.validate()?;
+        let mut data = self.data.lock().unwrap();
+        if data.jobs.values().any(Job::active) {
+            bail!("任务运行中不能更改并行线程数，请先取消或等待完成");
+        }
+        pdf::atomic_json(&self.dir.join("settings.json"), &settings)?;
+        data.settings = settings;
+        Ok(settings)
     }
     pub fn save_plan(&self, p: &Plan) -> Result<()> {
         pdf::atomic_json(&self.dir.join("plans").join(format!("{}.json", p.id)), p)
@@ -281,7 +337,18 @@ impl AppState {
         kind: &str,
         request: GenerateRequest,
     ) -> Result<Job> {
+        self.start_with_threads(plan_id, kind, request, None)
+    }
+    fn start_with_threads(
+        self: &Arc<Self>,
+        plan_id: &str,
+        kind: &str,
+        request: GenerateRequest,
+        threads: Option<usize>,
+    ) -> Result<Job> {
         let mut data = self.data.lock().unwrap();
+        let threads = threads.unwrap_or(data.settings.threads);
+        ProcessingSettings { threads }.validate()?;
         if !matches!(kind, "analyze" | "generate") {
             bail!("未知任务类型");
         }
@@ -373,6 +440,7 @@ impl AppState {
             error: None,
             results: vec![],
             request,
+            threads,
         };
         if kind == "analyze" {
             let mut updated = plan.clone();
@@ -437,160 +505,252 @@ impl AppState {
         if old.active() {
             bail!("任务仍在运行");
         }
-        self.start(&old.plan_id, &old.kind, old.request)
+        self.start_with_threads(&old.plan_id, &old.kind, old.request, Some(old.threads))
     }
     fn execute(&self, job: &Job, cancel: &AtomicBool) -> Result<()> {
         self.update_job(&job.id, |j| j.status = "running".into())?;
         let plan = self.plan(&job.plan_id)?;
         if job.kind == "analyze" {
-            let work: Vec<_> = plan
-                .vouchers
-                .iter()
-                .flat_map(|v| &v.files)
-                .filter(|f| pdf::needs_analysis(f))
-                .cloned()
-                .collect();
-            let mut engine = self.engine.lock().unwrap();
-            let mut failures = 0;
-            for (index, file) in work.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
+            self.execute_analysis(job, &plan, cancel)
+        } else {
+            self.execute_generation(job, &plan, cancel)
+        }
+    }
+
+    fn execute_analysis(&self, job: &Job, plan: &Plan, cancel: &AtomicBool) -> Result<()> {
+        let work: Vec<_> = plan
+            .vouchers
+            .iter()
+            .flat_map(|v| &v.files)
+            .filter(|f| pdf::needs_analysis(f))
+            .collect();
+        let mut engines = Vec::with_capacity(job.threads.min(work.len()));
+        let outcome = (|| -> Result<usize> {
+            if work.is_empty() || cancel.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            self.update_job(&job.id, |j| j.current = "正在准备识别工作线程".into())?;
+            let warm_engine = self.engine.lock().unwrap().take();
+            engines.push(match warm_engine {
+                Some(engine) => engine,
+                None => Engine::new(&self.model_path, self.runtime_path.as_deref())?,
+            });
+            for _ in 1..job.threads.min(work.len()) {
+                if cancel.load(Ordering::Acquire) {
                     break;
                 }
-                self.update_job(&job.id, |j| j.current = file.relative_path.clone())?;
+                engines.push(
+                    Engine::new(&self.model_path, self.runtime_path.as_deref())
+                        .context("无法准备并行识别模型，可降低线程数后新建任务")?,
+                );
+            }
+            self.analyze_work(job, plan, &work, &mut engines, cancel)
+        })();
+        // Keep one warm engine, releasing all additional sessions after the job.
+        // After a worker panic or scheduler failure the next job rebuilds it.
+        if outcome.is_ok() {
+            if let Some(engine) = engines.into_iter().next() {
+                *self.engine.lock().unwrap() = Some(engine);
+            }
+        }
+        {
+            let mut data = self.data.lock().unwrap();
+            let mut current = data.plans.get(&plan.id).cloned().context("计划不存在")?;
+            current.orientation_workflow.analysis_completed =
+                outcome.is_ok() && !cancel.load(Ordering::Acquire);
+            self.save_plan(&current)?;
+            data.plans.insert(plan.id.clone(), current);
+        }
+        let failures = outcome?;
+        if failures > 0 {
+            bail!("{} 个文件方向识别失败，详情见页面列表；可重试", failures);
+        }
+        Ok(())
+    }
+
+    fn analyze_work(
+        &self,
+        job: &Job,
+        plan: &Plan,
+        work: &[&SourceFile],
+        engines: &mut [Engine],
+        cancel: &AtomicBool,
+    ) -> Result<usize> {
+        let mut failures = 0;
+        let mut completed = 0;
+        workers::run(
+            work,
+            engines,
+            cancel,
+            |engine, file, _| {
                 // Fingerprint failures are source errors, not optional OCR errors.
-                let result = pdf::check_source(Path::new(&plan.root), file)
+                pdf::check_source(Path::new(&plan.root), file)
                     .map_err(|error| (false, error))
                     .and_then(|path| {
-                        let result = engine
-                            .as_mut()
-                            .context("模型未加载")
-                            .and_then(|engine| engine.predict(&path))
-                            .map_err(|error| (true, error))?;
+                        let result = engine.predict(&path).map_err(|error| (true, error))?;
                         pdf::check_source(Path::new(&plan.root), file)
                             .map_err(|error| (false, error))?;
                         Ok(result)
-                    });
-                let mut data = self.data.lock().unwrap();
-                let current = data.plans.get_mut(&plan.id).context("计划不存在")?;
-                if let Some(f) = current
-                    .vouchers
-                    .iter_mut()
-                    .flat_map(|v| &mut v.files)
-                    .find(|f| f.id == file.id)
-                {
-                    match result {
-                        Ok(o) => {
-                            if !f.reviewed {
-                                f.rotation_cw = o.rotation_cw;
-                            }
-                            f.orientation = Some(o);
-                            if f.error
-                                .as_ref()
-                                .is_some_and(|e| e.starts_with("方向识别失败："))
-                            {
-                                f.error = None;
-                            }
-                        }
-                        Err((orientation_error, err)) => {
-                            // Never replace a real scan/source failure with a
-                            // dismissible direction warning.
-                            if !orientation_error
-                                || f.error.as_deref().is_none_or(pdf::is_orientation_error)
-                            {
-                                f.error = Some(format!(
-                                    "{}：{err:#}",
-                                    if orientation_error {
-                                        "方向识别失败"
-                                    } else {
-                                        "源文件校验失败"
-                                    }
-                                ));
-                            }
-                            failures += 1;
-                        }
+                    })
+            },
+            |event| {
+                match event {
+                    workers::Event::Started { index } => {
+                        self.update_job(&job.id, |j| {
+                            j.current = format!("最近开始：{}", work[index].relative_path)
+                        })?;
                     }
+                    workers::Event::Finished { index, result } => {
+                        let mut data = self.data.lock().unwrap();
+                        let current = data.plans.get_mut(&plan.id).context("计划不存在")?;
+                        let file = current
+                            .vouchers
+                            .iter_mut()
+                            .flat_map(|v| &mut v.files)
+                            .find(|f| f.id == work[index].id)
+                            .context("图片不属于计划")?;
+                        match result {
+                            Ok(orientation) => {
+                                if !file.reviewed {
+                                    file.rotation_cw = orientation.rotation_cw;
+                                }
+                                file.orientation = Some(orientation);
+                                if file.error.as_deref().is_some_and(pdf::is_orientation_error) {
+                                    file.error = None;
+                                }
+                            }
+                            Err((orientation_error, error)) => {
+                                // A model error cannot erase a real source error.
+                                if !orientation_error
+                                    || file.error.as_deref().is_none_or(pdf::is_orientation_error)
+                                {
+                                    file.error = Some(format!(
+                                        "{}：{error:#}",
+                                        if orientation_error {
+                                            "方向识别失败"
+                                        } else {
+                                            "源文件校验失败"
+                                        }
+                                    ));
+                                }
+                                failures += 1;
+                            }
+                        }
+                        completed += 1;
+                        if completed % 20 == 0 {
+                            self.save_plan(current)?;
+                        }
+                        drop(data);
+                        self.update_job(&job.id, |j| j.done += 1)?;
+                    }
+                    workers::Event::Panicked => bail!("识别工作线程异常，可重试继续"),
+                    workers::Event::Progress { .. } => {}
                 }
-                if index % 20 == 0 {
-                    self.save_plan(current)?;
-                }
-                drop(data);
-                self.update_job(&job.id, |j| j.done += 1)?;
-            }
-            {
-                let mut data = self.data.lock().unwrap();
-                let mut current = data.plans.get(&plan.id).cloned().context("计划不存在")?;
-                current.orientation_workflow.analysis_completed = !cancel.load(Ordering::Relaxed);
-                self.save_plan(&current)?;
-                data.plans.insert(plan.id.clone(), current);
-            }
-            if failures > 0 {
-                bail!("{} 个文件方向识别失败，详情见页面列表；可重试", failures);
-            }
-        } else {
-            let report_dir = self.dir.join("reports").join(&job.id);
-            fs::create_dir_all(&report_dir)?;
-            for voucher in &plan.vouchers {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                if job
-                    .request
+                Ok(())
+            },
+        )?;
+        Ok(failures)
+    }
+
+    fn execute_generation(&self, job: &Job, plan: &Plan, cancel: &AtomicBool) -> Result<()> {
+        let work: Vec<_> = plan
+            .vouchers
+            .iter()
+            .filter(|voucher| {
+                job.request
                     .voucher_ids
                     .as_ref()
-                    .is_some_and(|ids| !ids.contains(&voucher.id))
-                {
-                    continue;
-                }
-                self.update_job(&job.id, |j| j.current = voucher.folder.clone())?;
-                let before = self.job(&job.id)?.done;
-                let outcome = pdf::build_voucher(
+                    .is_none_or(|ids| ids.contains(&voucher.id))
+            })
+            .collect();
+        let report_dir = self.dir.join("reports").join(&job.id);
+        fs::create_dir_all(&report_dir)?;
+        let positions: HashMap<_, _> = work
+            .iter()
+            .enumerate()
+            .map(|(index, voucher)| (voucher.id.clone(), index))
+            .collect();
+        let mut accounted = vec![0u32; work.len()];
+        let mut contexts = vec![(); job.threads.min(work.len())];
+        workers::run(
+            &work,
+            &mut contexts,
+            cancel,
+            |_, voucher, progress| {
+                pdf::build_voucher(
                     &self.dir,
-                    &plan,
+                    plan,
                     voucher,
                     job.request.allow_unreviewed,
                     cancel,
-                    |n| {
-                        let _ = self.update_job(&job.id, |j| j.done += n);
-                    },
-                );
-                if cancel.load(Ordering::Relaxed) && outcome.is_err() {
-                    break;
-                }
-                let result = match outcome {
-                    Ok(out) => {
-                        pdf::atomic_json(
-                            &report_dir.join(format!("{}.json", voucher.id)),
-                            &out.manifest,
-                        )?;
-                        JobResult {
-                            voucher_id: voucher.id.clone(),
-                            folder: voucher.folder.clone(),
-                            status: if out.skipped { "skipped" } else { "completed" }.into(),
-                            output_path: Some(out.path.to_string_lossy().into()),
-                            pages: out.manifest.pages,
-                            error: None,
-                            needs_review: out.manifest.needs_review,
-                        }
+                    progress,
+                )
+            },
+            |event| {
+                match event {
+                    workers::Event::Started { index } => {
+                        self.update_job(&job.id, |j| {
+                            j.current = format!("最近开始：{}", work[index].folder)
+                        })?;
                     }
-                    Err(err) => JobResult {
-                        voucher_id: voucher.id.clone(),
-                        folder: voucher.folder.clone(),
-                        status: "failed".into(),
-                        output_path: None,
-                        pages: 0,
-                        error: Some(format!("{err:#}")),
-                        needs_review: voucher
-                            .files
-                            .iter()
-                            .any(|f| pdf::requires_manual_review(&plan, f)),
-                    },
-                };
-                self.update_job(&job.id, |j| {
-                    j.done = before + voucher.files.iter().map(|f| f.pages).sum::<u32>();
-                    j.results.push(result);
-                })?;
-            }
-        }
-        Ok(())
+                    workers::Event::Progress { index, pages } => {
+                        accounted[index] += pages;
+                        self.update_job(&job.id, |j| j.done += pages)?;
+                    }
+                    workers::Event::Finished { index, result } => {
+                        let voucher = work[index];
+                        if cancel.load(Ordering::Acquire) && result.is_err() {
+                            return Ok(());
+                        }
+                        let result = match result {
+                            Ok(output) => {
+                                pdf::atomic_json(
+                                    &report_dir.join(format!("{}.json", voucher.id)),
+                                    &output.manifest,
+                                )?;
+                                JobResult {
+                                    voucher_id: voucher.id.clone(),
+                                    folder: voucher.folder.clone(),
+                                    status: if output.skipped {
+                                        "skipped"
+                                    } else {
+                                        "completed"
+                                    }
+                                    .into(),
+                                    output_path: Some(output.path.to_string_lossy().into()),
+                                    pages: output.manifest.pages,
+                                    error: None,
+                                    needs_review: output.manifest.needs_review,
+                                }
+                            }
+                            Err(error) => JobResult {
+                                voucher_id: voucher.id.clone(),
+                                folder: voucher.folder.clone(),
+                                status: "failed".into(),
+                                output_path: None,
+                                pages: 0,
+                                error: Some(format!("{error:#}")),
+                                needs_review: voucher
+                                    .files
+                                    .iter()
+                                    .any(|f| pdf::requires_manual_review(plan, f)),
+                            },
+                        };
+                        let pages = voucher.files.iter().map(|f| f.pages).sum::<u32>();
+                        self.update_job(&job.id, |j| {
+                            // Other vouchers may have progressed since this worker started.
+                            j.done += pages.saturating_sub(accounted[index]);
+                            j.results.push(result);
+                            j.results
+                                .sort_by_key(|result| positions[&result.voucher_id]);
+                        })?;
+                    }
+                    workers::Event::Panicked => {
+                        bail!("PDF工作线程异常，已提交的成品保留，可重试继续")
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 }

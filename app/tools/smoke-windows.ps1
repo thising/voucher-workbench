@@ -165,9 +165,9 @@ $report = [ordered]@{
     package_sha256 = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     version = $null
     runtime_loaded = $false
-    source_images = 2
-    native_pdf_pages = 2
-    total_output_pages = 4
+    source_images = 4
+    native_pdf_pages = 4
+    total_output_pages = 8
     checks = @()
 }
 
@@ -196,36 +196,47 @@ try {
     $fixtureRoot = Join-Path $WorkDirectory '合成资料 测试批次'
     $stateDirectory = Join-Path $WorkDirectory '隔离 状态'
     $fixture = Invoke-Fixture 'create' $fixtureRoot
-    Assert-True ($fixture.synthetic -eq $true -and $fixture.pages -eq 4) 'Fixture creation failed.'
+    Assert-True ($fixture.synthetic -eq $true -and $fixture.pages -eq 8 -and $fixture.vouchers -eq 2) 'Fixture creation failed.'
     $service = Start-SmokeService $executable $workingDirectory $stateDirectory $localData
     $status = Invoke-SmokeApi $service 'GET' '/status'
     Assert-True ($status.model_ready -eq $true) 'Running package did not load bundled OCR components.'
+    $settings = Invoke-SmokeApi $service 'GET' '/settings'
+    Assert-True ($settings.threads -eq 1) 'New state must default to one processing thread.'
+    [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 0 } 400)
+    [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 11 } 400)
+    $settings = Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 10 }
+    Assert-True ($settings.threads -eq 10) 'Ten-thread preference was not saved.'
+
     $plan = Invoke-SmokeApi $service 'POST' '/scan' @{ root = $fixtureRoot }
     $planId = $plan.id
     Assert-True ($plan.orientation_workflow.enabled -eq $false) 'New plan must default to direction recognition disabled.'
-    Assert-True (@($plan.vouchers).Count -eq 1) 'Synthetic ledger did not match one voucher.'
-    $files = @($plan.vouchers[0].files)
-    Assert-True ($files.Count -eq 3 -and $plan.ignored -eq 2) 'Synthetic source sorting or ignored export resources are incorrect.'
+    Assert-True (@($plan.vouchers).Count -eq 2) 'Synthetic ledger did not match two vouchers.'
+    $files = @($plan.vouchers | ForEach-Object { $_.files })
+    Assert-True ($files.Count -eq 6 -and $plan.ignored -eq 4) 'Synthetic source sorting or ignored export resources are incorrect.'
     Assert-True ($plan.sheet -eq '合成首表' -and $plan.vouchers[0].subject -eq '合成科目') 'First-sheet or duplicate-first-row matching failed.'
     [void](Invoke-SmokeApi $service 'POST' "/plans/$planId/analyze" $null 400)
     $offJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{})
-    Assert-True ($offJob.total -eq 4 -and @($offJob.results).Count -eq 1) 'Disabled-mode generation returned wrong page/result counts.'
+    Assert-True ($offJob.total -eq 8 -and @($offJob.results).Count -eq 2 -and $offJob.threads -eq 10) 'Disabled-mode generation returned wrong page/result counts.'
     [void](Invoke-Fixture 'verify' $fixtureRoot 'disabled' $stateDirectory)
     $report.checks += 'disabled-workflow-original-orientation-and-native-pdf'
+    Assert-True ($offJob.results[0].voucher_id -eq $plan.vouchers[0].id -and $offJob.results[1].voucher_id -eq $plan.vouchers[1].id) 'Parallel results are not in voucher order.'
+
 
     [void](Invoke-SmokeApi $service 'PATCH' "/plans/$planId/orientation" @{ enabled = $true; accept_disclaimer = $false } 400)
     $plan = Invoke-SmokeApi $service 'PATCH' "/plans/$planId/orientation" @{ enabled = $true; accept_disclaimer = $true }
     Assert-True ($plan.orientation_workflow.consent_version -eq $status.orientation_disclaimer_version) 'Consent version was not recorded.'
     Assert-True (-not [string]::IsNullOrWhiteSpace($plan.orientation_workflow.consented_at)) 'Consent time was not recorded.'
     Assert-True ($plan.orientation_workflow.analysis_completed -eq $false) 'Enabling recognition must require analysis completion.'
-    $images = @($plan.vouchers[0].files | Where-Object kind -EQ 'image')
+    $images = @($plan.vouchers | ForEach-Object { $_.files } | Where-Object kind -EQ 'image')
     [void](Invoke-SmokeApi $service 'POST' "/plans/$planId/review" @{ file_ids = @($images[0].id) } 400)
     [void](Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{} 400)
-    $analysis = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/analyze")
-    Assert-True ($analysis.total -eq 2 -and $analysis.done -eq 2) 'Analysis did not process both synthetic images.'
+    $analysisStarted = Invoke-SmokeApi $service 'POST' "/plans/$planId/analyze"
+    [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 1 } 400)
+    $analysis = Wait-SmokeJob $service $analysisStarted
+    Assert-True ($analysis.total -eq 4 -and $analysis.done -eq 4 -and $analysis.threads -eq 10) 'Analysis did not process all four images using the requested thread limit.'
     $plan = Invoke-SmokeApi $service 'GET' "/plans/$planId"
     Assert-True ($plan.orientation_workflow.analysis_completed -eq $true) 'Analysis completion stage was not persisted.'
-    $images = @($plan.vouchers[0].files | Where-Object kind -EQ 'image')
+    $images = @($plan.vouchers | ForEach-Object { $_.files } | Where-Object kind -EQ 'image')
     foreach ($file in $images) {
         Assert-True ($null -eq $file.error -and $null -ne $file.orientation) 'Actual model inference failed on a synthetic image.'
         Assert-True ($file.orientation.model -eq $status.orientation_model) 'Inference did not use the current title rule.'
@@ -240,24 +251,34 @@ try {
         $plan = Invoke-SmokeApi $service 'PATCH' "/plans/$planId/files/$($file.id)" @{ rotation_cw = $angle; reviewed = $true }
     }
     $onJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{})
-    Assert-True ($onJob.total -eq 4) 'Confirmed-mode output has unexpected page count.'
+    Assert-True ($onJob.total -eq 8 -and $onJob.threads -eq 10) 'Confirmed-mode output has unexpected page/thread count.'
     [void](Invoke-Fixture 'verify' $fixtureRoot 'enabled' $stateDirectory)
     $report.checks += 'consent-analysis-inference-manual-gates-and-corrected-output'
+    [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 1 })
+
 
     Stop-SmokeProcess $service.Process
     $service = $null
     $service = Start-SmokeService $executable $workingDirectory $stateDirectory $localData
+    $settings = Invoke-SmokeApi $service 'GET' '/settings'
+    Assert-True ($settings.threads -eq 1) 'Single-thread preference did not survive restart.'
     $resumed = Invoke-SmokeApi $service 'GET' "/plans/$planId"
     Assert-True ($resumed.orientation_workflow.analysis_completed -eq $true) 'Completed analysis did not survive restart.'
-    Assert-True (@($resumed.vouchers[0].files | Where-Object { $_.kind -eq 'image' -and $_.reviewed }).Count -eq 2) 'Manual confirmations did not survive restart.'
+    Assert-True (@($resumed.vouchers | ForEach-Object { $_.files } | Where-Object { $_.kind -eq 'image' -and $_.reviewed }).Count -eq 4) 'Manual confirmations did not survive restart.'
     $reuseJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/plans/$planId/generate" @{})
-    Assert-True (@($reuseJob.results).Count -eq 1 -and $reuseJob.results[0].status -eq 'skipped') 'Restart did not reuse the verified existing output.'
+    Assert-True ($reuseJob.threads -eq 1 -and @($reuseJob.results).Count -eq 2 -and @($reuseJob.results | Where-Object status -EQ 'skipped').Count -eq 2) 'Restart did not reuse the verified existing output.'
     [void](Invoke-Fixture 'verify' $fixtureRoot 'enabled' $stateDirectory)
     $report.checks += 'restart-preserves-state-and-reuses-verified-output'
+    $retryJob = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/jobs/$($onJob.id)/retry")
+    Assert-True ($retryJob.threads -eq 10 -and @($retryJob.results | Where-Object status -EQ 'skipped').Count -eq 2) 'Retry did not retain the original ten-thread snapshot.'
+    $settings = Invoke-SmokeApi $service 'GET' '/settings'
+    Assert-True ($settings.threads -eq 1) 'Retry changed the global thread preference.'
+    $report.checks += 'one-to-ten-thread-setting-and-retry-snapshot'
+
     $originalReport = Invoke-SmokeApi $service 'GET' "/jobs/$($offJob.id)/report"
     $latestReport = Invoke-SmokeApi $service 'GET' "/jobs/$($reuseJob.id)/report"
-    Assert-True (@($originalReport.manifests).Count -eq 1 -and $originalReport.manifests[0].orientation_workflow.enabled -eq $false) 'Original report snapshot changed after regeneration or restart.'
-    Assert-True (@($latestReport.manifests).Count -eq 1 -and $latestReport.manifests[0].orientation_workflow.enabled -eq $true) 'Latest report download failed after metadata separation.'
+    Assert-True (@($originalReport.manifests).Count -eq 2 -and $originalReport.manifests[0].orientation_workflow.enabled -eq $false) 'Original report snapshot changed after regeneration or restart.'
+    Assert-True (@($latestReport.manifests).Count -eq 2 -and $latestReport.manifests[0].orientation_workflow.enabled -eq $true) 'Latest report download failed after metadata separation.'
     Assert-True (@($latestReport.manifests[0].sources).Count -eq 3 -and $latestReport.manifests[0].pages -eq 4) 'Latest report lost source/page mappings.'
     $report.checks += 'metadata-outside-output-and-job-report-snapshots'
     $report.passed = $true
@@ -269,5 +290,5 @@ finally {
     $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $WorkDirectory 'smoke-summary.json') -Encoding utf8
 }
 
-Write-Host 'Windows package smoke passed: synthetic 2 images + 2 native PDF pages; runtime, consent, confirmation, correction, restart, reuse and separate metadata/report snapshots verified.'
+Write-Host 'Windows package smoke passed: synthetic 2 vouchers, 4 images + 4 native PDF pages; runtime, consent, confirmation, correction, restart, reuse, separate metadata/report snapshots and one-to-ten-thread settings verified.'
 Write-Output (Join-Path $WorkDirectory 'smoke-summary.json')

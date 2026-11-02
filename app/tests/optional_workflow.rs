@@ -163,6 +163,7 @@ fn synthetic_job(plan: &Plan, kind: &str, status: &str) -> Job {
         updated_at: "2026-01-01T00:00:00Z".into(),
         total: 2,
         done: 1,
+        threads: 1,
         current: "synthetic interrupted stage".into(),
         error: None,
         results: vec![],

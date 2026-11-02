@@ -1,5 +1,5 @@
 use crate::{
-    jobs::{AppState, GenerateRequest, Job},
+    jobs::{AppState, GenerateRequest, Job, ProcessingSettings},
     model::{ScanRequest, ORIENTATION_DISCLAIMER_VERSION},
     pdf,
 };
@@ -95,6 +95,16 @@ async fn status(State(s): State<Arc<AppState>>) -> Json<Value> {
     Json(
         json!({"version":env!("CARGO_PKG_VERSION"),"orientation_model":crate::orientation::MODEL_ID,"orientation_disclaimer_version":ORIENTATION_DISCLAIMER_VERSION,"model_ready":s.model_error.is_none(),"model_error":s.model_error,"running_jobs":running}),
     )
+}
+
+async fn settings(State(s): State<Arc<AppState>>) -> Json<ProcessingSettings> {
+    Json(s.settings())
+}
+async fn update_settings(
+    State(s): State<Arc<AppState>>,
+    Json(settings): Json<ProcessingSettings>,
+) -> ApiResult<Json<ProcessingSettings>> {
+    Ok(Json(s.set_settings(settings)?))
 }
 
 async fn browse(Query(q): Query<HashMap<String, String>>) -> ApiResult<Json<Value>> {
@@ -392,6 +402,7 @@ async fn open_output(
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/status", get(status))
+        .route("/settings", get(settings).patch(update_settings))
         .route("/fs", get(browse))
         .route("/ledger/sheets", get(sheets))
         .route("/scan", post(scan))

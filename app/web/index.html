@@ -34,6 +34,10 @@
           </form>
           <div id="source-summary" class="source-summary" hidden></div>
         </section>
+        <section class="card processing-settings" aria-label="并行处理设置">
+          <div class="processing-setting-control"><label for="processing-threads">并行线程数</label><select id="processing-threads" aria-describedby="processing-threads-hint processing-settings-status" disabled><option value="1">1 线程</option></select><span id="processing-settings-status" role="status" aria-live="polite">正在读取设置…</span></div>
+          <p id="processing-threads-hint">用于标题识别与 PDF 生成。更多线程会占用更多 CPU 和内存，实际速度随资料与设备变化，不保证按线程数成倍提速。</p>
+        </section>
         <section id="welcome" class="welcome"><div class="welcome-illustration" aria-hidden="true"><div class="paper back"></div><div class="paper front"><span></span><span></span><span></span><i>PDF</i></div><span class="check-seal">✓</span></div><h2>从一份明细账开始</h2><p>图片与 PDF 按数字序号整理，默认按原图方向生成。<br>可选标题方向识别；启用后须人工核对全部图片。<br>完成后，文件会保存在各分项同级的「分项-PDF」文件夹。</p><div class="welcome-tags"><span>本地运行</span><span>自动命名</span><span>方向识别可选</span></div></section>
         <div id="workspace" hidden>
           <section class="stats" aria-label="资料概况"><article class="stat"><span>凭证匹配</span><strong id="stat-match">—</strong><small id="stat-match-note">按所选工作表</small></article><article class="stat"><span>源文档页数</span><strong id="stat-pages">—</strong><small id="stat-files">—</small></article><article class="stat attention"><span>待人工确认</span><strong id="stat-review">—</strong><small id="stat-unprocessed">—</small></article><article class="stat"><span>需处理的问题</span><strong id="stat-errors">—</strong><small id="stat-ignored">—</small></article></section>
@@ -42,7 +46,7 @@
             <div class="orientation-heading"><h2 id="orientation-title">可选：标题方向识别</h2><span id="orientation-mode" class="status-pill">默认关闭</span></div>
             <label class="orientation-choice"><input type="checkbox" id="orientation-enabled" aria-describedby="orientation-disclaimer"><span>启用标题方向识别，并同意以下免责声明</span></label>
             <div id="orientation-disclaimer" class="orientation-disclaimer"><strong>使用须知与免责声明</strong><ul>
-              <li>历史样本（3,270 张图片）的 4 并行评估约需 23 分钟；当前界面串行执行可能更久，实际耗时随设备和资料变化。</li>
+              <li>可设置 1–10 个工作线程并行。历史样本（3,270 张图片）的 4 并行评估约需 23 分钟，仅供参考，不代表本版或当前资料的处理速度；实际耗时随设备和资料变化。</li>
               <li>识别可能误转、漏转或遇到混排。样本中 39 / 3,270（1.19%）为未决率，不是准确率；240 张方向明确样本抽查未见错误，不代表全批或新资料 100% 正确。</li>
               <li>启用后须等识别完成，再逐页核对、修正并确认全部图片；也可明确勾选已核对的页面后确认。同意本说明不构成准确性保证。</li>
             </ul></div>
@@ -60,7 +64,7 @@
             </section>
           </section>
         </div>
-        <section class="card job-panel" id="job-panel" hidden><div class="job-heading"><div><span class="section-number">03</span><h2 id="job-title">处理进度</h2><span class="status-pill" id="job-status"></span></div><div class="job-actions"><button id="cancel-job" type="button" class="secondary-button compact">取消任务</button><button id="retry-job" type="button" class="secondary-button compact" hidden>继续 / 重试</button><button id="download-report" type="button" class="text-button" hidden><span data-icon="download"></span>下载报告</button></div></div><div class="progress-meta"><span id="job-current">准备中</span><strong id="job-progress-text">0 / 0</strong></div><div class="progress-track"><div id="job-progress"></div></div><div id="job-error" class="alert error" hidden></div><div id="job-results" class="job-results"></div><div id="output-actions" class="output-actions"></div></section>
+        <section class="card job-panel" id="job-panel" hidden><div class="job-heading"><div><span class="section-number">03</span><h2 id="job-title">处理进度</h2><span class="status-pill" id="job-status"></span><span class="job-thread-note" id="job-threads"></span></div><div class="job-actions"><button id="cancel-job" type="button" class="secondary-button compact">取消任务</button><button id="retry-job" type="button" class="secondary-button compact" hidden>继续 / 重试</button><button id="download-report" type="button" class="text-button" hidden><span data-icon="download"></span>下载报告</button></div></div><div class="progress-meta"><span id="job-current">准备中</span><strong id="job-progress-text">0 / 0</strong></div><div class="progress-track"><div id="job-progress"></div></div><div id="job-error" class="alert error" hidden></div><div id="job-results" class="job-results"></div><div id="output-actions" class="output-actions"></div></section>
       </section>
       <section id="history-view" hidden><div class="history-intro"><h2>可接着上次继续</h2><p>扫描计划、方向复核与处理结果均保存在本机。</p><button type="button" id="refresh-history" class="secondary-button compact"><span data-icon="refresh"></span>刷新记录</button></div><div id="history-list"></div></section>
       <footer class="page-footer"><span>凭证工作台</span><span>一份凭证，一份清楚的交付。</span></footer>

@@ -7,3 +7,4 @@ pub mod orientation;
 pub mod pdf;
 pub mod scan;
 pub mod server;
+mod workers;

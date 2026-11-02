@@ -46,7 +46,9 @@ fn verified_bytes(path: &Path, expected: &str) -> Result<Vec<u8>> {
 fn session(bytes: &[u8]) -> Result<Session> {
     Ok(Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_intra_threads(2)?
+        // Parallelism is bounded by the application's independent image workers.
+        // One inference thread avoids multiplying per-session thread pools.
+        .with_intra_threads(1)?
         .with_inter_threads(1)?
         .with_log_level(ort::logging::LogLevel::Error)?
         .commit_from_memory(bytes)?)

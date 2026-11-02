@@ -331,6 +331,44 @@ em {
   padding:21px 24px;
   margin-bottom:23px
 }
+.processing-settings {
+  padding:16px 22px;
+  margin-bottom:23px
+}
+.processing-setting-control {
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:10px
+}
+.processing-setting-control label {
+  color:#5c6959;
+  font-size:11px;
+  font-weight:600
+}
+.processing-setting-control select {
+  font-size:11px;
+  padding:5px 27px 5px 10px;
+  min-width:95px
+}
+.processing-setting-control select:disabled {
+  opacity:.65;
+  cursor:not-allowed
+}
+#processing-settings-status,.processing-settings p,.job-thread-note {
+  font-size:10px;
+  color:var(--muted)
+}
+#processing-settings-status.error {
+  color:var(--red)
+}
+.processing-settings p {
+  margin-top:8px;
+  line-height:1.8
+}
+.job-thread-note {
+  white-space:nowrap
+}
 .section-heading {
   display:flex;
   align-items:center;
