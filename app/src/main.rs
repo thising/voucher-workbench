@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use voucher_workbench::launcher::{LaunchPaths, RuntimeDiagnostic, StartupOptions};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "本地凭证 PDF 工作台", args_override_self = true)]
+#[command(version, about = "PDF工作台 · 本地诊断服务", args_override_self = true)]
 struct Args {
     #[arg(long, default_value_t = 0)]
     port: u16,

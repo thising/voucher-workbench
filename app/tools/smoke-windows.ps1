@@ -13,6 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$script:DesktopPackage = $false
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -38,6 +39,7 @@ function New-ProcessInfo([string]$Executable, [string[]]$Arguments, [string]$Wor
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    if ($script:DesktopPackage -and '--check-runtime' -notin $Arguments) { $info.ArgumentList.Add('--headless') }
     # Prove that the package loads its own DLL, not a developer's environment.
     [void]$info.Environment.Remove('ORT_DYLIB_PATH')
     $info.Environment['LOCALAPPDATA'] = $LocalData
@@ -245,10 +247,11 @@ $report = [ordered]@{
 try {
     $expanded = Join-Path $WorkDirectory '中文 包含空格 解压目录'
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $expanded
-    $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter 'voucher-workbench.exe')
+    $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -File | Where-Object { $_.Name -in @('voucher-workbench.exe','PDF工作台.exe') })
     Assert-True ($executables.Count -eq 1) 'ZIP must contain exactly one workbench executable.'
     $executable = $executables[0].FullName
     $packageDirectory = $executables[0].DirectoryName
+    $script:DesktopPackage = $executables[0].Name -eq 'PDF工作台.exe'
     $verifyScript = Join-Path $PSScriptRoot 'verify-windows-package.ps1'
     if (Test-Path -LiteralPath $verifyScript) {
         & $verifyScript -PackageDirectory $packageDirectory

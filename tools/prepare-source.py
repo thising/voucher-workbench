@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "tools/public-source.json"
 FORBIDDEN_PARTS = {".git", ".local", ".voucher-state", "input", "output", "output_v2", "target", "memory", "scripts", "archive", "__pycache__"}
 FORBIDDEN_SUFFIXES = {".onnx", ".pdf", ".jpg", ".jpeg", ".png", ".xls", ".xlsx", ".log", ".pem", ".key", ".p12", ".exe", ".dll", ".zip"}
+# This authored application icon is a tool asset required by Tauri codegen.
+# Keep the general image exclusion so business images cannot enter source.
+TOOL_ASSETS = {"app/desktop/icons/icon.png"}
 
 
 def source_files():
@@ -24,7 +27,9 @@ def source_files():
             relative = path.relative_to(ROOT)
             if any(part.startswith("._") for part in relative.parts):
                 continue
-            if any(part in FORBIDDEN_PARTS for part in relative.parts) or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+            if any(part in FORBIDDEN_PARTS for part in relative.parts) or (
+                path.suffix.lower() in FORBIDDEN_SUFFIXES and relative.as_posix() not in TOOL_ASSETS
+            ):
                 raise ValueError(f"Forbidden publication path: {relative}")
             if any(p.is_symlink() for p in [path, *path.parents] if p != ROOT.parent):
                 raise ValueError(f"Symlink publication path: {relative}")
@@ -66,7 +71,7 @@ def main():
         patterns = json.loads(CONFIG.read_text())["patterns"]
         lines = ["# Current tool only. Historical specs and private audit files remain local.", "*", "!*/"]
         lines += ["!/" + pattern for pattern in patterns]
-        lines += ["", "# Always exclude private/generated material, including accidental nested copies.", "**/._*", "**/.DS_Store", "**/__pycache__/", "**/*.onnx", "/.local/", "/.voucher-state/", "/input/", "/output/", "/output_v2/", "/memory/", "/scripts/", "/app/target/", "/openspec/changes/"]
+        lines += ["", "# Always exclude private/generated material, including accidental nested copies.", "**/._*", "**/.DS_Store", "**/__pycache__/", "**/*.onnx", "/.local/", "/.voucher-state/", "/input/", "/output/", "/output_v2/", "/memory/", "/scripts/", "/app/target/", "/app/desktop/target/", "/app/desktop/gen/", "/openspec/changes/"]
         (ROOT / ".gitignore").write_text("\n".join(lines) + "\n")
     paths = source_files()
     if args.verify_staged:

@@ -128,7 +128,7 @@ function Wait-Service($Entry) {
             $Entry.Token = $Matches[2]
             $status = Invoke-Api $Entry 'GET' '/status'
             Assert-True ($status.model_ready -eq $true) 'The launch entry did not load its packaged OCR runtime.'
-            Assert-True ($status.version -eq '0.5.1') 'Launcher acceptance must run against the 0.5.1 package.'
+            Assert-True ($status.version -eq $script:ExpectedVersion) 'Launcher acceptance must run against the selected package version.'
             return
         }
         if ($Entry.Process.HasExited) { throw 'The primary launcher exited before becoming ready.' }
@@ -251,7 +251,7 @@ $unrelated = Join-Path $WorkDirectory '其他 中文 工作目录'
 $localData = Join-Path $WorkDirectory '隔离 LocalAppData'
 [void](New-Item -ItemType Directory -Path $requests, $unrelated)
 $summary = [ordered]@{
-    passed = $false; synthetic_only = $true; version = '0.5.1'
+    passed = $false; synthetic_only = $true; version = $null
     package_sha256 = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     code_pages = @(936, 65001); checks = @()
 }
@@ -265,6 +265,8 @@ try {
     $entries = @(Get-ChildItem -LiteralPath $expanded -Recurse -File -Filter '启动凭证工作台.cmd')
     Assert-True ($entries.Count -eq 1) 'ZIP must contain exactly one distributed CMD entry.'
     $entry = $entries[0].FullName
+    $script:ExpectedVersion = [string](Get-Content (Join-Path $entries[0].DirectoryName 'package-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json).version
+    $summary.version = $script:ExpectedVersion
     $bytes = [IO.File]::ReadAllBytes($entry)
     Assert-True (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0) 'The package CMD must contain only ASCII bytes.'
     $ascii = [Text.Encoding]::ASCII.GetString($bytes)

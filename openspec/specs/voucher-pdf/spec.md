@@ -2,6 +2,8 @@
 
 ## Purpose
 
+0.6.0兼容范围：本文件仅约束0.5.x旧计划及兼容API，新产品的批量合并以 ../batch-merge/spec.md 为唯一依据；尤其不能把旧强制人工确认门槛带入新mode=batch_merge。
+
 2026-10-30 用户授权实施的 Rust 本地服务＋浏览器工具，并按后续要求更新。此文件为新工具业务规则唯一依据；2026-05 Python 文档仅为历史。Windows构建、测试包和客户验收的当前状态由 `docs/windows-release.md` 维护。
 
 ## Requirements

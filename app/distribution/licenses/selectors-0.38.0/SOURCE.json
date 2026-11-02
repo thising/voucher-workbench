@@ -1,0 +1,14 @@
+{
+  "crate": "selectors",
+  "version": "0.38.0",
+  "repository": "https://github.com/servo/stylo",
+  "commit": "572ecba2d1600e7c3d490586692a209faf703baa",
+  "reason": "Crate metadata and source file headers declare MPL-2.0; neither the published crate nor its VCS commit includes the full license. Standard license text copied from Mozilla, the license steward. Source code remains available from crates.io at this exact crate version.",
+  "files": [
+    {
+      "path": "LICENSE-MPL-2.0",
+      "url": "https://www.mozilla.org/media/MPL/2.0/index.815ca599c9df.txt",
+      "sha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+    }
+  ]
+}

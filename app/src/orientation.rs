@@ -7,11 +7,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage};
 use std::{
     collections::BTreeSet,
+    io::Cursor,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 pub const MODEL_ID: &str = "title-ocr-v1.0.2";
+pub const GENERAL_MODEL_ID: &str = "header-text-ocr-v2.0.0";
 const TITLE_MIN_CONFIDENCE: f32 = 0.82;
 pub fn is_current(value: &Orientation) -> bool {
     value.model == MODEL_ID
@@ -23,7 +25,20 @@ pub fn load_image(path: &Path) -> Result<DynamicImage> {
         .with_context(|| format!("无法打开图片：{}", path.display()))?
         .with_guessed_format()
         .context("无法识别图片格式")?;
-    let mut decoder = reader.into_decoder().context("图片解码器初始化失败")?;
+    let decoder = reader.into_decoder().context("图片解码器初始化失败")?;
+    decode_normalized(decoder)
+}
+
+/// Previews decode the exact source bytes whose hash was checked, so a file
+/// replaced between validation and decoding cannot change the returned image.
+pub(crate) fn load_image_bytes(bytes: Vec<u8>) -> Result<DynamicImage> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("无法识别图片格式")?;
+    decode_normalized(reader.into_decoder().context("图片解码器初始化失败")?)
+}
+
+fn decode_normalized(mut decoder: impl ImageDecoder) -> Result<DynamicImage> {
     let orientation = decoder.orientation().context("无法读取图片方向元数据")?;
     // Bound allocation even when a crafted header advertises enormous dimensions.
     let (w, h) = decoder.dimensions();
@@ -46,6 +61,49 @@ impl Engine {
     }
     pub fn predict(&mut self, path: &Path) -> Result<Orientation> {
         self.predict_image(&load_image(path)?)
+    }
+    /// General batch documents use readable heading text rather than a
+    /// finance-specific vocabulary. Ambiguous evidence keeps the original
+    /// direction; every result remains an aid for optional human review.
+    pub fn predict_generic(&mut self, path: &Path) -> Result<Orientation> {
+        self.predict_generic_image(&load_image(path)?)
+    }
+    pub(crate) fn predict_generic_image(&mut self, image: &DynamicImage) -> Result<Orientation> {
+        let rgb = composite_white(image);
+        let mut candidates = vec![];
+        for angle in [0, 90, 180, 270] {
+            let rotated = match angle {
+                0 => rgb.clone(),
+                90 => image::imageops::rotate90(&rgb),
+                180 => image::imageops::rotate180(&rgb),
+                _ => image::imageops::rotate270(&rgb),
+            };
+            let height = ((rotated.height() as f32 * 0.42).ceil() as u32)
+                .max(96)
+                .min(rotated.height());
+            let header =
+                image::imageops::crop_imm(&rotated, 0, 0, rotated.width(), height).to_image();
+            for line in self.ocr.read_lines(&header)? {
+                let [x, y, w, h] = line.bbox;
+                let center = x as f32 + w as f32 / 2.;
+                let accepted = line.confidence.is_finite()
+                    && line.confidence >= TITLE_MIN_CONFIDENCE
+                    && generic_heading_text(&line.text)
+                    && h >= 7
+                    && w as f32 >= h as f32 * 1.8
+                    && center >= rotated.width() as f32 * 0.06
+                    && center <= rotated.width() as f32 * 0.94;
+                candidates.push(TitleCandidate {
+                    rotation_cw: angle,
+                    text: line.text,
+                    confidence: line.confidence,
+                    bbox: [x, y, w, h],
+                    keyword: "通用头部文字".into(),
+                    accepted,
+                });
+            }
+        }
+        Ok(select_generic_direction(candidates))
     }
     pub fn predict_image(&mut self, image: &DynamicImage) -> Result<Orientation> {
         let rgb = composite_white(image);
@@ -87,6 +145,68 @@ impl Engine {
             }
         }
         Ok(select_title_direction(candidates))
+    }
+}
+
+fn generic_heading_text(text: &str) -> bool {
+    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+    letters
+        >= if text.chars().any(|c| c.is_alphabetic() && !c.is_ascii()) {
+            2
+        } else {
+            3
+        }
+}
+
+pub fn select_generic_direction(mut candidates: Vec<TitleCandidate>) -> Orientation {
+    for candidate in &mut candidates {
+        candidate.accepted = candidate.accepted
+            && generic_heading_text(&candidate.text)
+            && candidate.confidence.is_finite()
+            && candidate.confidence >= TITLE_MIN_CONFIDENCE;
+    }
+    let score = |c: &TitleCandidate| c.confidence * c.bbox[3] as f32;
+    candidates.sort_by(|a, b| score(b).total_cmp(&score(a)));
+    let mut directions = vec![];
+    for angle in [0, 90, 180, 270] {
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|c| c.accepted && c.rotation_cw == angle)
+        {
+            directions.push((angle, score(candidate)));
+        }
+    }
+    directions.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let unique = directions
+        .first()
+        .is_some_and(|best| directions.get(1).is_none_or(|next| best.1 >= next.1 * 1.2));
+    let best = candidates
+        .iter()
+        .find(|c| c.accepted)
+        .or_else(|| candidates.first());
+    Orientation {
+        rotation_cw: if unique { directions[0].0 } else { 0 },
+        confidence: best.map(|c| c.confidence).unwrap_or(0.),
+        scores: [0, 90, 180, 270]
+            .iter()
+            .map(|angle| {
+                directions
+                    .iter()
+                    .find(|(a, _)| a == angle)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0.)
+            })
+            .collect(),
+        model: GENERAL_MODEL_ID.into(),
+        needs_review: !unique,
+        title: best.map(|c| c.text.clone()),
+        reason: if unique {
+            "头部文字候选方向分差较清楚；建议仅供核对，不能保证正确"
+        } else {
+            "未找到清楚且方向占优的头部文字，保留原向，请人工检查"
+        }
+        .into(),
+        candidates,
     }
 }
 

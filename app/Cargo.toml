@@ -1,9 +1,9 @@
 [package]
 name = "voucher-workbench"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
-description = "Local voucher image and PDF workbench"
+description = "Offline PDF workbench for configurable batch merging"
 
 [dependencies]
 anyhow = "1"

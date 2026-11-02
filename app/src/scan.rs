@@ -264,7 +264,7 @@ fn tiff_has_multiple_pages(path: &Path) -> Result<bool> {
     Ok(next != 0)
 }
 
-fn reject_multiframe(path: &Path, format: Option<image::ImageFormat>) -> Result<()> {
+pub(crate) fn reject_multiframe(path: &Path, format: Option<image::ImageFormat>) -> Result<()> {
     let multiple = match format {
         Some(image::ImageFormat::Png) => {
             image::codecs::png::PngDecoder::new(BufReader::new(fs::File::open(path)?))?.is_apng()?

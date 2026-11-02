@@ -144,7 +144,7 @@ fn path_key(path: &Path) -> String {
 }
 
 /// Windows directory junctions and cloud placeholders must not be followed.
-fn checked_metadata(path: &Path) -> Result<fs::Metadata> {
+pub(crate) fn checked_metadata(path: &Path) -> Result<fs::Metadata> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         bail!("符号链接不在支持范围，请选择真实本地目录或排除该路径");
@@ -191,7 +191,7 @@ fn reject_network(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn absolute_checked(path: &Path, must_exist: bool) -> Result<PathBuf> {
+pub(crate) fn absolute_checked(path: &Path, must_exist: bool) -> Result<PathBuf> {
     reject_network(path)?;
     #[cfg(windows)]
     if matches!(path.components().next(), Some(Component::Prefix(_))) && !path.is_absolute() {
@@ -257,7 +257,7 @@ fn relative_rule(text: &str) -> Result<String> {
     }
     Ok(text.into())
 }
-fn glob_regex(pattern: &str) -> Result<Regex> {
+pub(crate) fn glob_regex(pattern: &str) -> Result<Regex> {
     let pattern = relative_rule(pattern)?;
     let segments: Vec<_> = pattern.split('/').collect();
     let mut expression = String::from("(?i)^");
@@ -338,7 +338,7 @@ fn sort_files(files: &mut [File], sort: &str) {
         _ => natural_compare(&a.relative_path, &b.relative_path),
     });
 }
-fn output_name(raw: &str) -> Result<String> {
+pub(crate) fn output_name(raw: &str) -> Result<String> {
     // User edits are names, never paths. Default names have already joined directories.
     if raw.contains(['/', '\\']) {
         bail!("输出文件名不能包含目录路径");
@@ -389,7 +389,7 @@ fn output_name(raw: &str) -> Result<String> {
 
 /// Reject unsupported document-level features before page import. Static page
 /// annotations are restricted to text/markup and external URI links.
-fn inspect_pdf(path: &Path) -> Result<u32> {
+pub(crate) fn inspect_pdf(path: &Path) -> Result<u32> {
     let doc = Document::load(path).context("PDF损坏或无法解析")?;
     if doc.is_encrypted() || doc.trailer.has(b"Encrypt") {
         bail!("加密PDF不支持，请提供未加密的静态副本");

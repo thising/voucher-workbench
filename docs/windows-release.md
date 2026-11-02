@@ -1,6 +1,18 @@
 # Windows构建、打包与验收
 
-当前唯一发布目标：**0.5.1，Windows10/11 x64，CPU OCR，ZIP客户试用包**。有效规则见[Windows发行规格](../openspec/specs/windows-distribution/spec.md)、[凭证规则](../openspec/specs/voucher-pdf/spec.md)及[通用PDF规则](../openspec/specs/generic-pdf/spec.md)。本文记录构建与验收证据，不替代这些规则。
+当前唯一发布目标是 **0.6.0：PDF工作台，Tauri 独立窗口＋Rust 核心，Windows10/11 x64**。有效依据为[批量合并规格](../openspec/specs/batch-merge/spec.md)及[桌面发行规格](../openspec/specs/windows-distribution/spec.md)。以下0.5.1记录为已交付历史，不作为新版行为约束。
+
+## 0.6.0 当前状态
+
+实现已进入实际桌面与发布验收：统一三栏批量合并、可选索引、图片自动方向、PDF逐页手动旋转，以及不阻塞生成的人工核对；新模式默认4线程，旧状态与线程设置单独保留。本机已完成核心与Tauri联编、新增合成回归；Windows构建、真实窗口和安装包尚待本轮CI验证，不能视为已交付。
+
+分发采用便携ZIP与当前用户NSIS安装包。WebView2按需检测/安装，微软x64离线安装器独立附带，本次实际附件215,017,168字节（约205MiB），不嵌入每份主程序更新。PDF.js离线预览资源内嵌并锁定版本/哈希，运行不从CDN加载。
+
+当前构建入口为 `app/tools/build-windows-desktop.ps1`；CI需实际运行随包GUI、原生文件选择/保存与安全退出，仅headless API通过不代表窗口通过。最终CI链接、成品校验值及客户Win10待验项将在验收后更新。
+
+## 0.5.1 历史交付记录
+
+历史发布目标：**0.5.1，Windows10/11 x64，CPU OCR，ZIP客户试用包**。有效规则见[Windows发行规格](../openspec/specs/windows-distribution/spec.md)、[凭证规则](../openspec/specs/voucher-pdf/spec.md)及[通用PDF规则](../openspec/specs/generic-pdf/spec.md)。本文记录构建与验收证据，不替代这些规则。
 
 当前状态（2026-11-02）：通用PDF模式与启动优化已实现，本地104项合成测试通过（另1项私有OCR测试按设计忽略），格式、Clippy、JS语法及Windows GNU全目标Clippy通过。Windows106项测试及完整打包、两种随包业务流程和真实CMD入口矩阵通过；构件已下载并独立验包，客户资料包与校验值已生成。客户当前Windows10实际双击与浏览器复测仍待反馈。截图证明旧入口存在解析异常，具体触发条件尚未在客户环境复现，不能断言文件编码损坏。
 
@@ -99,4 +111,4 @@ pwsh -File app/tools/smoke-windows-launcher.ps1 -ZipPath dist/voucher-workbench-
 
 ## 历史构建
 
-0.5.0线程功能测试包：[CI #8](https://github.com/thising/voucher-workbench/actions/runs/41375857170)，源码196f3ca，本地79/Windows80项通过、1项私有OCR测试忽略。此包未包含通用模式与本轮启动优化，仅作历史，当前目标为0.5.1。
+0.5.0线程功能测试包：[CI #8](https://github.com/thising/voucher-workbench/actions/runs/41375857170)，源码196f3ca，本地79/Windows80项通过、1项私有OCR测试忽略。此包未包含0.5.1通用模式与启动优化，仅作历史。

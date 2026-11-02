@@ -1,4 +1,4 @@
-use crate::{generic, model::*, orientation::Engine, pdf, workers};
+use crate::{batch, generic, model::*, orientation::Engine, pdf, workers};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -77,6 +77,7 @@ impl Job {
 pub struct Data {
     pub plans: HashMap<String, Plan>,
     pub generic_plans: HashMap<String, generic::Plan>,
+    pub batch_plans: HashMap<String, batch::Plan>,
     pub jobs: HashMap<String, Job>,
     pub cancels: HashMap<String, Arc<AtomicBool>>,
     pub settings: ProcessingSettings,
@@ -87,8 +88,9 @@ pub struct AppState {
     pub token: String,
     pub engine: Mutex<Option<Engine>>,
     pub model_error: Option<String>,
-    model_path: PathBuf,
-    runtime_path: Option<PathBuf>,
+    pub shutting_down: AtomicBool,
+    pub(crate) model_path: PathBuf,
+    pub(crate) runtime_path: Option<PathBuf>,
 }
 
 pub fn now() -> String {
@@ -114,10 +116,12 @@ impl AppState {
         fs::create_dir_all(dir.join("plans"))?;
         fs::create_dir_all(dir.join("jobs"))?;
         fs::create_dir_all(dir.join("generic-plans"))?;
+        fs::create_dir_all(dir.join("batch-plans"))?;
         fs::create_dir_all(dir.join("reports"))?;
         recover_json_directory(&dir.join("plans"))?;
         recover_json_directory(&dir.join("jobs"))?;
         recover_json_directory(&dir.join("generic-plans"))?;
+        recover_json_directory(&dir.join("batch-plans"))?;
         recover_json_directory(&dir)?;
         let settings_path = dir.join("settings.json");
         let settings: ProcessingSettings = if settings_path.exists() {
@@ -130,6 +134,7 @@ impl AppState {
         let mut data = Data {
             plans: HashMap::new(),
             generic_plans: HashMap::new(),
+            batch_plans: HashMap::new(),
             jobs: HashMap::new(),
             cancels: HashMap::new(),
             settings,
@@ -152,6 +157,15 @@ impl AppState {
                 .with_context(|| format!("通用计划文件损坏：{}", path.display()))?;
             data.generic_plans.insert(plan.id.clone(), plan);
         }
+        for entry in fs::read_dir(dir.join("batch-plans"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let plan: batch::Plan = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("批量计划文件损坏：{}", path.display()))?;
+            data.batch_plans.insert(plan.id.clone(), plan);
+        }
         for entry in fs::read_dir(dir.join("jobs"))? {
             let path = entry?.path();
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
@@ -166,6 +180,15 @@ impl AppState {
                         plan.orientation_workflow.analysis_completed = false;
                         pdf::atomic_json(
                             &dir.join("plans").join(format!("{}.json", plan.id)),
+                            plan,
+                        )?;
+                    }
+                }
+                if j.kind == "batch_analyze" {
+                    if let Some(plan) = data.batch_plans.get_mut(&j.plan_id) {
+                        plan.orientation_workflow.analysis_completed = false;
+                        pdf::atomic_json(
+                            &dir.join("batch-plans").join(format!("{}.json", plan.id)),
                             plan,
                         )?;
                     }
@@ -191,6 +214,7 @@ impl AppState {
             ),
             engine: Mutex::new(engine),
             model_error: error,
+            shutting_down: AtomicBool::new(false),
             model_path: model.to_owned(),
             runtime_path: runtime.map(Path::to_owned),
         }))
@@ -237,6 +261,48 @@ impl AppState {
         )?;
         data.generic_plans.insert(plan.id.clone(), plan.clone());
         Ok(plan)
+    }
+    pub fn save_batch_plan(&self, plan: &batch::Plan) -> Result<()> {
+        pdf::atomic_json(
+            &self
+                .dir
+                .join("batch-plans")
+                .join(format!("{}.json", plan.id)),
+            plan,
+        )
+    }
+    pub fn insert_batch_plan(&self, plan: batch::Plan) -> Result<batch::Plan> {
+        let mut data = self.data.lock().unwrap();
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("工作台正在退出，不能修改计划");
+        }
+        if data.jobs.values().any(Job::active) {
+            bail!("已有任务运行，请等待或取消后再更改工作流");
+        }
+        if data.batch_plans.contains_key(&plan.id) {
+            bail!("不能覆盖已保存的批量合并计划");
+        }
+        self.save_batch_plan(&plan)?;
+        data.batch_plans.insert(plan.id.clone(), plan.clone());
+        Ok(plan)
+    }
+    pub fn batch_plan(&self, id: &str) -> Result<batch::Plan> {
+        self.data
+            .lock()
+            .unwrap()
+            .batch_plans
+            .get(id)
+            .cloned()
+            .context("批量合并计划不存在，请重新扫描")
+    }
+    pub fn start_batch(
+        self: &Arc<Self>,
+        id: &str,
+        kind: &str,
+        request: GenerateRequest,
+        threads: usize,
+    ) -> Result<Job> {
+        self.start_with_threads(id, kind, request, Some(threads))
     }
     pub fn generic_plan(&self, id: &str) -> Result<generic::Plan> {
         self.data
@@ -384,9 +450,19 @@ impl AppState {
         threads: Option<usize>,
     ) -> Result<Job> {
         let mut data = self.data.lock().unwrap();
-        let threads = threads.unwrap_or(data.settings.threads);
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("工作台正在退出，不能启动新任务");
+        }
+        let threads = threads.unwrap_or(if kind.starts_with("batch_") {
+            batch::DEFAULT_THREADS
+        } else {
+            data.settings.threads
+        });
         ProcessingSettings { threads }.validate()?;
-        if !matches!(kind, "analyze" | "generate" | "generic_generate") {
+        if !matches!(
+            kind,
+            "analyze" | "generate" | "generic_generate" | "batch_generate" | "batch_analyze"
+        ) {
             bail!("未知任务类型");
         }
         if request.allow_unreviewed {
@@ -395,7 +471,24 @@ impl AppState {
         if data.jobs.values().any(Job::active) {
             bail!("已有任务运行，请完成或取消后再启动");
         }
-        let total = if kind == "generic_generate" {
+        let total = if kind.starts_with("batch_") {
+            let plan = data
+                .batch_plans
+                .get(plan_id)
+                .context("批量合并计划不存在")?;
+            if kind == "batch_analyze" {
+                let count = batch::validate_analysis(plan, &request)?;
+                if batch::requires_inference(plan, &request)? && self.model_error.is_some() {
+                    bail!(
+                        "方向模型未就绪：{}；可跳过自动识别直接按当前方向合并",
+                        self.model_error.as_deref().unwrap_or_default()
+                    );
+                }
+                count
+            } else {
+                batch::validate_generation(plan, &request)?
+            }
+        } else if kind == "generic_generate" {
             let plan = data.generic_plans.get(plan_id).context("通用计划不存在")?;
             generic::validate_generation(plan, &request)?
         } else {
@@ -508,7 +601,11 @@ impl AppState {
                 Err(_) => Some("任务内部异常；源文件未改动，可检查后重试".into()),
             };
             let _ = state.update_job(&task.id, |j| {
-                let unit = if task.kind == "generic_generate" {
+                let unit = if task.kind == "batch_analyze" {
+                    "文件"
+                } else if task.kind == "batch_generate" {
+                    "合并单元"
+                } else if task.kind == "generic_generate" {
                     "分组"
                 } else {
                     "凭证"
@@ -553,10 +650,23 @@ impl AppState {
         if old.active() {
             bail!("任务仍在运行");
         }
+        if old.kind == "batch_analyze" {
+            let original = self.batch_plan(&old.plan_id)?;
+            if original.orientation_workflow.consent_version.as_deref()
+                != Some(batch::DISCLAIMER_VERSION)
+            {
+                bail!("旧任务未同意当前方向识别说明，请在工作台重新开始识别");
+            }
+            let plan = self.insert_batch_plan(batch::analysis_revision(&original, old.threads)?)?;
+            return self.start_with_threads(&plan.id, &old.kind, old.request, Some(old.threads));
+        }
         self.start_with_threads(&old.plan_id, &old.kind, old.request, Some(old.threads))
     }
     fn execute(&self, job: &Job, cancel: &AtomicBool) -> Result<()> {
         self.update_job(&job.id, |j| j.status = "running".into())?;
+        if job.kind.starts_with("batch_") {
+            return batch::execute(self, job, cancel);
+        }
         if job.kind == "generic_generate" {
             return generic::execute(self, job, cancel);
         }

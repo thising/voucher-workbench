@@ -25,6 +25,7 @@ mod platform;
 pub type OpenBrowser = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 const PROTOCOL: u8 = 1;
+const DESKTOP_PROTOCOL: u8 = 2;
 const MAX_MESSAGE: u64 = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -128,6 +129,21 @@ impl Drop for PrimaryInstance {
 /// contention is the only condition that attempts activation; permission and
 /// filesystem errors never masquerade as an already-running instance.
 pub async fn enter(state_dir: &Path, reopen: bool, opener: OpenBrowser) -> Result<Entry> {
+    enter_with_protocol(state_dir, reopen, opener, PROTOCOL).await
+}
+
+/// Desktop activations must never ask a legacy browser service to open a page.
+/// Protocol separation preserves the same state lock and protected endpoint.
+pub async fn enter_desktop(state_dir: &Path, reopen: bool, activate: OpenBrowser) -> Result<Entry> {
+    enter_with_protocol(state_dir, reopen, activate, DESKTOP_PROTOCOL).await
+}
+
+async fn enter_with_protocol(
+    state_dir: &Path,
+    reopen: bool,
+    opener: OpenBrowser,
+    protocol: u8,
+) -> Result<Entry> {
     fs::create_dir_all(state_dir).with_context(|| {
         format!(
             "处理记录目录无法创建或没有写入权限：{}。请确认磁盘已连接，并由当前账号检查该目录的读写权限后重试；不会自动改用其他记录目录",
@@ -163,7 +179,7 @@ pub async fn enter(state_dir: &Path, reopen: bool, opener: OpenBrowser) -> Resul
             return Err(error).context("无法锁定处理记录目录。请检查当前账号的目录权限和磁盘状态后重试；不会自动结束旧程序或删除锁文件");
         }
         println!("检测到同一记录目录已有实例，正在联系已有工作台…");
-        notify_existing(&endpoint, reopen, REUSE_WAIT).await?;
+        notify_existing(&endpoint, reopen, REUSE_WAIT, protocol).await?;
         if reopen {
             println!("已打开正在运行的工作台；原任务继续运行。");
         } else {
@@ -174,7 +190,7 @@ pub async fn enter(state_dir: &Path, reopen: bool, opener: OpenBrowser) -> Resul
     let listener = endpoint.bind().context("无法创建仅当前用户可访问的本地通信通道。请确认同一记录目录没有旧程序正在退出，并检查当前账号权限或安全软件后重试；处理记录不会被删除")?;
     let (sender, receiver) = watch::channel(Readiness::Starting);
     let (stop, stopped) = oneshot::channel();
-    let task = tokio::spawn(listen(listener, receiver, opener, stopped));
+    let task = tokio::spawn(listen(listener, receiver, opener, stopped, protocol));
     Ok(Entry::Primary(PrimaryInstance {
         _lock: lock,
         readiness: sender,
@@ -187,6 +203,7 @@ async fn notify_existing(
     endpoint: &platform::Endpoint,
     reopen: bool,
     wait: Duration,
+    protocol: u8,
 ) -> Result<()> {
     let deadline = Instant::now() + wait;
     let mut reported_starting = false;
@@ -200,7 +217,7 @@ async fn notify_existing(
             write_json(
                 &mut connection,
                 &Request {
-                    protocol: PROTOCOL,
+                    protocol,
                     command: if reopen { Command::Open } else { Command::Ping },
                 },
             )
@@ -208,7 +225,10 @@ async fn notify_existing(
             read_json::<_, Response>(&mut connection).await
         };
         match timeout(remaining.min(REQUEST_TIMEOUT + OPEN_TIMEOUT), exchange).await {
-            Ok(Ok(response)) if response.protocol == PROTOCOL => match response.status {
+            Ok(Ok(response)) if response.protocol != protocol => {
+                bail!("同一处理记录目录已有不同界面版本的工作台，无法安全复用。请先在原网页版服务窗口等待任务完成后按 Ctrl+C 退出，或从原桌面窗口正常退出，再启动 PDF工作台；记录保留，不要删除锁文件");
+            }
+            Ok(Ok(response)) => match response.status {
                 Status::Opened | Status::Ready => return Ok(()),
                 Status::Starting => {
                     if !reported_starting {
@@ -216,7 +236,12 @@ async fn notify_existing(
                         reported_starting = true;
                     }
                 }
-                Status::BrowserFailed => bail!(BROWSER_HELP),
+                Status::BrowserFailed => {
+                    if protocol == DESKTOP_PROTOCOL {
+                        bail!("原PDF工作台仍在运行，但窗口唤醒失败。请切回原窗口或任务栏，等待任务完成后正常退出并重试；不会自动结束原进程");
+                    }
+                    bail!(BROWSER_HELP)
+                }
                 Status::Closing => {
                     bail!("原工作台正在正常退出。请等待原服务窗口结束后再双击启动，处理记录会保留；不要删除锁文件")
                 }
@@ -236,6 +261,7 @@ async fn listen(
     readiness: watch::Receiver<Readiness>,
     opener: OpenBrowser,
     mut stopped: oneshot::Receiver<()>,
+    protocol: u8,
 ) {
     let mut requests = JoinSet::new();
     loop {
@@ -247,7 +273,7 @@ async fn listen(
                         let readiness = readiness.clone();
                         let opener = opener.clone();
                         requests.spawn(async move {
-                            let _ = serve(connection, readiness, opener).await;
+                            let _ = serve(connection, readiness, opener, protocol).await;
                         });
                     }
                     Err(_) => {
@@ -268,18 +294,19 @@ async fn serve<S>(
     mut connection: S,
     readiness: watch::Receiver<Readiness>,
     opener: OpenBrowser,
+    protocol: u8,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request = timeout(REQUEST_TIMEOUT, read_json::<_, Request>(&mut connection)).await;
     let request = match request {
-        Ok(Ok(request)) if request.protocol == PROTOCOL => request,
+        Ok(Ok(request)) if request.protocol == protocol => request,
         _ => {
             write_json(
                 &mut connection,
                 &Response {
-                    protocol: PROTOCOL,
+                    protocol,
                     status: Status::Unsupported,
                 },
             )
@@ -304,21 +331,18 @@ where
                 match opened {
                     Ok(Ok(Ok(()))) => Status::Opened,
                     _ => {
-                        eprintln!("{BROWSER_HELP}");
+                        if protocol == DESKTOP_PROTOCOL {
+                            eprintln!("PDF工作台窗口唤醒失败，任务继续运行；请从任务栏切回原窗口");
+                        } else {
+                            eprintln!("{BROWSER_HELP}");
+                        }
                         Status::BrowserFailed
                     }
                 }
             }
         },
     };
-    write_json(
-        &mut connection,
-        &Response {
-            protocol: PROTOCOL,
-            status,
-        },
-    )
-    .await
+    write_json(&mut connection, &Response { protocol, status }).await
 }
 
 async fn read_json<S: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(
@@ -402,10 +426,9 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let primary = create_primary(temp.path(), opener(count.clone())).await;
         let endpoint = platform::Endpoint::for_state(&temp.path().canonicalize().unwrap()).unwrap();
-        let waiting =
-            tokio::spawn(
-                async move { notify_existing(&endpoint, true, Duration::from_secs(2)).await },
-            );
+        let waiting = tokio::spawn(async move {
+            notify_existing(&endpoint, true, Duration::from_secs(2), PROTOCOL).await
+        });
         sleep(Duration::from_millis(150)).await;
         assert_eq!(count.load(Ordering::SeqCst), 0);
         primary.ready("http://127.0.0.1:1234/#token=never-in-protocol".into());
@@ -426,13 +449,13 @@ mod tests {
         .await;
         primary.ready("http://127.0.0.1:1234/#token=never-in-protocol".into());
         let endpoint = platform::Endpoint::for_state(&temp.path().canonicalize().unwrap()).unwrap();
-        let failure = notify_existing(&endpoint, true, Duration::from_secs(1))
+        let failure = notify_existing(&endpoint, true, Duration::from_secs(1), PROTOCOL)
             .await
             .unwrap_err()
             .to_string();
         assert!(failure.contains("浏览器") && !failure.contains("must-not-be-returned"));
         primary.closing_notifier()();
-        let failure = notify_existing(&endpoint, true, Duration::from_secs(1))
+        let failure = notify_existing(&endpoint, true, Duration::from_secs(1), PROTOCOL)
             .await
             .unwrap_err()
             .to_string();
@@ -447,7 +470,7 @@ mod tests {
         let lock = File::create(&path).unwrap();
         fs2::FileExt::try_lock_exclusive(&lock).unwrap();
         let endpoint = platform::Endpoint::for_state(&temp.path().canonicalize().unwrap()).unwrap();
-        let failure = notify_existing(&endpoint, true, Duration::from_millis(40))
+        let failure = notify_existing(&endpoint, true, Duration::from_millis(40), PROTOCOL)
             .await
             .unwrap_err()
             .to_string();
@@ -496,6 +519,42 @@ mod tests {
         }
         assert_eq!(count.load(Ordering::SeqCst), 0);
         primary.close().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_and_browser_instances_never_reuse_each_others_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let browser = create_primary(temp.path(), opener(count.clone())).await;
+        browser.ready("http://127.0.0.1:1234/#token=never-in-protocol".into());
+        let error = enter_desktop(temp.path(), true, opener(count.clone()))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("不同界面版本") && error.contains("Ctrl+C"));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        browser.close().await;
+        let desktop = match enter_desktop(temp.path(), false, opener(count.clone()))
+            .await
+            .unwrap()
+        {
+            Entry::Primary(primary) => primary,
+            Entry::Reused => panic!("expected primary"),
+        };
+        desktop.ready("http://127.0.0.1:1234/#token=never-in-protocol".into());
+        assert!(enter(temp.path(), true, opener(count.clone()))
+            .await
+            .is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            enter_desktop(temp.path(), true, opener(count.clone()))
+                .await
+                .unwrap(),
+            Entry::Reused
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        desktop.close().await;
     }
 
     #[tokio::test]

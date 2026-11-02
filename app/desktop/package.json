@@ -1,0 +1,9 @@
+{
+  "name": "pdf-workbench-build-tools",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Pinned Tauri build CLI only; no Node runtime is shipped.",
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  }
+}

@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod generic;
 pub mod instance;
 pub mod jobs;
@@ -7,6 +8,7 @@ pub mod model;
 pub mod ocr;
 pub mod orientation;
 pub mod pdf;
+pub mod rename_index;
 pub mod scan;
 pub mod server;
 mod workers;

@@ -2,6 +2,7 @@
 * text=auto eol=lf
 *.cmd -text whitespace=cr-at-eol
 app/distribution/README-Windows.txt -text whitespace=cr-at-eol
+app/web/pdfjs/** -text
 app/models/title-ocr/dictionary.txt -text
 app/models/title-ocr/det.yml -text
 app/models/title-ocr/rec.yml -text

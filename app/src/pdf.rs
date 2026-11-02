@@ -494,6 +494,18 @@ pub(crate) fn append_pdf(
     rotation: u16,
     cancel: &AtomicBool,
 ) -> Result<u32> {
+    append_pdf_rotations(output, page_root, kids, path, rotation, &[], cancel)
+}
+
+pub(crate) fn append_pdf_rotations(
+    output: &mut Document,
+    page_root: ObjectId,
+    kids: &mut Vec<Object>,
+    path: &Path,
+    rotation: u16,
+    page_rotations: &[u16],
+    cancel: &AtomicBool,
+) -> Result<u32> {
     let mut source = Document::load(path).context("无法读取 PDF")?;
     if source.is_encrypted() {
         bail!("加密 PDF 不支持直接合并");
@@ -503,7 +515,10 @@ pub(crate) fn append_pdf(
     if pages.is_empty() {
         bail!("PDF 没有页面");
     }
-    for id in pages.values() {
+    if !page_rotations.is_empty() && page_rotations.len() != pages.len() {
+        bail!("PDF逐页角度数量与源页数不符");
+    }
+    for (index, id) in pages.values().enumerate() {
         cancelled(cancel)?;
         let mut page = source.get_object(*id)?.as_dict()?.clone();
         for key in [b"Resources".as_slice(), b"MediaBox", b"CropBox", b"Rotate"] {
@@ -513,6 +528,7 @@ pub(crate) fn append_pdf(
                 }
             }
         }
+        let rotation = (rotation + page_rotations.get(index).copied().unwrap_or(0)) % 360;
         if rotation != 0 {
             let existing = page
                 .get(b"Rotate")
@@ -564,7 +580,7 @@ fn jpeg_components(data: &[u8]) -> Option<u8> {
     None
 }
 
-fn append_image(
+pub(crate) fn append_image(
     output: &mut Document,
     page_root: ObjectId,
     kids: &mut Vec<Object>,

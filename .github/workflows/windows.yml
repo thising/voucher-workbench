@@ -1,4 +1,4 @@
-name: Windows x64 checks and test package
+name: PDF Workbench Windows desktop checks and test package
 
 on:
   push:
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -36,36 +36,58 @@ jobs:
           rustup toolchain install $settings.rust_toolchain --profile minimal --component rustfmt --component clippy --target $settings.target
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
 
-      - name: Test Windows build and optionally assemble ZIP
+      - name: Test Rust core and Tauri desktop; optionally assemble release attachments
         env:
           PACKAGE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           $checksOnly = $env:PACKAGE_REQUESTED -ne 'true'
-          ./app/tools/build-windows.ps1 -CheckOnly:$checksOnly -OutputDirectory "$env:GITHUB_WORKSPACE/dist" -CacheDirectory "$env:RUNNER_TEMP/voucher-dependency-cache"
+          ./app/tools/build-windows-desktop.ps1 -CheckOnly:$checksOnly -OutputDirectory "$env:GITHUB_WORKSPACE/dist" -CacheDirectory "$env:RUNNER_TEMP/pdf-dependency-cache"
 
-      - name: Exercise the packaged executable with synthetic data
+      - name: Exercise the same shipped GUI binary in headless compatibility mode
         if: github.event_name == 'workflow_dispatch'
         run: |
-          $archives = @(Get-ChildItem dist/voucher-workbench-*-windows-x64.zip)
+          $archives = @(Get-ChildItem dist/pdf-workbench-*-windows-x64.zip)
           if ($archives.Count -ne 1) { throw 'Expected exactly one Windows test package.' }
           ./app/tools/smoke-windows.ps1 -ZipPath $archives[0].FullName -FixtureExecutable "$env:GITHUB_WORKSPACE/app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe"
 
-      - name: Exercise the real packaged CMD entry in isolated Windows consoles
+      - name: Prepare pinned native WebDriver and matching Microsoft EdgeDriver
         if: github.event_name == 'workflow_dispatch'
         run: |
-          $archives = @(Get-ChildItem dist/voucher-workbench-*-windows-x64.zip)
-          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows test package.' }
-          $examples = "$env:GITHUB_WORKSPACE/app/target/windows-dist/x86_64-pc-windows-msvc/release/examples"
-          ./app/tools/smoke-windows-launcher.ps1 -ZipPath $archives[0].FullName -FixtureExecutable "$examples/package_fixture.exe" -ProbeExecutable "$examples/startup_probe.exe"
+          ./app/tools/setup-windows-desktop-tests.ps1 -Directory "$env:RUNNER_TEMP/pdf-native-test-tools"
+
+      - name: Exercise real portable and installed Tauri windows, IPC, native dialogs and safe close
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          $archives = @(Get-ChildItem dist/pdf-workbench-*-windows-x64.zip)
+          $installers = @(Get-ChildItem dist/pdf-workbench-*-windows-x64-setup.exe)
+          if ($archives.Count -ne 1 -or $installers.Count -ne 1) { throw 'Expected one portable package and one installer.' }
+          ./app/tools/smoke-windows-desktop.ps1 -ZipPath $archives[0].FullName -InstallerPath $installers[0].FullName -FixtureExecutable "$env:GITHUB_WORKSPACE/app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe" -ToolsDirectory "$env:RUNNER_TEMP/pdf-native-test-tools" -EvidenceDirectory "$env:GITHUB_WORKSPACE/dist/desktop-verification"
+
+      - name: Upload bounded native desktop evidence
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pdf-workbench-desktop-verification-${{ github.run_number }}
+          path: |
+            dist/desktop-verification/desktop-smoke-report.json
+            dist/desktop-verification/desktop-window.png
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload verified test package
         if: success() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: voucher-workbench-windows-x64-${{ github.run_number }}
+          name: pdf-workbench-windows-x64-${{ github.run_number }}
           path: |
-            dist/voucher-workbench-*-windows-x64.zip
-            dist/voucher-workbench-*-windows-x64.zip.sha256
+            dist/pdf-workbench-*-windows-x64.zip
+            dist/pdf-workbench-*-windows-x64.zip.sha256
+            dist/pdf-workbench-*-windows-x64-setup.exe
+            dist/pdf-workbench-*-windows-x64-setup.exe.sha256
+            dist/pdf-workbench-*-windows-x64-release.json
+            dist/pdf-workbench-*-windows-x64-release.json.sha256
+            dist/MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+            dist/MicrosoftEdgeWebView2RuntimeInstallerX64.exe.sha256
           if-no-files-found: error
           retention-days: 14
           compression-level: 0

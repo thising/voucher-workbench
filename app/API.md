@@ -1,6 +1,39 @@
-# 本地 API 契约（实现接口）
+# 本地 API 契约
 
-凭证规则见 `../openspec/specs/voucher-pdf/spec.md`，通用规则见 `../openspec/specs/generic-pdf/spec.md`。服务只监听 127.0.0.1；首次打开的 URL fragment 含 token，前端存 sessionStorage 后移除 fragment。所有 /api 请求带 `X-Session-Token`，拒绝异源请求。请求/响应 JSON；错误 `{error: "中文原因"}`。文件缩略图/原件也需用 fetch + blob（不得 token 放 URL）。静态文件内嵌，离线无 CDN。`/`为凭证界面，`/generic`为通用界面；同源页面共享当前标签页sessionStorage。
+当前产品规则见[批量合并规格](../openspec/specs/batch-merge/spec.md)。Tauri 独立窗口加载随机端口的本地服务，HTTP仅监听127.0.0.1。首次URL fragment含token，页面存入sessionStorage后移除fragment；所有 `/api` 请求带 `X-Session-Token`，校验回环Host和同源Origin，拒绝跨站请求。JSON业务错误为 `{error:"中文原因"}`；认证失败403，退出期间写请求503，格式错误由框架拒绝。缩略图/原件通过认证fetch取得，不把token放查询参数。
+
+`/` 是新批量合并界面，`/legacy`、`/generic` 仅作0.5.x兼容。静态文件、PDF.js主模块/worker、字体、CMap与WASM资源内嵌；未知静态路径404，无运行时CDN。关闭桌面时禁止新写操作、取消并等待活动任务和原生保存完成，再释放IPC/目录锁。
+
+## 批量合并（0.6.0）
+
+以下路径均以 `/api/batch` 为前缀，文件系统路径使用真实绝对路径：
+
+- POST `/initialize` `{root}` → `{root,max_level,levels:[{level,folder_count,file_count,samples}],folder_count,file_count,issues}`。只读取目录元数据，提供真实级别；level0递归一份，更深层级保留浅层直属文件组，目录深度安全上限256。
+- POST `/index/inspect` `{path,sheet?,header_row?}` → `{path,sha256,sheets,sheet,sheet_error,header_row,columns,preview_rows,suggested_index_column,suggested_name_column}`。默认第一个工作表，不跨表补匹配；表头行为Excel的1起始行，列索引是0起始绝对列。首表为空/不可读仍返回其他工作表信息供选择，`sheet_error`解释当前问题。
+- POST `/scan` `{root,level:0,exclude_rules:string,index?:Config,sort?:Sort}` → 完整Plan。Config为 `{path,sheet,index_column,name_column,header_row,match_rule:"auto"|"exact"|"voucher_code",naming:"index"|"folder_index",duplicates:"fallback"|"first"}`；默认auto/index/fallback。Sort为 `{mode:"name"|"modified"|"prefix"|"suffix",descending:false,separator:null|string}`，默认文件名自然升序。无效排除行忽略并列入issues，来源损坏不忽略；索引不可用时回退目录名并提示。
+- GET `/plans` → Plan[]；GET `/plans/{id}` → 注册Plan。
+- POST `/plans/{id}/edit` `{output_dir?,groups:[{group_id,file_ids?,output_name?,sort?}],files:[{file_id,rotation_cw?,page_rotations?,reviewed?,reviewed_pages?}]}` → 派生Plan。原计划不改；文件顺序必须完整排列本组ID，禁止跨组/重复/遗漏；PDF page_rotations和reviewed_pages与页数严格一致。角度仅0/90/180/270；旋转以EXIF规范后的图片或源PDF原旋转为基准，PDF整份额外角度与逐页角度相加。输出迁移后重新计算自动排除，并可恢复原先仅因旧输出子树而省略的来源。
+- POST `/plans/{id}/analyze` `{accept_disclaimer:true,threads:1..10,group_ids?}` → kind=batch_analyze的Job。默认4，创建单独分析修订计划，job.plan_id指向它；只处理图片，人工设置角度优先保留。记录当前免责声明版本与时间。自动角度/未决/失败供后续核对，人工确认不是生成门槛。
+- POST `/plans/{id}/generate` `{group_ids?,threads:1..10,output_dir?}` → kind=batch_generate的Job。默认4，指定输出先派生并预检；不传group_ids为全部。所选任一空组或已有error会拒绝整个启动请求，调用方可显式仅选有效组；运行中才出现的来源变化按组失败，其他组继续。不以未核对或OCR失败拒绝生成。
+- GET `/plans/{id}/files/{file_id}?thumbnail=true` → EXIF规范、尚未应用额外旋转的图片缩略图；不传thumbnail返回已核验来源（PDF供PDF.js逐页绘制）。实际读取字节核对SHA256，禁止任意来源路径或越权ID。
+- POST `/plans/{id}/open-output` → `{ok:true}`，打开注册且核验过的输出目录。
+- GET `/jobs` → 新批量任务；取消、重试、报告及成品使用公共 `/api/jobs` 接口。
+- GET/PATCH `/preferences` → `{orientation_threads,merge_threads}`。缺省均4，分别为整数1–10；PATCH要求完整结构，任务运行中/退出中拒绝修改。持久化到 `state-dir/batch-preferences.json`，不写旧settings.json。调用方应在新任务前保存偏好，再显式传递线程数；旧任务重试不读取新偏好。
+
+Plan：`{schema_version:1,mode:"batch_merge",id,parent_plan_id,created_at,root,output_dir,level,sort,exclude_rules,index,index_error,groups,issues,exclusions,ignored_files,empty_directories,orientation_workflow,omitted_sources}`。Group包含稳定id、relative_path/name、shallow、output_name/output_path、files/pages、issues/empty、rename匹配证据、sort、review_count/image_count/pdf_count。File包含稳定id、name/relative_path、kind:image|pdf、bytes/modified_ms/sha256、pages/width/height、rotation_cw/page_rotations、reviewed/reviewed_pages/manual_rotation、orientation/orientation_error/error。Workflow为 `{consent_version,consented_at,analysis_completed,threads}`。未核对计数与模型未决计数不同，不称为错误率或准确率。
+
+新计划放在 `state-dir/batch-plans`。合并任务启动冻结 `reports/{job_id}/batch-plan.json`；识别任务先保存初始快照，结束或取消时再冻结最终识别状态。报告逐组冻结来源顺序、指纹、实际页码、索引证据、旋转和复核状态；successful_pages只计算成功合并页，analyzed_files用于识别报告。Job.request.voucher_ids兼容字段保存所选group ID（分析结果按file ID）。编辑生成新修订，不改旧报告。输出记录mode=batch_merge，不能冒用其他模式归属；已修改、未知或外来成品拒绝覆盖，工具拥有的旧成品更新前归档。
+
+## Tauri 原生调用
+
+仅实际main窗口和实际本机服务origin具备能力，其他来源与外部导航拒绝；不授予通用文件系统/任意命令能力。通过 `window.__TAURI__.core.invoke` 调用：
+
+- `select_folder({initialPath?})`、`select_index_file({initialPath?})` → 绝对路径或null，使用原生目录/工作簿选择。
+- `save_job_report({jobId})`、`save_job_output({jobId,groupId})` → `{saved,path?}`。服务根据注册任务重新核验快照/成品哈希，原生另存为取消正常返回；不允许覆盖目标。保存进行中计入退出保护。
+
+## 0.5.x 兼容接口
+
+以下旧规则只适用于原mode/接口，不适用于上述批量合并。旧方向复核门禁和默认1线程保持兼容，新批量合并不继承门禁。
 
 ## 通用PDF模式（0.5.1）
 
@@ -48,7 +81,7 @@ Plan.requested_root 保留原先单分项/批次选择，换表重扫使用此�
 
 Plan.orientation_workflow为`{enabled,consent_version,consented_at,analysis_completed}`，manifest同步保存当次值。缺字段旧计划默认enabled、无同意记录且分析阶段未确认完成，保留旧图片证据和人工确认；不会代用户接受新免责声明。启用后所有图片均需要人工确认，算法自身Orientation.needs_review仅代表模型未决。取消/重启中断不能冒充已完成分析。
 
-Job 字段：`{id,plan_id,kind:"analyze"|"generate"|"generic_generate",status:"queued"|"running"|"completed"|"completed_with_errors"|"cancelled"|"interrupted"|"failed",threads:整数1..10,created_at,updated_at,total,done,current,error:null|string,results:[]}`。
+Job 字段：`{id,plan_id,kind:"analyze"|"generate"|"generic_generate"|"batch_analyze"|"batch_generate",status:"queued"|"running"|"completed"|"completed_with_errors"|"cancelled"|"interrupted"|"failed",threads:整数1..10,created_at,updated_at,total,done,current,error:null|string,results:[]}`。
 结果字段：`{voucher_id,folder,status:"completed"|"skipped"|"failed",output_path:null|string,pages,error:null|string,needs_review:boolean}`。
 服务重启将残留运行任务标为 interrupted，可以重试；方向选择、计划、结果持久保存在启动参数指定 state-dir。
 
