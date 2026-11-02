@@ -6,7 +6,7 @@
 
 ## Windows使用
 
-当前目标为0.5.1 Windows10/11 x64 ZIP测试包，含通用PDF模式和重复启动复用。构建、下载及校验值以[发行说明](docs/windows-release.md)中的实际状态为准；客户Windows10实机试用单独验收。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。再次双击会由原服务重新开网页，任务继续；原服务启动中短暂等待。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
+0.5.1 Windows10/11 x64 ZIP测试包已完成，含通用PDF模式和重复启动复用。[Windows CI #14](https://github.com/thising/voucher-workbench/actions/runs/41389303328)的106项测试、随包业务及真实CMD入口验收通过，构件已独立核验。下载及校验值见[发行说明](docs/windows-release.md)；客户Windows10实机试用单独验收。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。再次双击会由原服务重新开网页，任务继续；原服务启动中短暂等待。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
 
 随包提供CPU OCR模型和ONNX Runtime；方向识别仍默认关闭。Windows VC++运行库要求及缺失处理见[发行说明](docs/windows-release.md)。处理记录默认保存在 `%LOCALAPPDATA%\VoucherWorkbench`，移动或替换程序目录不会删除记录；升级前先在旧版服务窗口退出，再启动新版。旧版占锁或无法联系时，新版显示中文处理步骤；不会自动结束旧进程、删除锁文件或改用新记录目录。
 
