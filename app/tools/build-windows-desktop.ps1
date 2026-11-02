@@ -146,7 +146,7 @@ try {
     Copy-Payload (Join-Path $app 'desktop/package-lock.json') 'licenses/tauri-cli-package-lock.json'
     Copy-Payload (Join-Path $desktop 'Cargo.lock') 'licenses/desktop-Cargo.lock'
     $commit = if ($env:GITHUB_SHA -match '^[0-9a-f]{40}$') { $env:GITHUB_SHA } else { $null }
-    $source = [ordered]@{schema_version=1; name='pdf-workbench'; version=$version; source_commit=$commit; rust_toolchain=$toolchain; rust_crt='static'; core_cargo_lock_sha256=(Hash (Join-Path $app 'Cargo.lock')); desktop_cargo_lock_sha256=(Hash (Join-Path $desktop 'Cargo.lock')); build_tools=$settings.desktop; runtime=$settings.runtime; models=$coreInfo.models; pdfjs=(Get-Content (Join-Path $app 'web/pdfjs/manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json)}
+    $source = [ordered]@{schema_version=1; name='pdf-workbench'; version=$version; source_commit=$commit; rust_toolchain=$toolchain; rust_crt='static'; binary_patching='disabled-no-updater'; core_cargo_lock_sha256=(Hash (Join-Path $app 'Cargo.lock')); desktop_cargo_lock_sha256=(Hash (Join-Path $desktop 'Cargo.lock')); build_tools=$settings.desktop; runtime=$settings.runtime; models=$coreInfo.models; pdfjs=(Get-Content (Join-Path $app 'web/pdfjs/manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json)}
     $source | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $package 'release-source.json') -Encoding utf8NoBOM
     & npm ci --prefix $desktop --ignore-scripts --no-audit --no-fund --cache (Join-Path $CacheDirectory 'npm')
     if ($LASTEXITCODE -ne 0) { throw 'Pinned Tauri CLI installation failed.' }
@@ -158,7 +158,9 @@ try {
     $env:CARGO_TARGET_DIR = $targetDirectory
     Push-Location -LiteralPath $desktop
     try {
-        & node node_modules/@tauri-apps/cli/tauri.js build --ci --target $target --bundles nsis --config $config -- --locked
+        # Tauri otherwise stamps the NSIS payload and restores the original EXE
+        # afterwards. No updater is used; keep portable and installed bytes equal.
+        & node node_modules/@tauri-apps/cli/tauri.js build --ci --target $target --bundles nsis --no-binary-patching --config $config -- --locked
         if ($LASTEXITCODE -ne 0) { throw 'Tauri NSIS build failed.' }
     } finally { Pop-Location }
     Copy-Payload (Join-Path $targetDirectory "$target/release/pdf-workbench.exe") 'PDF工作台.exe'

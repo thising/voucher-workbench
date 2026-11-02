@@ -1,7 +1,7 @@
 # 通用 PDF 模式：使用与设计说明
 
 > 本文仅记录 0.5.x `generic_pdf` 兼容入口。0.6.0 当前主流程以[批量合并规格](../openspec/specs/batch-merge/spec.md)和[README](../README.md)为准；新模式支持图片/PDF、可选索引与非阻塞核对。
-本轮用户已授权规格与实现同步完成，目标版本0.5.1。[通用模式有效规格](../openspec/specs/generic-pdf/spec.md)是业务规则唯一依据；本页解释操作和设计，不另建一份平行规格。API调用字段由[API文档](../app/API.md)维护，Windows构建、发布及客户验收状态由[发行记录](windows-release.md)维护。
+以下是0.5.1 generic_pdf兼容入口的使用与设计说明，仅以[旧通用规格](../openspec/specs/generic-pdf/spec.md)约束该入口；当前0.6.0默认流程以[批量合并规格](../openspec/specs/batch-merge/spec.md)为准。API字段由[API文档](../app/API.md)维护，当前Windows构建、发布及客户验收统一见[发行记录](windows-release.md)。
 
 ## 操作流程
 

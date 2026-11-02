@@ -45,7 +45,9 @@ try {
     if (-not $installation.WaitForExit(180000) -or $installation.ExitCode -ne 0) { throw 'Current-user NSIS installation failed.' }
     $installedExe = Join-Path $installed 'pdf-workbench.exe'
     if (-not (Test-Path -LiteralPath $installedExe)) { throw 'Installer did not place the desktop executable at the requested owned path.' }
-    if ((Get-FileHash -LiteralPath $installedExe).Hash -ne (Get-FileHash -LiteralPath $executable).Hash) { throw 'Portable and installed GUI binaries differ.' }
+    $installedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $portableHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($installedHash -ne $portableHash) { throw "Portable and installed GUI binaries differ: portable SHA256=$portableHash, installed SHA256=$installedHash." }
     foreach ($file in @('runtime/onnxruntime.dll','models/title-ocr/manifest.json','licenses/rust-desktop-dependencies.json','licenses/pdfjs/LICENSE','release-source.json','使用说明.txt')) {
         if (-not (Test-Path -LiteralPath (Join-Path $installed $file))) { throw "Installer resource missing: $file" }
     }
@@ -96,6 +98,7 @@ try {
         if (-not $installedProcess.WaitForExit(60000) -or $installedProcess.ExitCode -ne 0) { throw 'The installed GUI did not close safely.' }
     } finally { if (-not $installedProcess.HasExited) { $installedProcess.Kill() }; $installedProcess.Dispose() }
     $report = Get-Content -LiteralPath $reportFile -Raw -Encoding utf8 | ConvertFrom-Json
+    $report | Add-Member -NotePropertyName binary_sha256 -NotePropertyValue @{ portable = $portableHash; installed = $installedHash } -Force
     $report.checks += @('current-user-nsis-install-chinese-space-path','installed-and-portable-identical-exe','installed-model-runtime-and-license-payload','installed-real-visible-webview-and-normal-close')
     $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8NoBOM
 } catch {
