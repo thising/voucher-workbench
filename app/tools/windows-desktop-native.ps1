@@ -67,7 +67,40 @@ do {
 } while ([DateTimeOffset]::UtcNow -lt $deadline)
 if ($window -eq [IntPtr]::Zero) { throw 'The expected owned native window did not appear.' }
 $contents = if ($dialog) { [OwnedDesktop]::Contents($window) } else { '' }
-if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]::Ordinal)) { throw 'The owned dialog did not contain the expected Chinese explanation.' }
+$textSource = 'win32'
+$textControlsChecked = 0
+if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]::Ordinal)) {
+    # Modern TaskDialog text can be a virtual DirectUI element. Retain the exact
+    # text assertion, using a read-only .NET Framework UIA client in this HWND.
+    $textStart = [Diagnostics.ProcessStartInfo]::new()
+    $textStart.FileName = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    $textStart.UseShellExecute = $false
+    $textStart.CreateNoWindow = $true
+    $textStart.RedirectStandardOutput = $true
+    $textStart.RedirectStandardError = $true
+    $textStart.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $textStart.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-Mta','-File',(Join-Path $PSScriptRoot 'windows-dialog-text-uia.ps1'),'-OwnedProcessId',[string]$OwnedProcessId,'-OwnedWindowHandle',$window.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture),'-ExpectedText',$ExpectedText)) { $textStart.ArgumentList.Add($argument) }
+    $textProcess = [Diagnostics.Process]::Start($textStart)
+    try {
+        $textOutput = $textProcess.StandardOutput.ReadToEndAsync()
+        $textError = $textProcess.StandardError.ReadToEndAsync()
+        if (-not $textProcess.WaitForExit(9500)) { $textProcess.Kill(); throw 'Owned dialog UIA text assertion timed out.' }
+        $textJson = $textOutput.GetAwaiter().GetResult()
+        $null = $textError.GetAwaiter().GetResult()
+        try { $textResult = $textJson | ConvertFrom-Json } catch { throw 'Owned dialog UIA text assertion returned invalid JSON.' }
+        if ($null -eq $textResult -or -not $textResult.PSObject.Properties['matched'] -or
+            -not $textResult.PSObject.Properties['failure'] -or -not $textResult.PSObject.Properties['controls_checked']) {
+            throw 'Owned dialog UIA text assertion returned an invalid result.'
+        }
+        if ($textProcess.ExitCode -ne 0 -or $textResult.matched -isnot [bool] -or $textResult.matched -ne $true) {
+            $textFailure = if ([string]$textResult.failure -match '^[a-z0-9-]{1,80}$') { [string]$textResult.failure } else { 'assertion-failed' }
+            throw "The owned dialog did not contain the expected Chinese explanation ($textFailure)."
+        }
+        $textSource = 'uia'
+        $textControlsChecked = [Math]::Min(512,[Math]::Max(0,[int]$textResult.controls_checked))
+    } finally { if (-not $textProcess.HasExited) { $textProcess.Kill() }; $textProcess.Dispose() }
+}
 switch ($Action) {
     minimize { [OwnedDesktop]::Minimize($window) }
     close { [OwnedDesktop]::Close($window) }
@@ -102,5 +135,6 @@ switch ($Action) {
     error { if (-not [OwnedDesktop]::Button($window,1)) { throw 'The owned native error acknowledgement was not found.' } }
 }
 $result = [ordered]@{controlled=$true; action=$Action; owned_pid=$OwnedProcessId; expected_text_checked=[bool]$ExpectedText}
+if ($ExpectedText) { $result['expected_text_source'] = $textSource; $result['text_controls_checked'] = $textControlsChecked }
 if ($Action -eq 'save') { $result['save_target_verified'] = $true; $result['filename_controls'] = $saveControlResult.filename_controls }
 $result | ConvertTo-Json -Depth 10 -Compress
