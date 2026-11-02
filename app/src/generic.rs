@@ -162,6 +162,46 @@ pub(crate) fn checked_metadata(path: &Path) -> Result<fs::Metadata> {
     }
     Ok(meta)
 }
+
+fn is_missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn check_component_with(
+    path: &Path,
+    must_exist: bool,
+    directory_required: bool,
+    mut observe: impl FnMut(&Path) -> Result<fs::Metadata>,
+) -> Result<()> {
+    let metadata = match observe(path) {
+        Ok(metadata) => Some(metadata),
+        Err(first) if is_missing(&first) => match observe(path) {
+            // Another merge worker may have created the shared output directory.
+            // Validate its current type/attributes instead of returning an old
+            // NotFound after a separate exists() query has observed its creation.
+            Ok(metadata) => Some(metadata),
+            Err(current) if is_missing(&current) => {
+                if must_exist {
+                    return Err(current).context("目录不存在，请检查资料路径");
+                }
+                None
+            }
+            Err(current) => return Err(current),
+        },
+        Err(error) => return Err(error),
+    };
+    if directory_required && metadata.is_some_and(|metadata| !metadata.is_dir()) {
+        bail!("路径中间组件不是目录，请选择真实本地目录");
+    }
+    Ok(())
+}
+
+fn canonicalize_checked_leaf(path: &Path) -> Result<PathBuf> {
+    checked_metadata(path)?;
+    Ok(path.canonicalize()?)
+}
 fn reject_network(path: &Path) -> Result<()> {
     let text = path.to_string_lossy();
     if (text.starts_with("\\\\") && !text.starts_with("\\\\?\\"))
@@ -203,7 +243,8 @@ pub(crate) fn absolute_checked(path: &Path, must_exist: bool) -> Result<PathBuf>
         std::env::current_dir()?.join(path)
     };
     let mut current = PathBuf::new();
-    for part in path.components() {
+    let mut parts = path.components().peekable();
+    while let Some(part) = parts.next() {
         match part {
             Component::CurDir => continue,
             // A drive prefix (especially \\?\C:) is not a complete root
@@ -220,23 +261,18 @@ pub(crate) fn absolute_checked(path: &Path, must_exist: bool) -> Result<PathBuf>
             }
             _ => current.push(part.as_os_str()),
         }
-        match checked_metadata(&current) {
-            Ok(_) => {}
-            Err(e)
-                if !current.exists()
-                    && fs::symlink_metadata(&current)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                if must_exist {
-                    return Err(e).context("目录不存在，请检查资料路径");
-                }
-            }
-            Err(e) => return Err(e),
-        }
+        check_component_with(
+            &current,
+            must_exist,
+            parts.peek().is_some(),
+            checked_metadata,
+        )?;
     }
     reject_network(&current)?;
     if current.exists() {
-        return Ok(current.canonicalize()?);
+        // The leaf may have appeared after a missing observation above. Do not
+        // canonicalize a newly introduced link/reparse/cloud-placeholder leaf.
+        return canonicalize_checked_leaf(&current);
     }
     let parent = current.parent().context("输出目录无效")?;
     let canonical_parent = absolute_checked(parent, false)?;
@@ -2014,5 +2050,184 @@ mod pdf_inspection_tests {
             "Dests"=>dictionary! {"Names"=>vec![Object::string_literal("synthetic"),Object::Array(vec![Object::Reference(page),Object::Name(b"Fit".to_vec())])]}
         });
         assert_eq!(inspect_both(&mut doc).unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod path_observation_tests {
+    use super::*;
+
+    #[test]
+    fn missing_component_created_between_observations_is_validated_as_a_directory() {
+        for must_exist in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let base = temporary.path().canonicalize().unwrap();
+            let directory = base.join("new-output");
+            let mut observations = 0;
+            check_component_with(&directory, must_exist, true, |path| {
+                observations += 1;
+                let observed = checked_metadata(path);
+                if observations == 1 {
+                    assert!(observed.as_ref().is_err_and(is_missing));
+                    fs::create_dir(path).unwrap();
+                }
+                observed
+            })
+            .unwrap();
+            assert_eq!(observations, 2);
+            assert_eq!(
+                absolute_checked(&directory, must_exist).unwrap(),
+                directory.canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_component_stays_missing_or_becomes_a_file_without_weakening_directory_checks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let missing = base.join("missing");
+        check_component_with(&missing, false, true, checked_metadata).unwrap();
+        assert!(check_component_with(&missing, true, true, checked_metadata)
+            .unwrap_err()
+            .to_string()
+            .contains("目录不存在"));
+        let became_file = base.join("new-file");
+        let mut observations = 0;
+        let error = check_component_with(&became_file, false, true, |path| {
+            observations += 1;
+            let observed = checked_metadata(path);
+            if observations == 1 {
+                assert!(observed.as_ref().is_err_and(is_missing));
+                fs::write(path, b"ordinary file").unwrap();
+            }
+            observed
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("中间组件不是目录"));
+        assert!(absolute_checked(&became_file.join("child"), false).is_err());
+        assert_eq!(
+            absolute_checked(&became_file, true).unwrap(),
+            became_file.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_new_security_error_is_preserved_and_other_original_errors_are_not_retried() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().canonicalize().unwrap().join("leaf");
+        let mut observations = 0;
+        let error = check_component_with(&path, false, true, |_| {
+            observations += 1;
+            if observations == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+            } else {
+                bail!("重解析点或云占位文件拒绝")
+            }
+        })
+        .unwrap_err();
+        assert_eq!(observations, 2);
+        assert!(error.to_string().contains("云占位"));
+        let mut observations = 0;
+        let error = check_component_with(&path, false, true, |_| {
+            observations += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        })
+        .unwrap_err();
+        assert_eq!(observations, 1);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_component_replaced_by_a_real_symlink_is_rejected_on_reobservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        for must_exist in [false, true] {
+            let link = base.join(if must_exist {
+                "required-link"
+            } else {
+                "optional-link"
+            });
+            let mut observations = 0;
+            let error = check_component_with(&link, must_exist, true, |path| {
+                observations += 1;
+                let observed = checked_metadata(path);
+                if observations == 1 {
+                    assert!(observed.as_ref().is_err_and(is_missing));
+                    std::os::unix::fs::symlink(&target, path).unwrap();
+                }
+                observed
+            })
+            .unwrap_err();
+            assert_eq!(observations, 2);
+            assert!(error.to_string().contains("符号链接"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_component_replaced_by_a_real_junction_is_rejected_on_reobservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let junction = base.join("new-junction");
+        let mut observations = 0;
+        let error = check_component_with(&junction, false, true, |path| {
+            observations += 1;
+            let observed = checked_metadata(path);
+            if observations == 1 {
+                assert!(observed.as_ref().is_err_and(is_missing));
+                let result = std::process::Command::new("cmd.exe")
+                    .args(["/D", "/C", "mklink", "/J"])
+                    .arg(path)
+                    .arg(&target)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "junction fixture failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            observed
+        })
+        .unwrap_err();
+        assert_eq!(observations, 2);
+        assert!(error.to_string().contains("重解析点"));
+        fs::remove_dir(junction).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leaf_link_appearing_after_both_missing_observations_is_not_canonicalized() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let leaf = base.join("late-link");
+        let mut observations = 0;
+        check_component_with(&leaf, false, false, |path| {
+            observations += 1;
+            let observed = checked_metadata(path);
+            assert!(observed.as_ref().is_err_and(is_missing));
+            if observations == 2 {
+                std::os::unix::fs::symlink(&target, path).unwrap();
+            }
+            observed
+        })
+        .unwrap();
+        assert_eq!(observations, 2);
+        assert!(leaf.exists());
+        assert!(canonicalize_checked_leaf(&leaf)
+            .unwrap_err()
+            .to_string()
+            .contains("符号链接"));
     }
 }

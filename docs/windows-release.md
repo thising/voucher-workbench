@@ -69,7 +69,13 @@ CI仅上传受限合成截图与摘要，不上传含token的原始服务日志�
 
 NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter3.html#3.2.2)使用末尾不带引号的 `_?=` 原地卸载，等待其完成并断言安装EXE消失，避免只等待转交给临时副本的启动进程。该修订仅作用于CI测试助手。
 
-**本轮构件状态：已补充分组诊断、5轮并发兼容稳定性门禁与卸载完成检查，待固定第七轮源码并运行CI；Windows原生另存及附件/SHA256仍待完整CI与独立验包。**
+[第七轮CI #22](https://github.com/thising/voucher-workbench/actions/runs/41503680980)，源码 `3b5467a1ad64021abe6296078562d7f33e418d2e`，完整检查/构建、兼容smoke及5轮默认并发generic均通过；原生业务8项、NSIS原地卸载及EXE消失检查通过。UIA报告仅找到SearchEditBox，证明Edit-only枚举未包含虚拟文件名主机；正在补充FileNameControlHost自身可写ValuePattern，继续坚持精确定位、读回及最终落盘校验。未产出客户附件。
+
+独立路径复核发现了可受控复现的缺失→目录出现竞态：首次NotFound后若另一worker已创建目录，旧exists守卫会返回过期错误。共享路径检查改为重新观察并验证当前元数据；中间非目录、链接/重解析点/云占位/权限保护保留，末尾canonicalize前再次受检。本机5项受控回归、57项release库单测及Clippy通过；Windows真实junction及完整业务待下一轮。第六轮缺分组错误，尚不能确认它必定命中此竞态。
+
+**本轮构件状态：已整合共享路径竞态修复与精确文件名主机UIA支持，准备固定第八轮源码并运行CI；Windows原生另存、附件/SHA256仍待完整CI与独立验包。**
+
+CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 
 开发重建入口：`pwsh -File app/tools/build-windows-desktop.ps1`；`-CheckOnly`只检查，输出与缓存支持隔离目录，同名发行文件拒绝覆盖。准确依赖许可与源码归档地址随包提供。
 

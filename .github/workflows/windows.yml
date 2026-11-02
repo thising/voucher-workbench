@@ -30,6 +30,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Preflight owned modern Windows save dialog controller
+        if: github.event_name == 'workflow_dispatch'
+        run: ./app/tools/test-windows-native-save.ps1
+
       - name: Install pinned Rust toolchain
         run: |
           $settings = Get-Content app/distribution/windows-dependencies.json -Raw | ConvertFrom-Json

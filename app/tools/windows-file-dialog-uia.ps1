@@ -31,10 +31,19 @@ function Get-ControlStructure($Element) {
     $current = $Element.Current
     return [pscustomobject][ordered]@{
         automation_id = Get-SafeAutomationId $current.AutomationId
+        class_name = Get-SafeAutomationId $current.ClassName
         control_type = $current.ControlType.ProgrammaticName
         enabled = [bool]$current.IsEnabled
         offscreen = [bool]$current.IsOffscreen
     }
+}
+
+function Test-FilenameHost($Current) {
+    return ($Current.AutomationId -ceq 'FileNameControlHost' -or
+        ($Current.ClassName -ceq 'FileNameControlHost' -and
+         $Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox) -or
+        ($Current.AutomationId -ceq '1148' -and
+         $Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox))
 }
 
 function Get-OwnedRoot {
@@ -67,16 +76,25 @@ function Get-ScopedAncestry($Element, $Root) {
         $current = $cursor.Current
         if ($current.ProcessId -ne $OwnedProcessId) { break }
         if ($chain.Count -lt 8) { [void]$chain.Add((Get-ControlStructure $cursor)) }
-        # The filename host is an ancestor of the Edit, never a search field
-        # selected solely by its reused Edit ID1001.
-        if ($depth -gt 0 -and ($current.AutomationId -ceq 'FileNameControlHost' -or
-            ($current.AutomationId -ceq '1148' -and
-             $current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox))) {
-            $filenameHost = $true
-        }
+        # A virtual filename host may expose ValuePattern itself without an
+        # Edit child. SearchEditBox and arbitrary ComboBoxes never qualify.
+        if (Test-FilenameHost $current) { $filenameHost = $true }
         $cursor = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($cursor)
     }
     return [pscustomobject]@{ inside = $inside; filename_host = $filenameHost; chain = @($chain.ToArray()) }
+}
+
+function Get-FilenameHost($Element, $Root) {
+    $hostElement = $null
+    $cursor = $Element
+    for ($depth = 0; $depth -lt 20 -and $null -ne $cursor; $depth++) {
+        if ([System.Windows.Automation.Automation]::Compare($cursor, $Root)) { return $hostElement }
+        $current = $cursor.Current
+        if ($current.ProcessId -ne $OwnedProcessId) { return $null }
+        if ($null -eq $hostElement -and (Test-FilenameHost $current)) { $hostElement = $cursor }
+        $cursor = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($cursor)
+    }
+    return $null
 }
 
 try {
@@ -97,26 +115,73 @@ try {
     Add-Type -AssemblyName UIAutomationTypes
     $script:FailureCode = 'dialog-root-read'
     $root = Get-OwnedRoot
-    $editCondition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Edit)
+    $filenameCondition = [System.Windows.Automation.OrCondition]::new(
+        [System.Windows.Automation.OrCondition]::new(
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Edit),
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::ComboBox)),
+        [System.Windows.Automation.OrCondition]::new(
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost'),
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'FileNameControlHost')))
     $script:FailureCode = 'filename-enumeration'
-    $edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
-    if ($edits.Count -gt 64) { Stop-UiaSave 'too-many-edit-controls' }
+    $controls = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $filenameCondition)
+    if ($controls.Count -gt 64) { Stop-UiaSave 'too-many-filename-controls' }
     $candidates = [System.Collections.Generic.List[object]]::new()
+    $hosts = [System.Collections.Generic.List[object]]::new()
     $structures = [System.Collections.Generic.List[object]]::new()
-    foreach ($edit in $edits) {
-        $ancestry = Get-ScopedAncestry $edit $root
-        if ($structures.Count -lt 16) { [void]$structures.Add($ancestry) }
-        $script:FilenameControls = @($structures.ToArray())
-        $current = $edit.Current
-        if (-not $ancestry.inside -or -not $ancestry.filename_host -or
-            -not $current.IsEnabled -or $current.IsOffscreen) { continue }
+    foreach ($control in $controls) {
+        $ancestry = Get-ScopedAncestry $control $root
+        $current = $control.Current
         $pattern = $null
-        if (-not $edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) { continue }
-        $valuePattern = [System.Windows.Automation.ValuePattern]$pattern
-        if ($valuePattern.Current.IsReadOnly) { continue }
-        [void]$candidates.Add([pscustomobject]@{ element = $edit; pattern = $valuePattern })
+        $hasValue = $control.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
+        $valuePattern = if ($hasValue) { [System.Windows.Automation.ValuePattern]$pattern } else { $null }
+        $readOnly = if ($hasValue) { [bool]$valuePattern.Current.IsReadOnly } else { $null }
+        if ($structures.Count -lt 16) {
+            [void]$structures.Add([pscustomobject]@{
+                inside = $ancestry.inside; filename_host = $ancestry.filename_host
+                value_pattern = [bool]$hasValue; read_only = $readOnly; chain = $ancestry.chain
+            })
+        }
+        $script:FilenameControls = @($structures.ToArray())
+        if (-not $ancestry.inside -or -not $ancestry.filename_host -or
+            -not $current.IsEnabled -or $current.IsOffscreen -or -not $hasValue -or $readOnly) { continue }
+        $hostElement = Get-FilenameHost $control $root
+        if ($null -eq $hostElement) { continue }
+        $hostCurrent = $hostElement.Current
+        if (-not $hostCurrent.IsEnabled -or $hostCurrent.IsOffscreen) { continue }
+        $isHost = [System.Windows.Automation.Automation]::Compare($control, $hostElement)
+        if (-not $isHost -and $current.ControlType -ne [System.Windows.Automation.ControlType]::Edit) { continue }
+        $hostGroup = $null
+        foreach ($entry in $hosts) {
+            if ([System.Windows.Automation.Automation]::Compare($entry.element, $hostElement)) { $hostGroup = $entry; break }
+        }
+        if ($null -eq $hostGroup) {
+            $hostGroup = [pscustomobject]@{
+                element = $hostElement
+                preferred = [System.Collections.Generic.List[object]]::new()
+                fallback = [System.Collections.Generic.List[object]]::new()
+            }
+            [void]$hosts.Add($hostGroup)
+        }
+        $candidate = [pscustomobject]@{ element = $control; pattern = $valuePattern; host = $hostElement }
+        if ($isHost) { [void]$hostGroup.preferred.Add($candidate) }
+        else { [void]$hostGroup.fallback.Add($candidate) }
+    }
+    # Host and child Edit can both implement ValuePattern. Treat them as one
+    # filename host and prefer its own pattern; distinct hosts remain ambiguous.
+    if ($hosts.Count -gt 1) { Stop-UiaSave ('filename-host-count=' + $hosts.Count) }
+    if ($hosts.Count -eq 1) {
+        $hostGroup = $hosts[0]
+        if ($hostGroup.preferred.Count -gt 0) {
+            foreach ($candidate in $hostGroup.preferred) { [void]$candidates.Add($candidate) }
+        } else {
+            foreach ($candidate in $hostGroup.fallback) { [void]$candidates.Add($candidate) }
+        }
     }
     if ($candidates.Count -ne 1) { Stop-UiaSave ('filename-candidate-count=' + $candidates.Count) }
 
@@ -149,7 +214,10 @@ try {
     $save = $saveCandidates[0]
     $script:FailureCode = 'dialog-revalidation'
     $null = Get-OwnedRoot
-    if (-not (Get-ScopedAncestry $filename.element $root).inside) { Stop-UiaSave 'filename-left-dialog' }
+    $currentHost = Get-FilenameHost $filename.element $root
+    if ($null -eq $currentHost -or -not [System.Windows.Automation.Automation]::Compare($currentHost, $filename.host) -or
+        -not $filename.element.Current.IsEnabled -or $filename.element.Current.IsOffscreen -or
+        $filename.pattern.Current.IsReadOnly) { Stop-UiaSave 'filename-left-dialog-or-not-writable' }
     $script:FailureCode = 'filename-focus'
     $filename.element.SetFocus()
     $script:FailureCode = 'filename-write'
