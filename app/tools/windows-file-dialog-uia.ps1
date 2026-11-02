@@ -14,6 +14,91 @@ $ProgressPreference = 'SilentlyContinue'
 $OutputEncoding = [Console]::OutputEncoding
 $script:FailureCode = 'initialization'
 $script:FilenameControls = @()
+$script:ClientsideProvidersLoaded = $false
+
+# Framework CodeDom-compatible C#: no global input, text retrieval or desktop
+# enumeration. Native controls must be children of the caller's exact dialog.
+$nativeDefinition = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class PdfWorkbenchDialogBridge {
+    public delegate bool Visitor(IntPtr window, IntPtr data);
+    [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsChild(IntPtr parent, IntPtr child);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr window);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr window, int id);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr window, StringBuilder text, int capacity);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, Visitor visitor, IntPtr data);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
+    static string ClassOf(IntPtr window) { StringBuilder text = new StringBuilder(128); GetClassNameW(window, text, text.Capacity); return text.ToString(); }
+    static bool SameProcess(IntPtr window, int process) { uint actual; GetWindowThreadProcessId(window, out actual); return IsWindow(window) && actual == (uint)process; }
+    public static bool Root(long root, int process) { IntPtr window = new IntPtr(root); return SameProcess(window, process) && ClassOf(window) == "#32770" && IsWindowVisible(window) && IsWindowEnabled(window); }
+    static bool Child(IntPtr window, IntPtr root, int process) { return SameProcess(window, process) && IsChild(root, window) && IsWindowVisible(window) && IsWindowEnabled(window); }
+    public static long[] VisibleEdits(long root, int process) {
+        List<long> result = new List<long>(); IntPtr parent = new IntPtr(root);
+        if (!Root(root, process)) return result.ToArray();
+        EnumChildWindows(parent, delegate(IntPtr child, IntPtr data) {
+            if (Child(child, parent, process) && ClassOf(child) == "Edit") result.Add(child.ToInt64());
+            return result.Count < 65;
+        }, IntPtr.Zero);
+        return result.ToArray();
+    }
+    public static double[] Bounds(long handle) {
+        // UIA rectangles use physical screen pixels. GetWindowRect otherwise
+        // virtualizes coordinates for a DPI-unaware PowerShell client.
+        IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-3));
+        if (previous == IntPtr.Zero) return null;
+        try { Rect rect; if (!GetWindowRect(new IntPtr(handle), out rect)) return null;
+            return new double[] { rect.Left, rect.Top, rect.Right, rect.Bottom };
+        } finally { SetThreadDpiAwarenessContext(previous); }
+    }
+    public static bool Filename(long handle, long root, int process, double left, double top, double right, double bottom) {
+        IntPtr edit = new IntPtr(handle), dialog = new IntPtr(root);
+        if (!Root(root, process) || !Child(edit, dialog, process) || ClassOf(edit) != "Edit") return false;
+        bool combo = false; bool reached = false; IntPtr parent = GetParent(edit);
+        for (int depth = 0; depth < 20 && parent != IntPtr.Zero; depth++, parent = GetParent(parent)) {
+            if (parent == dialog) { reached = true; break; }
+            if (!SameProcess(parent, process)) return false;
+            string kind = ClassOf(parent); if (kind == "ComboBox" || kind == "ComboBoxEx32") combo = true;
+        }
+        if (!reached || !combo) return false;
+        double[] rect = Bounds(handle); if (rect == null || rect[2] <= rect[0] || rect[3] <= rect[1]) return false;
+        // Two physical pixels tolerate fractional UIA border rounding only.
+        return rect[0] >= left - 2 && rect[1] >= top - 2 && rect[2] <= right + 2 && rect[3] <= bottom + 2;
+    }
+    public static string[] Chain(long handle, long root, int process) {
+        List<string> result = new List<string>(); IntPtr cursor = new IntPtr(handle), dialog = new IntPtr(root);
+        for (int depth = 0; depth < 8 && cursor != IntPtr.Zero && cursor != dialog; depth++, cursor = GetParent(cursor)) {
+            if (!SameProcess(cursor, process) || !IsChild(dialog, cursor)) break;
+            result.Add(ClassOf(cursor) + "#" + GetDlgCtrlID(cursor));
+        }
+        return result.ToArray();
+    }
+    public static long SaveButton(long root, int process) {
+        IntPtr dialog = new IntPtr(root), button = GetDlgItem(dialog, 1);
+        return Root(root, process) && Child(button, dialog, process) && ClassOf(button) == "Button" && GetDlgCtrlID(button) == 1 ? button.ToInt64() : 0;
+    }
+    public static bool FocusSave(long root, int process, long button) {
+        if (button == 0 || SaveButton(root, process) != button) return false;
+        IntPtr result;
+        // WM_NEXTDLGCTL selects this exact child in the dialog's own UI thread.
+        return SendMessageTimeoutW(new IntPtr(root), 0x28, new IntPtr(button), new IntPtr(1), 2, 3000, out result) != IntPtr.Zero;
+    }
+    public static bool ClickSave(long root, int process, long button) {
+        return button != 0 && SaveButton(root, process) == button && PostMessageW(new IntPtr(button), 0xF5, IntPtr.Zero, IntPtr.Zero);
+    }
+}
+'@
 
 function Stop-UiaSave([string]$Code) {
     $script:FailureCode = $Code
@@ -29,13 +114,37 @@ function Get-SafeAutomationId([string]$Id) {
 
 function Get-ControlStructure($Element) {
     $current = $Element.Current
+    $patterns = @()
+    try { $patterns = @($Element.GetSupportedPatterns() | Select-Object -First 8 | ForEach-Object { $_.ProgrammaticName }) } catch { }
     return [pscustomobject][ordered]@{
         automation_id = Get-SafeAutomationId $current.AutomationId
         class_name = Get-SafeAutomationId $current.ClassName
         control_type = $current.ControlType.ProgrammaticName
         enabled = [bool]$current.IsEnabled
         offscreen = [bool]$current.IsOffscreen
+        patterns = $patterns
     }
+}
+
+function Get-UiaBounds($Element) {
+    $rect = $Element.Current.BoundingRectangle
+    if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) { return $null }
+    $bounds = @([double]$rect.Left, [double]$rect.Top, [double]$rect.Right, [double]$rect.Bottom)
+    foreach ($coordinate in $bounds) {
+        if ([double]::IsNaN($coordinate) -or [double]::IsInfinity($coordinate)) { return $null }
+    }
+    return ,$bounds
+}
+
+function Get-RawChildStructures($Element) {
+    $children = [System.Collections.Generic.List[object]]::new()
+    $child = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetFirstChild($Element)
+    while ($null -ne $child -and $children.Count -lt 8) {
+        if ($child.Current.ProcessId -ne $OwnedProcessId) { break }
+        [void]$children.Add((Get-ControlStructure $child))
+        $child = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetNextSibling($child)
+    }
+    return ,@($children.ToArray())
 }
 
 function Test-FilenameHost($Current) {
@@ -113,6 +222,10 @@ try {
     $script:FailureCode = 'uia-assembly-load'
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
+    # Framework normally registers these proxies automatically. Explicit loading
+    # is recorded as evidence, not treated as proof of the missing-tree cause.
+    try { Add-Type -AssemblyName UIAutomationClientsideProviders; $script:ClientsideProvidersLoaded = $true } catch { }
+    Add-Type -TypeDefinition $nativeDefinition -Language CSharp
     $script:FailureCode = 'dialog-root-read'
     $root = Get-OwnedRoot
     $filenameCondition = [System.Windows.Automation.OrCondition]::new(
@@ -133,6 +246,7 @@ try {
     if ($controls.Count -gt 64) { Stop-UiaSave 'too-many-filename-controls' }
     $candidates = [System.Collections.Generic.List[object]]::new()
     $hosts = [System.Collections.Generic.List[object]]::new()
+    $hostRegions = [System.Collections.Generic.List[object]]::new()
     $structures = [System.Collections.Generic.List[object]]::new()
     foreach ($control in $controls) {
         $ancestry = Get-ScopedAncestry $control $root
@@ -145,12 +259,23 @@ try {
             [void]$structures.Add([pscustomobject]@{
                 inside = $ancestry.inside; filename_host = $ancestry.filename_host
                 value_pattern = [bool]$hasValue; read_only = $readOnly; chain = $ancestry.chain
+                raw_children = if (Test-FilenameHost $current) { Get-RawChildStructures $control } else { @() }
             })
         }
         $script:FilenameControls = @($structures.ToArray())
+        $hostElement = $null
+        if ($ancestry.inside -and $ancestry.filename_host) {
+            $hostElement = Get-FilenameHost $control $root
+            if ($null -ne $hostElement -and $hostElement.Current.IsEnabled -and -not $hostElement.Current.IsOffscreen) {
+                $knownRegion = $false
+                foreach ($region in $hostRegions) {
+                    if ([System.Windows.Automation.Automation]::Compare($region, $hostElement)) { $knownRegion = $true; break }
+                }
+                if (-not $knownRegion) { [void]$hostRegions.Add($hostElement) }
+            }
+        }
         if (-not $ancestry.inside -or -not $ancestry.filename_host -or
             -not $current.IsEnabled -or $current.IsOffscreen -or -not $hasValue -or $readOnly) { continue }
-        $hostElement = Get-FilenameHost $control $root
         if ($null -eq $hostElement) { continue }
         $hostCurrent = $hostElement.Current
         if (-not $hostCurrent.IsEnabled -or $hostCurrent.IsOffscreen) { continue }
@@ -168,13 +293,13 @@ try {
             }
             [void]$hosts.Add($hostGroup)
         }
-        $candidate = [pscustomobject]@{ element = $control; pattern = $valuePattern; host = $hostElement }
+        $candidate = [pscustomobject]@{ element = $control; pattern = $valuePattern; host = $hostElement; native_handle = [long]0 }
         if ($isHost) { [void]$hostGroup.preferred.Add($candidate) }
         else { [void]$hostGroup.fallback.Add($candidate) }
     }
     # Host and child Edit can both implement ValuePattern. Treat them as one
     # filename host and prefer its own pattern; distinct hosts remain ambiguous.
-    if ($hosts.Count -gt 1) { Stop-UiaSave ('filename-host-count=' + $hosts.Count) }
+    if ($hostRegions.Count -gt 1) { Stop-UiaSave ('filename-host-count=' + $hostRegions.Count) }
     if ($hosts.Count -eq 1) {
         $hostGroup = $hosts[0]
         if ($hostGroup.preferred.Count -gt 0) {
@@ -182,6 +307,56 @@ try {
         } else {
             foreach ($candidate in $hostGroup.fallback) { [void]$candidates.Add($candidate) }
         }
+    }
+    if ($candidates.Count -eq 0 -and $hostRegions.Count -eq 1) {
+        $script:FailureCode = 'filename-native-bridge'
+        $hostElement = $hostRegions[0]
+        $hostBounds = Get-UiaBounds $hostElement
+        if ($null -eq $hostBounds) { Stop-UiaSave 'filename-host-bounds-unavailable' }
+        $bridgeInfo = [pscustomobject]@{
+            kind = 'owned-win32-bridge'; host = Get-ControlStructure $hostElement
+            host_bounds = $hostBounds; native_controls = @(); from_handle = $null
+        }
+        $script:FilenameControls = @($script:FilenameControls) + @($bridgeInfo)
+        $nativeEdits = @([PdfWorkbenchDialogBridge]::VisibleEdits($OwnedWindowHandle, $OwnedProcessId))
+        if ($nativeEdits.Count -gt 64) { Stop-UiaSave 'too-many-native-edit-controls' }
+        $nativeMatches = [System.Collections.Generic.List[long]]::new()
+        $nativeStructures = [System.Collections.Generic.List[object]]::new()
+        foreach ($nativeHandle in $nativeEdits) {
+            $eligible = [PdfWorkbenchDialogBridge]::Filename($nativeHandle, $OwnedWindowHandle, $OwnedProcessId,
+                $hostBounds[0], $hostBounds[1], $hostBounds[2], $hostBounds[3])
+            if ($nativeStructures.Count -lt 16) {
+                [void]$nativeStructures.Add([pscustomobject]@{
+                    native_chain = @([PdfWorkbenchDialogBridge]::Chain($nativeHandle, $OwnedWindowHandle, $OwnedProcessId))
+                    physical_bounds = @([PdfWorkbenchDialogBridge]::Bounds($nativeHandle)); inside_filename_host = [bool]$eligible
+                })
+            }
+            if ($eligible) { [void]$nativeMatches.Add($nativeHandle) }
+        }
+        $bridgeInfo.native_controls = @($nativeStructures.ToArray())
+        if ($nativeMatches.Count -ne 1) { Stop-UiaSave ('filename-native-candidate-count=' + $nativeMatches.Count) }
+        $nativeHandle = $nativeMatches[0]
+        $script:FailureCode = 'filename-from-handle'
+        $nativeElement = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new($nativeHandle))
+        if ($null -eq $nativeElement) { Stop-UiaSave 'filename-from-handle-unavailable' }
+        $current = $nativeElement.Current
+        $pattern = $null
+        $hasValue = $nativeElement.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
+        $valuePattern = if ($hasValue) { [System.Windows.Automation.ValuePattern]$pattern } else { $null }
+        $bridgeInfo.from_handle = [pscustomobject]@{
+            control = Get-ControlStructure $nativeElement; ancestry = Get-ScopedAncestry $nativeElement $root
+            value_pattern = [bool]$hasValue; read_only = if ($hasValue) { [bool]$valuePattern.Current.IsReadOnly } else { $null }
+        }
+        if ($current.ProcessId -ne $OwnedProcessId -or $current.ControlType -ne [System.Windows.Automation.ControlType]::Edit -or
+            (([long]$current.NativeWindowHandle -band 4294967295L) -ne ($nativeHandle -band 4294967295L))) {
+            Stop-UiaSave 'filename-from-handle-identity-mismatch'
+        }
+        if (-not $current.IsEnabled -or $current.IsOffscreen -or -not $hasValue -or $valuePattern.Current.IsReadOnly) {
+            Stop-UiaSave 'filename-from-handle-not-writable'
+        }
+        [void]$candidates.Add([pscustomobject]@{
+            element = $nativeElement; pattern = $valuePattern; host = $hostElement; native_handle = $nativeHandle
+        })
     }
     if ($candidates.Count -ne 1) { Stop-UiaSave ('filename-candidate-count=' + $candidates.Count) }
 
@@ -205,7 +380,13 @@ try {
         if (-not $ancestry.inside -or -not $current.IsEnabled -or $current.IsOffscreen) { continue }
         $pattern = $null
         if ($button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
-            [void]$saveCandidates.Add([pscustomobject]@{ element = $button; pattern = [System.Windows.Automation.InvokePattern]$pattern })
+            [void]$saveCandidates.Add([pscustomobject]@{ element = $button; pattern = [System.Windows.Automation.InvokePattern]$pattern; native_handle = [long]0 })
+        }
+    }
+    if ($saveCandidates.Count -eq 0) {
+        $nativeButton = [PdfWorkbenchDialogBridge]::SaveButton($OwnedWindowHandle, $OwnedProcessId)
+        if ($nativeButton -ne 0) {
+            [void]$saveCandidates.Add([pscustomobject]@{ element = $null; pattern = $null; native_handle = $nativeButton })
         }
     }
     if ($saveCandidates.Count -ne 1) { Stop-UiaSave ('save-button-candidate-count=' + $saveCandidates.Count) }
@@ -214,10 +395,23 @@ try {
     $save = $saveCandidates[0]
     $script:FailureCode = 'dialog-revalidation'
     $null = Get-OwnedRoot
-    $currentHost = Get-FilenameHost $filename.element $root
-    if ($null -eq $currentHost -or -not [System.Windows.Automation.Automation]::Compare($currentHost, $filename.host) -or
-        -not $filename.element.Current.IsEnabled -or $filename.element.Current.IsOffscreen -or
-        $filename.pattern.Current.IsReadOnly) { Stop-UiaSave 'filename-left-dialog-or-not-writable' }
+    if ($filename.native_handle -ne 0) {
+        # A native proxy may have no managed UIA-host ancestor. Revalidate its
+        # HWND ancestry and exact physical relationship to the known UIA host.
+        $hostScope = Get-ScopedAncestry $filename.host $root
+        $hostBounds = Get-UiaBounds $filename.host
+        if (-not $hostScope.inside -or -not (Test-FilenameHost $filename.host.Current) -or
+            -not $filename.host.Current.IsEnabled -or $filename.host.Current.IsOffscreen -or $null -eq $hostBounds -or
+            -not [PdfWorkbenchDialogBridge]::Filename($filename.native_handle, $OwnedWindowHandle, $OwnedProcessId,
+                $hostBounds[0], $hostBounds[1], $hostBounds[2], $hostBounds[3])) { Stop-UiaSave 'filename-native-scope-changed' }
+    } else {
+        $currentHost = Get-FilenameHost $filename.element $root
+        if ($null -eq $currentHost -or -not [System.Windows.Automation.Automation]::Compare($currentHost, $filename.host)) {
+            Stop-UiaSave 'filename-left-dialog'
+        }
+    }
+    if (-not $filename.element.Current.IsEnabled -or $filename.element.Current.IsOffscreen -or
+        $filename.pattern.Current.IsReadOnly) { Stop-UiaSave 'filename-not-writable' }
     $script:FailureCode = 'filename-focus'
     $filename.element.SetFocus()
     $script:FailureCode = 'filename-write'
@@ -229,15 +423,25 @@ try {
     # Focus commits the filename edit before invoking Save. Capture all evidence
     # first: invoking Save can destroy the dialog and invalidate every element.
     $script:FailureCode = 'save-button-focus'
-    $save.element.SetFocus()
-    $null = Get-OwnedRoot
-    if (-not (Get-ScopedAncestry $save.element $root).inside -or
-        -not $save.element.Current.IsEnabled -or $save.element.Current.IsOffscreen) {
-        Stop-UiaSave 'save-button-left-dialog-or-disabled'
+    if ($save.native_handle -ne 0) {
+        if (-not [PdfWorkbenchDialogBridge]::FocusSave($OwnedWindowHandle, $OwnedProcessId, $save.native_handle)) {
+            Stop-UiaSave 'save-button-native-focus-failed'
+        }
+    } else {
+        $save.element.SetFocus()
+        $null = Get-OwnedRoot
+        if (-not (Get-ScopedAncestry $save.element $root).inside -or
+            -not $save.element.Current.IsEnabled -or $save.element.Current.IsOffscreen) {
+            Stop-UiaSave 'save-button-left-dialog-or-disabled'
+        }
     }
-    $success = [ordered]@{ controlled = $true; save_target_verified = $true; filename_controls = $script:FilenameControls }
+    $success = [ordered]@{ controlled = $true; save_target_verified = $true; filename_controls = $script:FilenameControls; clientside_providers_loaded = $script:ClientsideProvidersLoaded }
     $script:FailureCode = 'save-button-invoke'
-    $save.pattern.Invoke()
+    if ($save.native_handle -ne 0) {
+        if (-not [PdfWorkbenchDialogBridge]::ClickSave($OwnedWindowHandle, $OwnedProcessId, $save.native_handle)) {
+            Stop-UiaSave 'save-button-native-click-failed'
+        }
+    } else { $save.pattern.Invoke() }
     # Never query an element or a dialog property after Invoke.
     [Console]::Out.WriteLine(($success | ConvertTo-Json -Depth 10 -Compress))
     exit 0
@@ -252,6 +456,7 @@ try {
         exception_type = $caughtException.GetType().FullName
         hresult = ('0x{0:x8}' -f ([long]$caughtException.HResult -band 4294967295L))
         filename_controls = $script:FilenameControls
+        clientside_providers_loaded = $script:ClientsideProvidersLoaded
     }
     [Console]::Out.WriteLine(($failure | ConvertTo-Json -Depth 10 -Compress))
     exit 1

@@ -73,7 +73,11 @@ NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter
 
 独立路径复核发现了可受控复现的缺失→目录出现竞态：首次NotFound后若另一worker已创建目录，旧exists守卫会返回过期错误。共享路径检查改为重新观察并验证当前元数据；中间非目录、链接/重解析点/云占位/权限保护保留，末尾canonicalize前再次受检。本机5项受控回归、57项release库单测及Clippy通过；Windows真实junction及完整业务待下一轮。第六轮缺分组错误，尚不能确认它必定命中此竞态。
 
-**本轮构件状态：已整合共享路径竞态修复与精确文件名主机UIA支持，准备固定第八轮源码并运行CI；Windows原生另存、附件/SHA256仍待完整CI与独立验包。**
+[第八轮CI #23](https://github.com/thising/voucher-workbench/actions/runs/41507355753)，源码 `955b4c5c8e0f1c7cbce026020341cc404062b13c`，快速现代另存预检失败，尚未进入Rust/产品窗口检查。明确证据：FileNameControlHost是AppControlHost类型Pane，自身无ValuePattern；UIA树只有搜索Edit，物理Win32 filename Edit仍存在。正在以精确主机范围关联其内部原生输入控件，继续要求同PID、唯一匹配、写入读回和实际目标落盘验证。
+
+文件名测试助手已增加精确UIA主机矩形→同PID原生Edit/ComboBox树→FromHandle可写ValuePattern桥接，必要时仅对自有ID1保存按钮投递消息；所有权、唯一性、物理像素边界和读回均须通过。C#5真实定义编译及10份PowerShell解析通过，Windows行为仍待快速预检和完整随包测试。
+
+**本轮构件状态：准备固定第九轮测试助手；共享路径补丁本机已过，完整Windows CI、附件/SHA256尚未完成。**
 
 CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 
