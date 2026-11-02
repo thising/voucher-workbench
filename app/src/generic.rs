@@ -390,23 +390,146 @@ pub(crate) fn output_name(raw: &str) -> Result<String> {
 /// Reject unsupported document-level features before page import. Static page
 /// annotations are restricted to text/markup and external URI links.
 pub(crate) fn inspect_pdf(path: &Path) -> Result<u32> {
-    let doc = Document::load(path).context("PDF损坏或无法解析")?;
+    inspect_pdf_bytes(&fs::read(path).context("PDF损坏或无法解析")?)
+}
+
+/// Inspect the exact bytes already fingerprinted by a scanner, without reopening
+/// the source. The path and byte entry points apply the same support boundary.
+pub(crate) fn inspect_pdf_bytes(bytes: &[u8]) -> Result<u32> {
+    let doc = Document::load_mem(bytes).context("PDF损坏或无法解析")?;
+    inspect_pdf_document(&doc)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdfImportInfo {
+    pub pages: u32,
+    pub signature_notice: bool,
+}
+
+/// Batch-only page import. Signature appearances become static annotations;
+/// original files and legacy import policies are unchanged.
+pub fn inspect_batch_pdf_bytes(bytes: &[u8]) -> Result<PdfImportInfo> {
+    let mut doc = Document::load_mem(bytes).context("PDF损坏或无法解析")?;
+    inspect_batch_pdf_document(&mut doc)
+}
+
+pub fn inspect_batch_pdf(path: &Path) -> Result<PdfImportInfo> {
+    let mut doc = Document::load(path).context("PDF损坏或无法解析")?;
+    inspect_batch_pdf_document(&mut doc)
+}
+
+pub(crate) fn inspect_batch_pdf_document(doc: &mut Document) -> Result<PdfImportInfo> {
+    inspect_pdf_document_rules(doc, true)?;
+    let signature_notice = pdf::normalize_batch_signatures(doc)?;
+    let pages = inspect_pdf_document(doc)?;
+    Ok(PdfImportInfo {
+        pages,
+        signature_notice,
+    })
+}
+
+fn pdf_dictionary(object: &Object) -> Option<&lopdf::Dictionary> {
+    match object {
+        Object::Dictionary(dictionary) => Some(dictionary),
+        Object::Stream(stream) => Some(&stream.dict),
+        _ => None,
+    }
+}
+
+fn signature_field_state(doc: &Document) -> (bool, bool) {
+    let mut has_signature_field = false;
+    for dictionary in doc.objects.values().filter_map(pdf_dictionary) {
+        if dictionary
+            .get(b"FT")
+            .ok()
+            .and_then(|value| value.as_name().ok())
+            != Some(b"Sig")
+        {
+            continue;
+        }
+        has_signature_field = true;
+        let Some(value) = dictionary
+            .get(b"V")
+            .ok()
+            .and_then(|value| doc.dereference(value).ok())
+            .and_then(|(_, value)| value.as_dict().ok())
+        else {
+            continue;
+        };
+        let byte_range = value
+            .get(b"ByteRange")
+            .ok()
+            .and_then(|value| doc.dereference(value).ok())
+            .and_then(|(_, value)| value.as_array().ok());
+        let contents = value
+            .get(b"Contents")
+            .ok()
+            .and_then(|value| doc.dereference(value).ok())
+            .and_then(|(_, value)| value.as_str().ok());
+        // This identifies a populated signature structure, not a cryptographic
+        // verification. An empty/preallocated signing field is a separate case.
+        if byte_range.is_some_and(|range| {
+            range.len() >= 4
+                && range.len() % 2 == 0
+                && range
+                    .iter()
+                    .all(|value| value.as_i64().is_ok_and(|n| n >= 0))
+                && range
+                    .iter()
+                    .any(|value| value.as_i64().is_ok_and(|n| n > 0))
+        }) && contents.is_some_and(|bytes| bytes.iter().any(|byte| *byte != 0))
+        {
+            return (true, true);
+        }
+    }
+    (false, has_signature_field)
+}
+
+fn inspect_pdf_document(doc: &Document) -> Result<u32> {
+    inspect_pdf_document_rules(doc, false)
+}
+
+fn inspect_pdf_document_rules(doc: &Document, signature_source: bool) -> Result<u32> {
     if doc.is_encrypted() || doc.trailer.has(b"Encrypt") {
         bail!("加密PDF不支持，请提供未加密的静态副本");
     }
+    let (has_populated_signature, has_signature_field) = signature_field_state(doc);
+    if has_populated_signature && !signature_source {
+        bail!("PDF含已填写的数字签名字段（未验证签名有效性）；当前合并无法保持原数字签名验证，原件未被改动。请移除此文件，或使用由您另行确认的静态副本");
+    }
     let catalog = doc.catalog()?;
-    for key in [
-        b"AcroForm".as_slice(),
-        b"OpenAction",
-        b"AA",
-        b"Collection",
-        b"OCProperties",
-        b"OutputIntents",
-        b"URI",
-        b"AF",
+    if catalog.has(b"AcroForm") && !signature_source {
+        if has_signature_field {
+            bail!("PDF含未填写或无法验证的签名字段；当前合并不支持保留此字段，原件未被改动。请移除此文件，或使用由您另行确认的静态副本");
+        }
+        bail!("PDF含交互表单；当前合并无法保留表单功能，原件未被改动。请移除此文件，或使用由您另行确认的静态副本");
+    }
+    for (key, message) in [
+        (
+            b"OpenAction".as_slice(),
+            "PDF含打开时动作，当前仅支持不含自动动作的静态副本",
+        ),
+        (b"AA", "PDF含文档自动动作，当前仅支持不含自动动作的静态副本"),
+        (
+            b"Collection",
+            "PDF为文档集合，当前不支持合并，请提供普通静态副本",
+        ),
+        (
+            b"OCProperties",
+            "PDF含可选图层，当前合并无法保留其文档级图层设置，请提供普通静态副本",
+        ),
+        (
+            b"OutputIntents",
+            "PDF含文档级色彩输出意图，当前合并无法保留该设置，请提供普通静态副本",
+        ),
+        (
+            b"URI",
+            "PDF含文档级链接基地址，当前合并可能改变相对链接目标，请提供普通静态副本",
+        ),
+        (b"AF", "PDF含关联附件，当前仅支持不含附件的普通静态副本"),
     ] {
         if catalog.has(key) {
-            bail!("PDF含表单、自动动作、文档集合、可选图层或色彩输出意图，当前仅支持普通静态PDF");
+            bail!(message);
         }
     }
     if let Ok(names) = catalog.get(b"Names") {
@@ -416,32 +539,28 @@ pub(crate) fn inspect_pdf(path: &Path) -> Result<u32> {
             bail!("PDF含脚本或嵌入文件，请提供普通静态副本");
         }
     }
-    for object in doc.objects.values() {
-        let dictionary = match object {
-            Object::Dictionary(d) => Some(d),
-            Object::Stream(s) => Some(&s.dict),
-            _ => None,
+    for d in doc.objects.values().filter_map(pdf_dictionary) {
+        let named = |key: &[u8], value: &[u8]| {
+            d.get(key).ok().and_then(|o| o.as_name().ok()) == Some(value)
         };
-        if let Some(d) = dictionary {
-            let named = |key: &[u8], value: &[u8]| {
-                d.get(key).ok().and_then(|o| o.as_name().ok()) == Some(value)
-            };
-            if named(b"Type", b"Sig")
-                || named(b"FT", b"Sig")
-                || named(b"S", b"JavaScript")
-                || d.has(b"JS")
-                || named(b"Type", b"EmbeddedFile")
-                || named(b"Subtype", b"Widget")
-                || named(b"Type", b"OCG")
-                || named(b"Type", b"OCMD")
-                || d.has(b"EF")
-                || d.has(b"AF")
-            {
-                bail!("PDF含数字签名、交互表单、脚本、嵌入文件或可选图层，请提供普通静态副本");
-            }
+        if (named(b"Type", b"Sig") || named(b"FT", b"Sig")) && !signature_source {
+            bail!("PDF含签名对象或签名字段；当前合并无法保留原数字签名验证，原件未被改动。请移除此文件，或使用由您另行确认的静态副本");
+        }
+        if named(b"Subtype", b"Widget") && !signature_source {
+            bail!("PDF含交互表单控件，当前合并无法保留表单功能，请提供另行确认的静态副本");
+        }
+        if named(b"S", b"JavaScript")
+            || d.has(b"JS")
+            || named(b"Type", b"EmbeddedFile")
+            || named(b"Type", b"OCG")
+            || named(b"Type", b"OCMD")
+            || d.has(b"EF")
+            || d.has(b"AF")
+        {
+            bail!("PDF含数字签名、交互表单、脚本、嵌入文件或可选图层，请提供普通静态副本");
         }
     }
-    let ordered = validate_page_tree(&doc)?;
+    let ordered = validate_page_tree(doc)?;
     let pages = doc.get_pages();
     if pages.values().copied().collect::<Vec<_>>() != ordered {
         bail!("PDF页树与解析页面列表不一致，拒绝可能漏页的合并");
@@ -460,25 +579,27 @@ pub(crate) fn inspect_pdf(path: &Path) -> Result<u32> {
                 let (_, annotation) = doc.dereference(annotation)?;
                 let d = annotation.as_dict()?;
                 let subtype = d.get(b"Subtype")?.as_name()?;
-                if !matches!(
-                    subtype,
-                    b"Text"
-                        | b"FreeText"
-                        | b"Line"
-                        | b"Square"
-                        | b"Circle"
-                        | b"Polygon"
-                        | b"PolyLine"
-                        | b"Highlight"
-                        | b"Underline"
-                        | b"Squiggly"
-                        | b"StrikeOut"
-                        | b"Stamp"
-                        | b"Caret"
-                        | b"Ink"
-                        | b"Popup"
-                        | b"Link"
-                ) {
+                if !(signature_source && subtype == b"Widget")
+                    && !matches!(
+                        subtype,
+                        b"Text"
+                            | b"FreeText"
+                            | b"Line"
+                            | b"Square"
+                            | b"Circle"
+                            | b"Polygon"
+                            | b"PolyLine"
+                            | b"Highlight"
+                            | b"Underline"
+                            | b"Squiggly"
+                            | b"StrikeOut"
+                            | b"Stamp"
+                            | b"Caret"
+                            | b"Ink"
+                            | b"Popup"
+                            | b"Link"
+                    )
+                {
                     bail!("PDF包含当前不支持的页面注释，请转为普通静态副本");
                 }
                 if d.has(b"AA") || d.has(b"Dest") {
@@ -1401,6 +1522,7 @@ pub fn build_group(
                 .map(|_| format!(".history/{}/{}", uuid::Uuid::new_v4(), group.output_name)),
             previous_hash,
             manifest: manifest.clone(),
+            replace_existing: false,
         };
         if let Some(backup) = &transaction.backup {
             pdf::checked_output_child(&directory, backup)?;
@@ -1496,6 +1618,7 @@ pub(crate) fn execute(state: &AppState, job: &Job, cancel: &AtomicBool) -> Resul
                                 pages: output.manifest.pages,
                                 error: None,
                                 needs_review: false,
+                                rotation_change: None,
                             }
                         }
                         Err(error) => JobResult {
@@ -1506,6 +1629,7 @@ pub(crate) fn execute(state: &AppState, job: &Job, cancel: &AtomicBool) -> Resul
                             pages: 0,
                             error: Some(format!("{error:#}")),
                             needs_review: false,
+                            rotation_change: None,
                         },
                     };
                     state.update_job(&job.id, |j| {
@@ -1755,4 +1879,140 @@ async fn api_open_output(
         .spawn()
         .context("无法打开输出目录，请在资源管理器中手动打开预览路径")?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod pdf_inspection_tests {
+    use super::*;
+
+    fn document() -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type"=>"Page", "Parent"=>pages,
+            "MediaBox"=>vec![0.into(),0.into(),100.into(),200.into()]
+        });
+        doc.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type"=>"Pages", "Kids"=>vec![Object::Reference(page)], "Count"=>1
+            }),
+        );
+        let root = doc.add_object(dictionary! {"Type"=>"Catalog", "Pages"=>pages});
+        doc.trailer.set("Root", root);
+        doc
+    }
+
+    fn form(doc: &mut Document, kind: &str, value: Option<lopdf::Dictionary>) {
+        let mut field =
+            dictionary! {"FT"=>Object::Name(kind.as_bytes().to_vec()), "Subtype"=>"Widget"};
+        if let Some(value) = value {
+            let value = doc.add_object(value);
+            field.set("V", value);
+        }
+        let field = doc.add_object(field);
+        let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        doc.get_object_mut(catalog)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "AcroForm",
+                dictionary! {"Fields"=>vec![Object::Reference(field)]},
+            );
+    }
+
+    fn inspect_both(doc: &mut Document) -> std::result::Result<u32, String> {
+        let mut bytes = vec![];
+        doc.save_to(&mut bytes).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("synthetic.pdf");
+        fs::write(&path, &bytes).unwrap();
+        let from_path = inspect_pdf(&path).map_err(|e| e.to_string());
+        let from_bytes = inspect_pdf_bytes(&bytes).map_err(|e| e.to_string());
+        assert_eq!(from_path, from_bytes);
+        from_bytes
+    }
+
+    #[test]
+    fn path_and_bytes_apply_the_same_static_pdf_boundary() {
+        assert_eq!(inspect_both(&mut document()).unwrap(), 1);
+        let mut interactive = document();
+        form(&mut interactive, "Tx", None);
+        let error = inspect_both(&mut interactive).unwrap_err();
+        assert!(error.contains("交互表单") && !error.contains("数字签名"));
+        let mut encrypted = document();
+        encrypted
+            .trailer
+            .set("Encrypt", dictionary! {"Filter"=>"Standard", "V"=>1,"R"=>2});
+        assert!(inspect_both(&mut encrypted)
+            .unwrap_err()
+            .contains("加密PDF"));
+        let mut action = document();
+        let root = action.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        action
+            .get_object_mut(root)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "OpenAction",
+                dictionary! {"S"=>"JavaScript","JS"=>Object::string_literal("synthetic")},
+            );
+        assert!(inspect_both(&mut action)
+            .unwrap_err()
+            .contains("打开时动作"));
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("invalid.pdf");
+        fs::write(&path, b"invalid synthetic PDF").unwrap();
+        assert_eq!(
+            inspect_pdf(&path).unwrap_err().to_string(),
+            inspect_pdf_bytes(b"invalid synthetic PDF")
+                .unwrap_err()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn populated_signature_requires_field_value_and_payload_evidence() {
+        let mut signed = document();
+        form(
+            &mut signed,
+            "Sig",
+            Some(dictionary! {
+                "Type"=>"Sig", "ByteRange"=>vec![0.into(),20.into(),40.into(),10.into()],
+                "Contents"=>Object::String(vec![48,1,2,3],lopdf::StringFormat::Hexadecimal)
+            }),
+        );
+        let error = inspect_both(&mut signed).unwrap_err();
+        assert!(
+            error.contains("已填写的数字签名字段")
+                && error.contains("未验证签名有效性")
+                && error.contains("原件未被改动")
+        );
+        for value in [
+            None,
+            Some(dictionary! {
+                "Type"=>"Sig", "ByteRange"=>vec![0.into(),0.into(),0.into(),0.into()],
+                "Contents"=>Object::String(vec![0;8],lopdf::StringFormat::Hexadecimal)
+            }),
+        ] {
+            let mut unsigned = document();
+            form(&mut unsigned, "Sig", value);
+            let error = inspect_both(&mut unsigned).unwrap_err();
+            assert!(error.contains("未填写或无法验证的签名字段"));
+            assert!(!error.contains("已填写的数字签名字段"));
+        }
+    }
+
+    #[test]
+    fn named_destinations_alone_are_not_reported_as_active_content() {
+        let mut doc = document();
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        doc.get_object_mut(root).unwrap().as_dict_mut().unwrap().set("Names", dictionary! {
+            "Dests"=>dictionary! {"Names"=>vec![Object::string_literal("synthetic"),Object::Array(vec![Object::Reference(page),Object::Name(b"Fit".to_vec())])]}
+        });
+        assert_eq!(inspect_both(&mut doc).unwrap(), 1);
+    }
 }

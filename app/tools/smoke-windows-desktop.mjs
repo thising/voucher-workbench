@@ -50,9 +50,39 @@ async function api(endpoint,body,method=body===undefined?'GET':'POST') {
   assert(result.ok,`Authenticated workbench API rejected ${endpoint.replace(/[a-z0-9]{20,}/gi,'<id>')}.`);
   return result.value;
 }
+async function scanPlan(body) {
+  const started=await api('/batch/scans',body);
+  const completed=await until(async()=>{
+    const progress=await api(`/batch/scans/${started.id}`);
+    return progress.status==='completed' && progress.plan_id && progress;
+  },'asynchronous scan completed',90000);
+  return api(`/batch/plans/${completed.plan_id}`);
+}
 async function click(selector) { await js(`const n=document.querySelector(arguments[0]);if(!n||n.disabled)throw Error('control unavailable');n.click();`,selector); }
 async function input(selector,value,event='input') {
   await js(`const n=document.querySelector(arguments[0]);n.value=arguments[1];n.dispatchEvent(new Event(arguments[2],{bubbles:true}));`,selector,String(value),event);
+}
+async function dragFileHandle(from,to) {
+  const points=await js(`
+    const handles=Array.from(document.querySelectorAll('#file-list .file-drag-handle'));
+    const source=handles[arguments[0]],target=handles[arguments[1]];
+    if(!source||!target||source.disabled||target.disabled)throw Error('sort handle unavailable');
+    source.scrollIntoView({block:'center'});
+    const point=node=>{const r=node.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};};
+    return {from:point(source),to:point(target)};`,from,to);
+  // Native WebDriver input: do not replace this with dispatched PointerEvents.
+  try {
+    await wd('POST',`/session/${session}/actions`,{actions:[{
+      type:'pointer',id:'file-sort-mouse',parameters:{pointerType:'mouse'},actions:[
+        {type:'pointerMove',duration:0,origin:'viewport',...points.from},
+        {type:'pointerDown',button:0},{type:'pause',duration:150},
+        {type:'pointerMove',duration:600,origin:'viewport',...points.to},
+        {type:'pointerUp',button:0},
+      ],
+    }]});
+  } finally {
+    await wd('DELETE',`/session/${session}/actions`);
+  }
 }
 async function probe(directory) { return JSON.parse(await fs.readFile(path.join(directory,'desktop-probe.json'),'utf8')); }
 async function native(pid,action,extra=[]) {
@@ -64,6 +94,7 @@ function start(args) {
   childProcesses.add(child);
   // Drain without persisting/printing. A headless legacy instance intentionally
   // prints a session fragment; it remains only in this anonymous pipe.
+  child.stdout.on('data',chunk=>{if(/http:\/\/127\.0\.0\.1:/.test(chunk.toString('utf8')))child.serviceReady=true;});
   child.stdout.resume();child.stderr.resume();
   return child;
 }
@@ -77,6 +108,9 @@ async function exited(pid) {
   owned.delete(pid);
 }
 async function open(state,probeDirectory,extra=[]) {
+  // A crash can leave the last visible/loaded record behind. Never accept a
+  // prior PID as evidence for a newly launched application.
+  await fs.rm(path.join(probeDirectory,'desktop-probe.json'),{force:true});
   const result=await wd('POST','/session',{capabilities:{alwaysMatch:{'tauri:options':{
     application:exe,args:['--state-dir',state,'--test-probe-dir',probeDirectory,...extra]}}}});
   session=result.sessionId;
@@ -127,29 +161,45 @@ try {
   assert.equal((await wd('GET',`/session/${session}/window/handles`)).length,1,'Unexpected additional desktop window.');
   report.checks.push('remote-navigation-and-new-window-blocked');
 
-  await input('#root-path',path.join(fixtures,'合成分项'));
-  await click('#initialize-folder');
+  await input('#root-path',path.join(fixtures,'合成分项'),'change');
   await until(()=>js(`return !document.querySelector('#merge-level').disabled && document.querySelector('#merge-level').options.length>=2;`),'actual folder levels');
   await input('#merge-level','1','change');
+  await until(()=>js(`return !document.querySelector('#scan-button').disabled;`),'automatic preparation ready');
   await click('#scan-button');
   await until(()=>js(`return document.querySelector('#summary-groups').textContent==='2' && document.querySelectorAll('#file-list .file-row').length===3;`),'three-pane scan');
   assert.equal(await js(`return document.querySelector('#summary-pages').textContent;`),'8');
-  report.checks.push('real-ui-folder-depth-scan-image-and-pdf-three-pane');
+  assert.equal(await js(`return document.querySelector('#initialize-folder')===null && !document.querySelector('#scan-results').hidden;`),true);
+  const scanJob=(await api('/jobs')).find(job=>job.kind==='batch_scan' && job.status==='completed');
+  assert(scanJob,'The UI did not finish a registered asynchronous scan.');
+  const scanProgress=await api(`/batch/scans/${scanJob.id}`);
+  assert.equal(scanProgress.counts.image_files,4);assert.equal(scanProgress.counts.pdf_files,2);
+  assert.equal(scanProgress.counts.source_errors,0);
+  report.checks.push('real-ui-automatic-folder-initialization-asynchronous-scan-and-three-pane');
   await js(`Array.from(document.querySelectorAll('#file-list .file-select')).find(n=>n.textContent.includes('.pdf')).click();`);
   await until(()=>js(`const c=document.querySelector('#preview-surface canvas');return !!c && c.width>0 && c.height>0;`),'offline PDF.js renders native PDF',60000);
   await input('#source-page-number',2,'change');
   await click('#rotate-right');
   await until(async()=>{const plans=await api('/batch/plans');const p=plans.find(p=>p.groups.some(g=>g.files.some(f=>f.kind==='pdf'&&f.page_rotations?.[1]===90)));return p;},'PDF manual page-two rotation');
   assert.equal(await js(`return document.querySelector('#rotation-scope').value;`),'page');
-  assert.equal(await js(`return document.querySelector('#reviewed-file').checked;`),false);
+  assert.equal(await js(`return document.querySelector('#reviewed-file')===null;`),true);
   await screenshot('desktop-window.png');
   report.checks.push('offline-pdfjs-real-canvas-and-per-page-manual-rotation');
 
-  // Reorder and rename through the actual UI, then merge without a review gate.
-  await js(`document.querySelectorAll('#file-list .to-top')[2].click();`);
+  // Exercise the native pointer gesture, then the existing move/top buttons.
+  await dragFileHandle(2,0);
+  await until(()=>js(`return document.querySelector('#file-list .file-select').textContent.includes('.pdf') && document.querySelector('#edit-state').textContent==='调整已保存';`),'native pointer sorting saved');
+  report.checks.push('native-webdriver-pointer-handle-reorder-and-autosave');
+  await js(`document.querySelectorAll('#file-list .file-moves')[0].querySelectorAll('button')[2].click();`);
+  await until(()=>js(`return !document.querySelector('#file-list .file-select').textContent.includes('.pdf') && document.querySelector('#edit-state').textContent==='调整已保存';`),'move-down button saved');
+  await js(`document.querySelectorAll('#file-list .to-top')[1].click();`);
+  await until(()=>js(`return document.querySelector('#file-list .file-select').textContent.includes('.pdf') && document.querySelector('#edit-state').textContent==='调整已保存';`),'top button saved');
   await input('#group-list .group-rename input','桌面合成成品.pdf');
-  await click('#save-edits');
-  await until(()=>js(`return document.querySelector('#save-edits').hidden;`),'manual edits saved');
+  await until(()=>js(`return document.querySelector('#edit-state').textContent==='调整已保存' && !document.querySelector('#merge-button').disabled;`),'order and rename autosaved');
+  const renamedPlan=await until(async()=>{
+    const plans=await api('/batch/plans');
+    return plans.find(plan=>plan.groups.some(group=>group.output_name==='桌面合成成品.pdf' && group.files[0]?.kind==='pdf'));
+  },'persisted automatic order and filename save');
+  assert(renamedPlan,'The automatic edit save did not persist file order and the output name.');
   await click('#merge-button');
   await until(()=>js(`return document.querySelector('#merge-dialog').open;`),'merge dialog');
   await input('#merge-threads',3,'change');
@@ -169,6 +219,56 @@ try {
   assert(saved.ok && saved.value.saved);assert.equal(JSON.parse(await fs.readFile(savedReport,'utf8')).job.id,completed.id);
   report.checks.push('real-native-save-pdf-and-report-verified-bytes');
 
+  // Existing destinations are runtime decisions, including outputs produced
+  // by this tool. Exercise the real controls rather than auto-answering APIs.
+  const previousHashes=new Map(await Promise.all(completed.results.map(async r=>[r.output_path,hash(await fs.readFile(r.output_path))])));
+  async function repeatMergeToConflict() {
+    await until(()=>js(`return !document.querySelector('#merge-button').disabled;`),'merge available after prior task');
+    const oldIds=new Set((await api('/jobs')).map(j=>j.id));
+    await click('#merge-button');
+    await until(()=>js(`return document.querySelector('#merge-dialog').open;`),'repeat merge dialog');
+    await click('#start-merge');
+    const task=await until(async()=>{const jobs=await api('/jobs');return jobs.find(j=>j.kind==='batch_generate'&&!oldIds.has(j.id));},'new conflict merge task');
+    await until(()=>js(`return document.querySelector('#output-conflict-dialog').open;`),'runtime same-name dialog');
+    const pending=await api(`/jobs/${task.id}`);
+    assert.equal(pending.status,'running');assert(pending.output_conflict?.id);
+    assert(await js(`return document.querySelector('#output-conflict-path').textContent.length>0 && !document.querySelector('#output-conflict-apply').checked;`),'Conflict details or fresh checkbox missing.');
+    return task;
+  }
+  const skipTask=await repeatMergeToConflict();
+  await screenshot('desktop-output-conflict.png');
+  await click('#output-conflict-apply');await click('#output-conflict-skip');
+  const skipped=await until(async()=>{const j=await api(`/jobs/${skipTask.id}`);return j.status==='completed'&&j;},'skip applies to remaining batch');
+  assert.equal(skipped.output_conflict,null);
+  assert.equal(skipped.results.length,2);
+  assert(skipped.results.every(r=>r.status==='skipped_existing'&&r.pages===0&&r.output_path===null));
+  assert.equal((await api(`/jobs/${skipTask.id}/report`)).successful_pages,0);
+  for(const [target,expected] of previousHashes) assert.equal(hash(await fs.readFile(target)),expected);
+  await until(()=>js(`return !document.querySelector('#output-conflict-dialog').open;`),'skip dialog closes');
+  const cancelTask=await repeatMergeToConflict();
+  await click('#output-conflict-cancel');
+  const cancelled=await until(async()=>{const j=await api(`/jobs/${cancelTask.id}`);return j.status==='cancelled'&&j;},'cancel while conflict pending');
+  assert.equal(cancelled.output_conflict,null);
+  for(const [target,expected] of previousHashes) assert.equal(hash(await fs.readFile(target)),expected);
+  await until(()=>js(`return !document.querySelector('#output-conflict-dialog').open;`),'cancel dialog closes');
+  const overwriteTask=await repeatMergeToConflict();
+  await click('#output-conflict-apply');await click('#output-conflict-overwrite');
+  const overwritten=await until(async()=>{const j=await api(`/jobs/${overwriteTask.id}`);return j.status==='completed'&&j;},'overwrite applies to remaining batch',90000);
+  assert.equal(overwritten.results.length,2);
+  assert(overwritten.results.every(r=>r.status==='completed'&&r.output_path));
+  assert.equal(overwritten.results.reduce((n,r)=>n+r.pages,0),8);
+  assert.equal(overwritten.output_conflict,null);
+  async function noArchives(directory) {
+    for(const entry of await fs.readdir(directory,{withFileTypes:true})) {
+      assert.notEqual(entry.name,'.history','Batch overwrite retained an archive.');
+      assert(!/\.(?:partial\.pdf|previous|bak|backup)$/i.test(entry.name),'A completed overwrite retained a temporary/backup file.');
+      if(entry.isDirectory()) await noArchives(path.join(directory,entry.name));
+    }
+  }
+  await noArchives(path.dirname(completed.results[0].output_path));
+  await noArchives(path.join(state,'outputs'));
+  report.checks.push('real-ui-runtime-output-conflict-skip-direct-overwrite-batch-scope-cancel-without-backups');
+
   await native(pid,'minimize');
   const before=(await probe(probes)).activations;
   await ended(start(['--state-dir',state]));
@@ -181,7 +281,7 @@ try {
   const busyRoot=path.join(work,'合成后台任务');await fs.mkdir(busyRoot);
   const syntheticImage=path.join(fixtures,'合成分项','260101-00001','2601_00001_1.jpg');
   for(let i=0;i<256;i++) await fs.copyFile(syntheticImage,path.join(busyRoot,`image_${String(i).padStart(4,'0')}.jpg`));
-  const busyPlan=await api('/batch/scan',{root:busyRoot,level:0});
+  const busyPlan=await scanPlan({root:busyRoot,level:0});
   const busyJob=await api(`/batch/plans/${busyPlan.id}/analyze`,{accept_disclaimer:true,threads:1});
   await until(async()=>['queued','running'].includes((await api(`/jobs/${busyJob.id}`)).status),'actual OCR task active');
   const busyBefore=await api(`/jobs/${busyJob.id}`);const count=(await probe(probes)).activations;
@@ -215,8 +315,9 @@ try {
   for(const [name,delay] of [['starting-instance',1800],['simultaneous-launch',0]]) {
     const d=path.join(work,name); const p=path.join(d,'probe');
     const one=start(['--state-dir',path.join(d,'state'),'--test-probe-dir',p,'--startup-delay-ms',String(delay)]);
-    if(delay) await wait(150);
+    if(delay) await until(async()=>{try{return (await fs.stat(path.join(d,'state','instance.lock'))).isFile();}catch{return false;}},'delayed primary published its record lock');
     const two=start(['--state-dir',path.join(d,'state'),'--test-probe-dir',p]);
+    if(delay) {await wait(250);assert.equal(two.exitCode,null,'Secondary exited before the delayed primary was ready.');}
     const ready=await until(async()=>{const s=await probe(p);return s.webview_loaded&&s.activations>=2&&s;},name,90000);
     owned.add(ready.pid);const secondary=one.pid===ready.pid?two:one;
     await ended(secondary);await native(ready.pid,'close');await exited(ready.pid);
@@ -228,7 +329,7 @@ try {
   // mismatch and must never ask that legacy process to open an external browser.
   const legacyState=path.join(work,'legacy-state');
   const legacy=start(['--headless','--no-browser','--state-dir',legacyState]);
-  await until(async()=>{try{return (await fs.stat(path.join(legacyState,'instance.lock'))).isFile();}catch{return false;}},'legacy lock created');
+  await until(()=>legacy.serviceReady,'legacy service fully ready');
   const blocked=start(['--state-dir',legacyState]);
   await native(blocked.pid,'error',['-ExpectedText','不同界面版本']);await ended(blocked,1);
   assert(legacy.exitCode===null,'The desktop ended the legacy process.');legacy.kill();await until(()=>legacy.exitCode!==null||legacy.signalCode!==null,'owned legacy cleanup');childProcesses.delete(legacy);

@@ -1,114 +1,70 @@
-# Windows构建、打包与验收
+# Windows 构建、打包与验收
 
-当前唯一发布目标是 **0.6.0：PDF工作台，Tauri 独立窗口＋Rust 核心，Windows10/11 x64**。有效依据为[批量合并规格](../openspec/specs/batch-merge/spec.md)及[桌面发行规格](../openspec/specs/windows-distribution/spec.md)。以下0.5.1记录为已交付历史，不作为新版行为约束。
+当前唯一发布目标：**0.6.0 PDF工作台，Tauri 独立窗口＋Rust 核心，Windows 10/11 x64**。业务依据为[批量合并规格](../openspec/specs/batch-merge/spec.md)，桌面与发行依据为[桌面发行规格](../openspec/specs/windows-distribution/spec.md)。本文是构建、基线、构件和验收状态的唯一入口；0.5.x规则仅约束其历史兼容入口。
 
-## 0.6.0 当前状态
+## 当前状态（2026-11-03）
 
-实现已进入实际桌面与发布验收：统一三栏批量合并、可选索引、图片自动方向、PDF逐页手动旋转，以及不阻塞生成的人工核对；新模式默认4线程，旧状态与线程设置单独保留。本机已完成核心与Tauri联编、新增合成回归；Windows构建、真实窗口和安装包尚待本轮CI验证，不能视为已交付。
+用户已明确授权固定当前功能基线、统一文档、运行Windows CI并准备客户软件包，之前的CI暂停要求已解除。本机功能和原生窗口验证已完成；本轮Windows构建与独立验包正在准备，尚无新的CI通过结论。客户Windows10实际双击、组件安装、单位安全策略和真实资料验收始终单列，不以CI代替。
 
-分发采用便携ZIP与当前用户NSIS安装包。WebView2按需检测/安装，微软x64离线安装器独立附带，本次实际附件215,017,168字节（约205MiB），不嵌入每份主程序更新。PDF.js离线预览资源内嵌并锁定版本/哈希，运行不从CDN加载。
+版本固定为0.6.0；构件准确源码以随包 `release-source.json` 的 `source_commit` 及同轮CI为准，ZIP逐文件清单在 `package-manifest.json`，附件大小、SHA256及双Cargo.lock摘要在 `pdf-workbench-0.6.0-windows-x64-release.json`。完成CI和独立验包后再补充本页的构建来源、附件及校验结果。
 
-当前构建入口为 `app/tools/build-windows-desktop.ps1`；CI需实际运行随包GUI、原生文件选择/保存与安全退出，仅headless API通过不代表窗口通过。最终CI链接、成品校验值及客户Win10待验项将在验收后更新。
+[公开仓库](https://github.com/thising/voucher-workbench)仅发布工具源码及现行规格。来源白名单为 `tools/public-source.json`；提交前运行 `tools/prepare-source.py --verify-staged`，禁止带入资料、处理记录、预览、日志、模型权重及临时验收目录。
 
-## 0.5.1 历史交付记录
+## 当前功能与兼容口径
 
-历史发布目标：**0.5.1，Windows10/11 x64，CPU OCR，ZIP客户试用包**。有效规则见[Windows发行规格](../openspec/specs/windows-distribution/spec.md)、[凭证规则](../openspec/specs/voucher-pdf/spec.md)及[通用PDF规则](../openspec/specs/generic-pdf/spec.md)。本文记录构建与验收证据，不替代这些规则。
+- 独立窗口默认进入“批量合并”；日常双击 `PDF工作台.exe` 或安装快捷方式，不需要外部浏览器、终端、Rust、Office、Python、Node或Docker。
+- 准备资料：选择目标即初始化，按实际层级分组；排除规则默认折叠。重命名默认关闭，开启后选择XLS/XLSX、工作表、表头行及两列；默认“文件夹名-指定列内容”，可选独立名称。同索引固定取原始第一条，未命中或首条为空回退文件夹名；支持逐行手改和实时重名提示。
+- 预处理：三栏展示合并单元、文件顺序和预览；支持手柄拖动、置顶、上下移及从本次任务移除/恢复来源，原文件不删除。图片与PDF可混合，PDF保持内部页序并支持逐页手动旋转。
+- 自动方向仅处理图片，用户同意须知后启动；默认4线程、允许1–10。仅本次实际变角的图片和所属单元标色，方向明细只列变角文件，其余结果汇总；同角缓存重跑不重复标记。旧记录缺少变化证据时保持中性，不改原JSON或保存角度。人工检查建议保留，未核对不阻止合并。
+- 执行合并：每单元一份PDF，默认目标同级加“-PDF”，可更改输出位置；按当前顺序和角度生成，不加页眉、页脚或分隔页。识别和合并线程分别记忆，默认4、范围1–10。
+- 已有普通同名文件只在执行合并时询问跳过、覆盖或取消，可应用本批次。**覆盖直接替换，不保留旧PDF或登记备份，覆盖后无法恢复**；提交前生成/校验失败或取消保留旧目标，已完成项目在任务取消后保留。事务只保存新结果供提交中断恢复，目录、链接、来源同目标等保护不能绕过。已有历史归档不自动清理。
+- 带签名PDF按可靠静态外观纳入；不验证、不保留原数字签名验证，输入原件不变。缺乏可用静态外观或其他不支持内容仍明确报错。旧计划中因此被拒绝的来源须重新扫描。
+- 同一处理记录目录仅一个实例；重复启动唤回原窗口，任务继续。活动任务关闭时选择继续或安全停止后退出，不自动强杀旧进程、删锁、放宽权限或另换目录。
+- 默认记录目录继续使用 `%LOCALAPPDATA%\VoucherWorkbench`，保留旧计划、复核及线程设置；新批量偏好与旧设置分开。输出PDF旁不生成manifest，来源/角度/页码/校验记录在该目录 `outputs/<输出路径摘要>/`，历史计划和报告另存。升级/换机保留整个记录目录；历史报告不能恢复已直接覆盖的旧PDF。
 
-当前状态（2026-11-02）：通用PDF模式与启动优化已实现，本地104项合成测试通过（另1项私有OCR测试按设计忽略），格式、Clippy、JS语法及Windows GNU全目标Clippy通过。Windows106项测试及完整打包、两种随包业务流程和真实CMD入口矩阵通过；构件已下载并独立验包，客户资料包与校验值已生成。客户当前Windows10实际双击与浏览器复测仍待反馈。截图证明旧入口存在解析异常，具体触发条件尚未在客户环境复现，不能断言文件编码损坏。
+## 软件包与运行组件
 
-## 0.5.1变更
+本轮交付便携ZIP、当前用户NSIS安装包、中文使用说明、附件校验值，以及独立WebView2离线安装器。便携与安装版主EXE须逐字一致；随包提供CPU模型、ONNX Runtime、PDF.js离线资源、许可和来源清单，不含客户资料及CI helper。
 
-通用PDF模式不依赖Excel或OCR。可选择合并层级0–32、输出目录、明确排除的文件/目录和受限glob规则；预览每组的文件、页数、输出名称。支持自然顺序、修改时间顺序、手动拖动或上下移动。保存顺序/名称会创建新计划，旧任务仍引用原计划。默认输出为资料目录同级的“资料名-合并PDF”；嵌套输出自动排除，未知或被修改的同名文件拒绝覆盖。
-
-凭证模式的明细账首表/指定表、原向合并、可选标题识别及人工复核规则保持兼容。两种模式共用1–10线程设置、全局单活动任务、取消/重试和历史；旧任务缺少线程字段时仍按1，重试沿用原值。通用PDF的记录明确标记模式，不能冒用凭证输出记录。
-
-随包`启动凭证工作台.cmd`只含ASCII、使用CRLF，定位同目录EXE、转发参数，非零退出时pause；不改代码页，中文提示由Rust输出。首次启动服务并开网页；重复启动通知原服务重新打开页面，第二进程正常退出。原服务启动中最多等待15秒，任务执行中再次启动不重置任务。
-
-Windows激活使用当前用户SID专属DACL的本地命名管道，拒绝远程客户端；认证URL只由原服务从内存交给浏览器，IPC不返回URL/token，也不保存普通会话发现文件。macOS开发使用私有用户目录与socket，校验对端用户。IPC关闭完成后才释放目录锁，锁文件不会自动删除。
-
-## 启动故障处理
-
-| 情况 | 行为与处理 |
-| --- | --- |
-| 新版服务已运行 | 由原服务再开认证页面；原任务继续，新进程返回成功 |
-| 原服务仍在启动 | 中文提示并短暂等待，15秒仍不可联系则报错 |
-| 旧版或无法联系的占锁实例 | 原窗口等待任务完成后Ctrl+C退出，再启动新版；保留记录和锁文件 |
-| 记录目录无写入权限 | 明示目录与权限/磁盘原因；检查当前账号读写权限及安全软件后重试 |
-| 指定端口被占用 | 检查占用应用，或显式使用`--port 0`；不自动结束其他进程 |
-| 首次浏览器打开失败 | 服务继续运行，检查HTTP/HTTPS默认应用，或复制原控制台完整地址手动打开 |
-| 重复启动时浏览器失败 | 第二进程返回非零并保留错误窗口，原任务不受影响；修复后再次双击 |
-
-程序不为启动自动结束占锁进程、删除锁文件、放宽访问权限或改用新记录目录。正常重复启动不视为故障。关闭网页不退出服务，结束使用在原服务窗口按Ctrl+C，等待当前工作收尾。
-
-## 自动化与验证范围
-
-公开仓库：[thising/voucher-workbench](https://github.com/thising/voucher-workbench)。GitHub Actions固定Windows2022 runner、Rust1.99.1、Cargo.lock及带SHA256的模型/原生库。push/PR执行检查，手动workflow_dispatch才构建并验证ZIP；工作流仅`contents: read`，不自动创建公开Release。
-
-完整CI先通过格式、Clippy、全部合成测试与release构建，再解压真实ZIP验证原EXE、两种业务模式，以及通过cmd.exe执行随包CMD。入口测试覆盖：
-
-- 中文、空格解压位置及不同工作目录，代码页936和65001。
-- 首次、连续、同时启动，原服务启动中和任务执行中再次启动。
-- Ctrl+C正常退出后重启，异常终止后任务标为interrupted并重试。
-- 记录目录无权限、端口占用、旧版持锁、浏览器启动失败与恢复。
-- 历史、方向复核、输出PDF指纹及线程设置兼容；浏览器替身核验由原进程打开认证本机页面。
-
-浏览器替身与独立控制台helper只用于CI，不入客户包。原始URL、token、服务stdout/stderr仅在测试内存与匿名管道内，CI不上传带会话凭据的服务原始日志。只使用代码生成的合成资料，不上传业务资料或本地状态。
-
-本机浏览器已验证第二层分组保留浅层文件、预设与明确排除、自然顺序、手动移动与改名、新计划、10线程生成4组共10页、同源模式切换及历史计划。实际浏览器下载的报告已核对4组/10页、手动顺序和成品哈希；自动化下载事件观测超时，不影响实际文件校验。临时隐藏一份合成来源后，仅该组失败，其他输出保留；恢复来源、全局改为1后，旧任务仍按10线程重试并核验复用全部4份结果。独立Poppler渲染的4页成品与对应来源逐页像素一致，实际查看了竖页及保留270度旋转的页面；本轮不改变来源已有旋转。通用合成用例还核对真实页树/内容、普通注释、严格损坏页树拒绝、历史和同哈希外来输出保护。随包通用冒烟脚本已在本机隔离服务和原生Windows真实ZIP运行通过。两种模式全局单任务、旧复核和线程设置保持兼容；既有本机两份记录目录共205文件与变更前指纹完全一致。
-
-CI通过仅证明覆盖的自动环境；不能替代客户Windows10双击、浏览器、单位安全策略及真实资料验收。
-
-## 交付与依赖
-
-ZIP包含主程序、ASCII启动脚本、离线CPU OCR模型及ONNX Runtime、使用说明、完整许可和逐文件package-manifest.json。客户外层资料包另附简明说明和压缩包SHA256，其中程序文件与CI包逐字节相同。
-
-- 完整构建与验收：[Windows CI #14](https://github.com/thising/voucher-workbench/actions/runs/41389303328)，源码 [`653112c`](https://github.com/thising/voucher-workbench/commit/653112cbfb36bd66b725406575951bab634349e1)。后续说明更新不改变包内容。
-- 下载：[Windows x64测试构件](https://github.com/thising/voucher-workbench/actions/runs/41389303328/artifacts/13117161264)，需登录GitHub，保留至2026-11-16。外层Actions归档包含程序ZIP和SHA256；没有创建公开Release。
-- 程序ZIP：`voucher-workbench-0.5.1-windows-x64.zip`，29,207,643字节（约27.9MiB）；429个载荷文件及1个package-manifest.json。逐文件SHA256、来源提交/Cargo.lock、模型、三个x64 PE及两份DLL与官方原包均已独立核对，无清单外文件。启动脚本ASCII/CRLF已复核，测试helper未入包。
-
-程序ZIP的SHA256（区别于外层Actions归档）：
+WebView2已安装直接使用；安装包缺少时按需下载微软官方引导程序，便携版给出步骤。离线组件单独附带，不塞入每份主程序更新。本轮锁定微软x64离线安装器 **215,017,168字节（约205MiB）**，SHA256：
 
 ```text
-8e4f870bd3b369d8977e35a5126b7a4d39566b82ce032c181bc66adfccbb7896
+62863f0f0611a16ccf124b4f15650c3b66624504eba74d7cde1e2ae5d951249b
 ```
 
-客户资料包：`凭证工作台-0.5.1-Windows客户试用包.zip`，28,879,156字节。430个程序文件与CI包逐字节相同，仅在最外层增加UTF-8 BOM/CRLF简明说明；不含业务数据、历史、预览或日志。其ZIP旁另有同名`.sha256`校验文件。客户资料包SHA256：
+来源URL、版本和摘要见 `app/distribution/windows-dependencies.json`；Windows构建验证Microsoft Authenticode签名。主程序Rust CRT静态链接，OCR库另需微软VC++2019或兼容更新版x64运行库；缺少OCR依赖仍可手动合并。PDF.js固定6.5.438，主模块/worker、字体、CMap、WASM均离线提供。本工具和安装器未签名，不要求关闭系统防护。
 
-```text
-4388d312547fa3deac249dd9e29ad823f5d0215241c2efc001b053773eaf685f
-```
+## 已完成的本机验证
 
-默认记录目录为`%LOCALAPPDATA%\VoucherWorkbench`，移动或替换程序目录不删除记录。升级前退出旧版服务，解压新版；保留整个记录目录即可继续使用原计划、复核和线程设置。`--state-dir`可指定整体记录目录，不自动搬迁原记录。
+- 核心156项通过、0失败、1项私有资料OCR按设计跳过；桌面2项通过。其中43项批量集成覆盖无备份事务提交边界/恢复、失败保旧、现存历史保持、角度变化/未变/未决/手动跳过/取消/并发汇总及旧记录兼容；6项签名集成通过。核心与桌面格式、Clippy均通过，OpenSpec严格校验10项通过。
+- 前端59次API、193个DOM控件及Pointer捕获/21类取消回归通过。真实原生手柄排序、外部释放取消、PDF页码保留、同记录重启、命名清错、移除/恢复、原生保存和任务退出保护已验。
+- 5张合成图真实OCR首次调整1/未变4，颜色与方向详情只列该图；缓存重跑调整0/未变5，角度保持。原生窗口及最终release业务API均验证。
+- 合成既存PDF实际直接覆盖2份5页，无旧PDF/登记副本及临时残留，5个来源摘要不变；全部5页经Poppler渲染并查看，顺序与角度正确。最终release API成品与原生输出摘要相同。另有混合PDF/图片6份10页及4例签名外观逐像素一致证据，未覆盖客户成品。
+- 原本地入口 `.local/pdf-workbench-trial/启动PDF工作台.command` 已更新为release，更新前23个记录文件字节保持，原3条历史和最新计划可继续，HTML/JS/CSS与最终源码一致。后续用户试用可新增记录，不将23视为永久文件数。
+- 现有Windows GNU目标全目标编译检查通过；这只证明条件编译，不替代Windows MSVC、WebView2或安装器实测。
 
-PDF旁不再新建manifest JSON。处理记录位于数据目录的`outputs/<输出路径摘要>/manifest.json`，保存来源、页码、方向/顺序及SHA256用于复用、恢复和防覆盖；报告仍可在界面下载，交付PDF不必附带记录。旧旁置凭证记录仅在再次生成/复用时，验证并迁移后才移除；已有历史归档不批量搬迁。更新工具拥有的输出前，旧PDF保留在输出目录`.history`，历史记录保存在程序数据目录。
+扫描性能证据仅限本机暖缓存：3274个来源一次只读核心扫描约2.486秒，保留完整SHA与解析检查；不包含窗口、索引和记录写入，不代表客户PC耗时或整批加速倍数。此前2份签名拒绝是修订前规则；现已按上述静态外观导入。原始证据、截图和指纹保留在本地验收目录，不公开业务数据。
 
-应用无需客户安装Rust、Python、Office、Node或Docker；运行时不下载模型。主程序静态链接Rust CRT，OCR原生DLL仍要求微软VC++2019或兼容更新版x64运行库。缺少OCR依赖不阻止关闭识别时的凭证合并或通用PDF合并。需要识别时按随包说明从微软官方安装运行库；本工具不静默安装系统组件。[ONNX Runtime官方要求](https://onnxruntime.ai/docs/install/#requirements)
+## Windows CI 与独立验包
 
-客户包未签名；若单位策略阻止运行，请联系管理员，不能要求关闭安全防护。签名、安装器、公开Release与本次试用包分别验收。
+工作流 `.github/workflows/windows.yml` 使用Windows2022、固定Rust/MSVC及依赖摘要；push/PR执行检查，手动workflow_dispatch构建客户附件，权限仅contents:read，不创建公开Release。新一轮以本次固定源码启动；不能将[首轮失败CI](https://github.com/thising/voucher-workbench/actions/runs/41412847079)视为发行通过。首轮在合法依赖版本号“+”路径白名单处中止，修复及后续启动竞态测试已纳入本轮。
 
-## Windows开发构建
+本轮要求：核心/桌面格式、Clippy、单测与UI契约；兼容CMD真实代码页/中文空格/重复与同时启动/任务中激活/正常异常重启/权限端口旧锁；同GUI EXE的headless兼容业务；真实Tauri/WebView2窗口的三栏、PDF预览/逐页旋转、排序命名、合并、运行时同名决策及无备份检查、原生保存、重复唤回、OCR期间关闭继续/安全停止、启动竞态、旧协议/缺运行时/目录故障；当前用户NSIS安装及安装版真实窗口。
 
-开发机需Rust/MSVC、PowerShell7、Node；这些不是客户安装要求。依赖固定于`app/distribution/windows-dependencies.json`：
+CI仅上传受限合成截图与摘要，不上传含token的原始服务日志。成功后下载附件，独立核对ZIP全文件SHA/大小/白名单、Windows x64 GUI子系统PE、便携与安装版一致证据、来源提交、双锁、模型/运行库/许可及离线附件签名检查结果，再整理客户目录及总校验表。真实界面截图须查看，不以编译或替身代替。
 
-```powershell
-rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
-pwsh -File app/tools/build-windows.ps1
-pwsh -File app/tools/smoke-windows.ps1 -ZipPath dist/voucher-workbench-0.5.1-windows-x64.zip -FixtureExecutable app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe
-pwsh -File app/tools/smoke-windows-launcher.ps1 -ZipPath dist/voucher-workbench-0.5.1-windows-x64.zip -FixtureExecutable app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe -ProbeExecutable app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/startup_probe.exe
-```
+**本轮构件状态：准备CI，附件和SHA256待通过后填写。**
 
-组包脚本不覆盖已有ZIP，可用`-OutputDirectory`及`-CacheDirectory`指定位置，`-CheckOnly`仅检查。ONNX Runtime固定1.23.2；模型算法不变，仍为title-ocr-v1.0.2。
-
-开源边界由`tools/public-source.json`与`tools/prepare-source.py`共同约束：只发布当前Rust工具、合成测试、发行脚本和有效规格；历史Python/规格、业务数据、模型权重、本地工具链、状态、预览和日志均排除。源码导出和暂存核验不放宽此边界。
+开发重建入口：`pwsh -File app/tools/build-windows-desktop.ps1`；`-CheckOnly`只检查，输出与缓存支持隔离目录，同名发行文件拒绝覆盖。准确依赖许可与源码归档地址随包提供。
 
 ## 客户Windows10待验
 
-普通用户在中文含空格路径解压：实际双击、连续双击、任务中再次双击，确认默认浏览器重新进入原工作台且任务继续。正常退出/异常退出后重启，确认历史、复核和线程设置保留；若旧版占锁，按提示手动退出旧版。
+普通用户在中文/空格路径实际解压、安装及双击；已有/缺少WebView2的真实联网或离线安装；单位安全策略；连续双击、任务中激活与安全退出；重启后历史、角度和线程偏好；真实资料的层级、索引、排序、移除、PDF逐页旋转、仅变角提示、签名静态外观和同名直接覆盖结果。分别试用1与10线程，核对成品份数/页数/方向/顺序与原件不变。CI通过只说明覆盖环境，客户实测尚待反馈。
 
-分别以1和10线程试用凭证与通用模式。通用模式核对0/1/2层分组、浅层文件、排除、手动排序/改名、输出目录、成品页序和报告；凭证模式检查首表/指定表、默认关闭识别、同意/识别/全部图片人工确认门禁。检查取消/重试仍用原线程，输出无额外页眉页脚或JSON，未知同名PDF被保护。
+## 历史交付与回滚范围
 
-截图原异常触发条件与修复后结果单独记录。客户实际复测尚未完成，不把CI结论扩展为客户PC已验收。
+- 0.5.1浏览器版：[CI #14](https://github.com/thising/voucher-workbench/actions/runs/41389303328)，源码653112c；客户包SHA256为 `4388d312547fa3deac249dd9e29ad823f5d0215241c2efc001b053773eaf685f`，仅作历史回滚。旧CMD客户解析异常的触发条件未复现，不断言编码损坏。
+- 0.5.0线程版：[CI #8](https://github.com/thising/voucher-workbench/actions/runs/41375857170)，源码196f3ca，旧规格历史。
+- 前轮150/2回归及覆盖归档证据属于旧修订，当前覆盖已不保留副本；已有历史归档保留，不将旧验证冒充当前无备份行为。
 
-## 历史构建
-
-0.5.0线程功能测试包：[CI #8](https://github.com/thising/voucher-workbench/actions/runs/41375857170)，源码196f3ca，本地79/Windows80项通过、1项私有OCR测试忽略。此包未包含0.5.1通用模式与启动优化，仅作历史。
+本轮空间清理只处理已核实可再生成的项目构建缓存和重复下载/解压材料；保留源码、原件、输出、处理记录、有效运行依赖、当前试用入口、必要验收证据及历史交付。实际删除清单、前后占用及释放量在本地验收目录记录，完成后补记本页结果。

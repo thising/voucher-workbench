@@ -986,6 +986,8 @@ fn shared_job_gate_restart_and_retry_preserve_original_thread_snapshot() {
         results: vec![],
         request: GenerateRequest::default(),
         threads: 7,
+        output_conflict: None,
+        orientation_summary: None,
     };
     state
         .data

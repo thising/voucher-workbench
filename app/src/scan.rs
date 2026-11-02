@@ -8,7 +8,7 @@ use regex::Regex;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::OnceLock,
     time::UNIX_EPOCH,
@@ -176,8 +176,12 @@ fn add_file_error(file: &mut SourceFile, message: impl Into<String>) {
 }
 
 fn tiff_has_multiple_pages(path: &Path) -> Result<bool> {
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
     let length = file.metadata()?.len();
+    tiff_reader_has_multiple_pages(file, length)
+}
+
+fn tiff_reader_has_multiple_pages(mut file: impl Read + Seek, length: u64) -> Result<bool> {
     let mut header = [0u8; 8];
     file.read_exact(&mut header).context("TIFF 文件头不完整")?;
     let little = match &header[..2] {
@@ -274,6 +278,29 @@ pub(crate) fn reject_multiframe(path: &Path, format: Option<image::ImageFormat>)
                 .has_animation()
         }
         Some(image::ImageFormat::Tiff) => tiff_has_multiple_pages(path)?,
+        _ => false,
+    };
+    if multiple {
+        bail!("多帧/多页图片不能只导入首帧，请先拆为单页图片或转换为 PDF");
+    }
+    Ok(())
+}
+
+/// Batch validation examines the same bytes used for SHA256 and decoding.
+pub(crate) fn reject_multiframe_bytes(
+    bytes: &[u8],
+    format: Option<image::ImageFormat>,
+) -> Result<()> {
+    let multiple = match format {
+        Some(image::ImageFormat::Png) => {
+            image::codecs::png::PngDecoder::new(Cursor::new(bytes))?.is_apng()?
+        }
+        Some(image::ImageFormat::WebP) => {
+            image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?.has_animation()
+        }
+        Some(image::ImageFormat::Tiff) => {
+            tiff_reader_has_multiple_pages(Cursor::new(bytes), bytes.len() as u64)?
+        }
         _ => false,
     };
     if multiple {
@@ -822,6 +849,7 @@ mod tests {
         let path = temp.path().join("2403_00001_1.tiff");
         image(&path);
         assert!(!tiff_has_multiple_pages(&path).unwrap());
+        reject_multiframe_bytes(&fs::read(&path).unwrap(), Some(image::ImageFormat::Tiff)).unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let little = &bytes[..2] == b"II";
         let first = if little {
@@ -844,7 +872,13 @@ mod tests {
         } else {
             second.to_be_bytes()
         });
-        fs::write(&path, bytes).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            reject_multiframe_bytes(&bytes, Some(image::ImageFormat::Tiff))
+                .unwrap_err()
+                .to_string()
+                .contains("多帧/多页")
+        );
         assert!(tiff_has_multiple_pages(&path).unwrap());
         let file = scan_file(&path, temp.path(), "240301", "00001").unwrap();
         assert_eq!(file.pages, 0);

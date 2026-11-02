@@ -33,7 +33,9 @@ foreach ($entry in $manifest.files) {
     if ($relative -match '(^/|\\|(^|/)\.\.?(/|$)|:)' -or -not $declared.Add($relative)) {
         throw "Unsafe or duplicate manifest entry: $relative"
     }
-    if ($relative -notmatch '^(voucher-workbench\.exe|启动凭证工作台\.cmd|PDF工作台\.exe|release-source\.json|使用说明\.txt|LICENSE|THIRD_PARTY_NOTICES\.md|models/README\.md|models/title-ocr/(det\.onnx|rec\.onnx|dictionary\.txt|manifest\.json|LICENSE|det\.yml|rec\.yml)|runtime/(onnxruntime\.dll|onnxruntime_providers_shared\.dll)|licenses/[\w./-]+)$') {
+    # Crate versions may carry SemVer build metadata, e.g. +spec-1.1.0.
+    # Only the license subtree allows '+'. The traversal guard above still applies.
+    if ($relative -notmatch '^(voucher-workbench\.exe|启动凭证工作台\.cmd|PDF工作台\.exe|release-source\.json|使用说明\.txt|LICENSE|THIRD_PARTY_NOTICES\.md|models/README\.md|models/title-ocr/(det\.onnx|rec\.onnx|dictionary\.txt|manifest\.json|LICENSE|det\.yml|rec\.yml)|runtime/(onnxruntime\.dll|onnxruntime_providers_shared\.dll)|licenses/[\w./+-]+)$') {
         throw "Unexpected package file: $relative"
     }
     if ($desktop -and $relative -in @('voucher-workbench.exe','启动凭证工作台.cmd')) { throw 'Desktop package contains a legacy daily entry point.' }

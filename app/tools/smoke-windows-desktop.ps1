@@ -15,6 +15,17 @@ if (-not $WorkDirectory) { $WorkDirectory = Join-Path ([IO.Path]::GetTempPath())
 if (-not $EvidenceDirectory) { $EvidenceDirectory = Join-Path $WorkDirectory 'evidence' }
 $WorkDirectory = [IO.Path]::GetFullPath($WorkDirectory)
 $EvidenceDirectory = [IO.Path]::GetFullPath($EvidenceDirectory)
+$reportFile = Join-Path $EvidenceDirectory 'desktop-smoke-report.json'
+function Write-DesktopResult([bool]$Passed, [string]$Phase, [string]$Failure = '') {
+    $null = New-Item -ItemType Directory -Force -Path $EvidenceDirectory
+    $result = if (Test-Path -LiteralPath $reportFile) {
+        Get-Content -LiteralPath $reportFile -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+    } else { @{ checks = @() } }
+    $result['passed'] = $Passed
+    $result['phase'] = $Phase
+    if ($Failure) { $result['failure'] = $Failure -replace '#token=[^\s"<>]+', '#token=[redacted]' }
+    $result | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8NoBOM
+}
 if (Test-Path -LiteralPath $WorkDirectory) { throw 'The desktop test directory already exists; refusing to reuse data.' }
 $null = New-Item -ItemType Directory -Path $WorkDirectory
 $expanded = Join-Path $WorkDirectory '中文 包含空格 便携版'
@@ -40,6 +51,9 @@ try {
     }
     & node (Join-Path $PSScriptRoot 'smoke-windows-desktop.mjs') $executable (Resolve-Path -LiteralPath $FixtureExecutable).Path (Resolve-Path -LiteralPath $ToolsDirectory).Path (Join-Path $WorkDirectory '合成运行场景') $EvidenceDirectory
     if ($LASTEXITCODE -ne 0) { throw 'Real desktop/WebView2 verification failed; only the bounded report and synthetic screenshot may be published.' }
+    # The JavaScript runner proves the portable copy only. Overall success is
+    # withheld until installed-window validation and owned cleanup also pass.
+    Write-DesktopResult $false 'installed-validation'
     # Also prove that an installed copy resolves the same model/DLL payload from
     # an unrelated CWD; no installer-run fixture or global user data is used.
     $check = [Diagnostics.ProcessStartInfo]::new()
@@ -81,11 +95,14 @@ try {
         $null = & (Join-Path $PSScriptRoot 'windows-desktop-native.ps1') -OwnedProcessId $installedProcess.Id -Action close
         if (-not $installedProcess.WaitForExit(60000) -or $installedProcess.ExitCode -ne 0) { throw 'The installed GUI did not close safely.' }
     } finally { if (-not $installedProcess.HasExited) { $installedProcess.Kill() }; $installedProcess.Dispose() }
-    $reportFile = Join-Path $EvidenceDirectory 'desktop-smoke-report.json'
     $report = Get-Content -LiteralPath $reportFile -Raw -Encoding utf8 | ConvertFrom-Json
     $report.checks += @('current-user-nsis-install-chinese-space-path','installed-and-portable-identical-exe','installed-model-runtime-and-license-payload','installed-real-visible-webview-and-normal-close')
     $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8NoBOM
+} catch {
+    Write-DesktopResult $false 'failed' $_.Exception.Message
+    throw
 } finally {
+  try {
     $installation.Dispose()
     $uninstaller = Join-Path $installed 'uninstall.exe'
     if (Test-Path -LiteralPath $uninstaller) {
@@ -98,4 +115,9 @@ try {
         if ($remove.ExitCode -ne 0) { throw 'Owned current-user test uninstall failed.' }
         $remove.Dispose()
     }
+  } catch {
+    Write-DesktopResult $false 'cleanup-failed' $_.Exception.Message
+    throw
+  }
 }
+Write-DesktopResult $true 'completed'

@@ -15,8 +15,10 @@ if (fragment.has('token')) {
 }
 const DEFAULT_RULES = '# 一行一条；以 # 开头的行为注释\n**/indexImg/**\n**/index.html\n**/.DS_Store\n**/._*\n**/Thumbs.db';
 const active = job => job && ['queued', 'running'].includes(job.status);
-const batchJob = job => job && ['batch_analyze', 'batch_generate'].includes(job.kind);
-const labels = {queued:'等待处理',running:'正在处理',completed:'已完成',completed_with_errors:'部分完成',cancelled:'已取消',interrupted:'意外中断',failed:'处理失败',skipped:'已核验，复用结果'};
+const batchJob = job => job && ['batch_analyze', 'batch_generate', 'batch_scan'].includes(job.kind);
+const scanJob = job => job?.kind === 'batch_scan';
+const jobKindLabel = job => scanJob(job) ? '资料扫描' : job.kind === 'batch_analyze' ? '图片方向调整' : '批量合并';
+const labels = {queued:'等待处理',running:'正在处理',completed:'已完成',completed_with_errors:'部分完成',cancelled:'已取消',interrupted:'意外中断',failed:'处理失败',skipped:'已核验，复用结果',skipped_existing:'跳过同名文件'};
 const fmt = value => Number(value || 0).toLocaleString('zh-CN');
 const basename = path => String(path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop();
 const shortTime = value => value ? new Date(value).toLocaleString('zh-CN', {hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '';
@@ -29,38 +31,50 @@ const S = {
   previewEpoch:0, renderEpoch:0, previewKey:null, previewUrl:null, image:null, pdf:null, pdfTask:null,
   pdfRender:null, pdfModule:null, zoom:1, fit:true, polling:null, syncing:false, pollCount:0,
   toastTimer:null, mergeRetry:null, orientationRetry:null, historyLoading:false,
+  renamePreview:null, renameOverrides:new Map(), preparationEpoch:0, namingEpoch:0, previewTimer:null,
+  editTimer:null, editError:false, scan:null, scanPolling:false, logFilter:'all', events:[],
+  pollEpoch:0, conflictKey:null, conflictRequest:0, conflictBusy:false, cancelInFlightId:null, cancelRequestedJobId:null,
   browser:{kind:'folder',target:'root-path',path:'',parent:null,selected:null}, closeAfterSave:false
 };
 const selectedGroup = () => S.plan?.groups.find(g => g.id === S.groupId);
 const selectedFile = () => selectedGroup()?.files.find(f => f.id === S.fileId);
-const busy = () => S.operations > 0 || active(S.job) || S.jobs.some(active);
+const busy = () => S.operations > 0 || active(S.scan) || active(S.job) || S.jobs.some(active);
 const hasDrafts = () => S.drafts.size > 0;
 const selectedGroups = () => S.plan?.groups.filter(g => S.selected.has(g.id)) || [];
 const allFiles = plan => (plan?.groups || []).flatMap(g => g.files);
-const hasErrors = group => group.empty || !group.files.length || (group.issues || []).some(i => i.severity === 'error') || group.files.some(f => f.error);
-const hasPlanErrors = () => (S.plan?.issues || []).some(i => i.severity === 'error');
+const hasErrors = group => group.empty || !group.files.length || groupProblems(group).some(i => i.severity === 'error');
+const hasPlanErrors = () => (S.plan?.issues || []).some(i => i.severity === 'error' && i.code !== 'output_existing');
+const successfulOutput = result => Boolean(result.output_path && ['completed','skipped'].includes(result.status));
 const imageFile = file => file?.kind === 'image';
 const pdfFile = file => file?.kind === 'pdf';
 function pdfReviewedPages(file) { return Array.from({length:file.pages}, (_, i) => Boolean(file.reviewed_pages?.[i])); }
-function autoTouched(file) { return imageFile(file) && Boolean(file.orientation || file.orientation_error); }
+function rotationChange(change) {
+  return change && [0,90,180,270].includes(change.from_cw) && [0,90,180,270].includes(change.to_cw) && change.from_cw !== change.to_cw ? change : null;
+}
+function appliedAutoChange(file) {
+  const change = rotationChange(file?.auto_rotation_change);
+  return imageFile(file) && !file.manual_rotation && change && file.rotation_cw === change.to_cw ? change : null;
+}
+function autoTouched(file) { return Boolean(appliedAutoChange(file)); }
 function pendingReview(file) {
-  if (imageFile(file)) return (autoTouched(file) || file.manual_rotation) && !file.reviewed ? 1 : 0;
-  if (!pdfFile(file)) return 0;
-  return pendingPdfPages(file) > 0 ? 1 : 0;
+  return autoTouched(file) ? 1 : 0;
 }
 function pendingPdfPages(file) { return pdfReviewedPages(file).filter((reviewed, i) => !reviewed && (Number(file.rotation_cw || 0) !== 0 || Number(file.page_rotations?.[i] || 0) !== 0)).length; }
 function fileStatus(file) {
   if (file.error) return {tone:'error',label:'来源有问题',symbol:'!'};
-  if (file.orientation_error && !file.reviewed) return {tone:'error',label:'识别失败 · 待人工检查',symbol:'!'};
   if (imageFile(file)) {
+    if (file.manual_rotation) return {tone:'manual',label:'已手动调整',symbol:'↻'};
+    const change = appliedAutoChange(file);
+    if (change) return {tone:'review',label:`自动调整 ${change.from_cw}° → ${change.to_cw}°`,symbol:'↻'};
     if (file.reviewed) return {tone:'reviewed',label:file.orientation_error ? '已人工核对 · 原识别失败' : '已人工核对',symbol:'✓'};
-    if (autoTouched(file)) return {tone:'review',label:'自动处理后待核对',symbol:'◷'};
-    if (file.manual_rotation) return {tone:'review',label:'手动调整 · 尚未确认',symbol:'◷'};
-    return {tone:'original',label:'原图方向',symbol:'—'};
+    if (file.orientation_error) return {tone:'original',label:'识别未完成 · 方向未变',symbol:'—'};
+    if (file.orientation?.needs_review) return {tone:'original',label:'方向未决 · 未调整',symbol:'—'};
+    return {tone:'original',label:'保留当前方向',symbol:'—'};
   }
   const reviews = pdfReviewedPages(file).filter(Boolean).length;
   if (reviews === file.pages && file.pages) return {tone:'reviewed',label:`已核对 ${fmt(reviews)} / ${fmt(file.pages)} 页`,symbol:'✓'};
-  if (pendingReview(file)) return {tone:'review',label:`方向已调整 · ${fmt(pendingPdfPages(file))} 页待核对`,symbol:'◷'};
+  const rotated = Array.from({length:file.pages}, (_, i) => (Number(file.rotation_cw || 0) + Number(file.page_rotations?.[i] || 0)) % 360).filter(Boolean).length;
+  if (file.manual_rotation) return {tone:'manual',label:rotated ? `已手动调整 ${fmt(rotated)} 页` : '已手动调整，当前为原页向',symbol:'↻'};
   if (reviews) return {tone:'original',label:`已核对 ${fmt(reviews)} / ${fmt(file.pages)} 页`,symbol:'✓'};
   return {tone:'original',label:'保留原 PDF 页向',symbol:'—'};
 }
@@ -68,6 +82,7 @@ function groupTone(group) {
   if (hasErrors(group)) return 'error';
   if (group.files.some(f => fileStatus(f).tone === 'error')) return 'error';
   if (group.files.some(f => pendingReview(f))) return 'review';
+  if (group.files.some(f => f.manual_rotation)) return 'manual';
   if (group.files.some(f => imageFile(f) ? f.reviewed : pdfReviewedPages(f).some(Boolean))) return 'reviewed';
   return 'original';
 }
@@ -75,7 +90,7 @@ function groupDraft(group) {
   return {group_id:group.id,file_ids:group.files.map(f => f.id),output_name:group.output_name,...S.drafts.get(group.id)};
 }
 function setDraft(group, changes) {
-  S.drafts.set(group.id, {group_id:group.id,...S.drafts.get(group.id),...changes}); controls();
+  S.drafts.set(group.id, {group_id:group.id,...S.drafts.get(group.id),...changes}); S.editError = false; controls();
 }
 function orderedFiles(group) {
   const map = new Map(group.files.map(f => [f.id, f]));
@@ -107,8 +122,8 @@ function action(fn) {
   };
 }
 async function operation(label, fn) {
-  S.operations++; S.operationLabel = label; controls();
-  try { return await fn(); } finally { S.operations--; controls(); }
+  const previous = S.operationLabel; S.operations++; S.operationLabel = label; controls();
+  try { return await fn(); } finally { S.operations--; S.operationLabel = previous; controls(); }
 }
 function toast(message) {
   clearTimeout(S.toastTimer); $('toast').textContent = message; $('toast').hidden = false;
@@ -124,26 +139,34 @@ function setPreparationCollapsed(collapsed) {
   S.preparationCollapsed = collapsed; $('source-form').hidden = collapsed; $('source-summary').hidden = !collapsed;
   $('toggle-preparation').textContent = collapsed ? '更改设置' : '收起设置';
   $('source-form').closest('.preparation').classList.toggle('collapsed', collapsed);
+  $('preparation-intro').hidden = collapsed;
 }
 
 function controls() {
   const locked = busy() || !S.ready;
+  if (locked || S.sourceDirty || hasDrafts()) clearDragState();
   $('source-form').querySelectorAll('input,select,textarea,button').forEach(node => { node.disabled = locked; });
   $('merge-level').disabled = locked || !S.initialization;
-  $('initialize-folder').disabled = locked || !$('root-path').value.trim();
-  $('inspect-index').disabled = locked || !$('index-path').value.trim();
   for (const id of ['index-column','name-column']) $(id).disabled = locked || !S.indexInspection?.columns?.length;
+  $('rename-section').hidden = !$('rename-enabled').checked;
+  $('refresh-names').disabled = locked || !$('root-path').value.trim() || !$('index-path').value.trim();
   $('scan-button').disabled = locked || !$('root-path').value.trim();
-  $('scan-button').textContent = S.operations ? S.operationLabel || '正在处理…' : '扫描资料 →';
+  $('scan-button').textContent = S.operations ? S.operationLabel || '正在处理…' : active(S.scan) ? '正在扫描资料…' : '扫描资料 →';
   $('source-dirty-note').hidden = !S.sourceDirty || !S.plan;
-  $('save-edits').hidden = !hasDrafts(); $('save-edits').disabled = locked || S.sourceDirty;
-  $('draft-notice').hidden = !hasDrafts();
+  $('save-edits').hidden = !S.editError || !hasDrafts(); $('save-edits').disabled = locked || S.sourceDirty;
+  $('draft-notice').hidden = !S.editError || !hasDrafts();
+  $('edit-state').textContent = S.editError ? '保存失败' : hasDrafts() ? '正在保存…' : S.plan ? '调整已保存' : '';
   const selected = selectedGroups();
   $('merge-button').disabled = locked || !selected.length || S.sourceDirty || hasDrafts();
   $('merge-button').textContent = selected.length ? `执行合并 · ${fmt(selected.length)} 份` : '执行合并';
-  const imageCount = selected.reduce((n, g) => n + g.files.filter(f => imageFile(f) && !f.error).length, 0);
+  $('merge-brief').textContent = `已选择 ${fmt(selected.length)} 个文件夹，将生成 ${fmt(selected.length)} 份 PDF，共 ${fmt(selected.reduce((n,g) => n + Number(g.pages || 0),0))} 页。`;
+  $('merge-destination').textContent = S.plan ? `输出位置：${prettyPath(S.plan.output_dir)} · 点击执行合并后可更改` : '';
+  const invalid = selected.filter(hasErrors).length;
+  $('merge-state').hidden = !S.sourceDirty && !invalid && !hasPlanErrors() && !hasDrafts();
+  $('merge-state').textContent = S.sourceDirty ? '资料设置已更改，请重新扫描。' : hasDrafts() ? '正在保存调整，请稍候。' : invalid ? `${fmt(invalid)} 个所选文件夹存在问题，请在上方处理，或取消选择。` : '扫描发现资料范围错误，请查看日志并处理。';
+  const imageCount = selected.reduce((n,g) => n + g.files.filter(f => imageFile(f) && !f.error).length,0);
   $('auto-orient').disabled = locked || !imageCount || S.sourceDirty || hasDrafts();
-  $('auto-orient').title = !imageCount ? '所选单元没有可识别的图片；PDF可在预览中逐页手动旋转。' : '可选：识别后提示人工核对，不阻止后续合并。';
+  $('auto-orient').title = !imageCount ? '所选文件夹没有可识别图片，PDF可逐页手动旋转。' : '可选预处理，识别后可查看和修正方向。';
   $('start-orientation').disabled = locked || !$('orientation-consent').checked || !imageCount || !S.status?.model_ready;
   $('orientation-threads').disabled = locked || Boolean(S.orientationRetry);
   $('merge-threads').disabled = locked || Boolean(S.mergeRetry);
@@ -156,33 +179,32 @@ function controls() {
   });
   $('group-list').querySelectorAll('[data-edit]').forEach(node => { node.disabled = locked || S.sourceDirty; });
   for (const id of ['file-sort','sort-direction','sort-separator','apply-sort']) $(id).disabled = locked || S.sourceDirty || !selectedGroup();
-  $('file-list').querySelectorAll('[data-edit]').forEach(node => { node.disabled = locked || S.sourceDirty || node.dataset.limit === 'true'; });
-  $('file-list').querySelectorAll('[draggable]').forEach(node => { node.draggable = !locked && !S.sourceDirty; });
+  $('file-list').querySelectorAll('[data-edit]').forEach(node => { node.disabled = locked || S.sourceDirty || node.dataset.limit === 'true' || (node.dataset.edit === 'drag' && hasDrafts()); });
+  $('removed-file-list').querySelectorAll('button').forEach(node => { node.disabled = locked || S.sourceDirty; });
   const file = selectedFile();
   const canEditFile = Boolean(file && !file.error && !locked && !S.sourceDirty && !hasDrafts());
-  for (const id of ['rotate-left','rotate-right','rotate-half','reset-rotation','rotation-scope','reviewed-file']) $(id).disabled = !canEditFile;
+  for (const id of ['rotate-left','rotate-right','rotate-half','reset-rotation','rotation-scope']) $(id).disabled = !canEditFile;
   $('rotation-scope').disabled = !canEditFile || !pdfFile(file);
   $('previous-source-page').disabled = !file || !pdfFile(file) || S.sourcePage <= 1;
   $('next-source-page').disabled = !file || !pdfFile(file) || S.sourcePage >= file.pages;
   $('source-page-number').disabled = !file || !pdfFile(file);
   for (const id of ['zoom-in','zoom-out','fit-preview']) $(id).disabled = !file || Boolean(file.error);
   $('retry-job').disabled = locked || S.sourceDirty || hasDrafts();
-  $('start-merge').disabled = locked || !S.plan || !selected.length || hasPlanErrors() || selected.some(hasErrors) || !samePath($('output-path').value.trim(), S.plan.output_dir);
-  $('choose-output').disabled = locked || Boolean(S.mergeRetry);
-  $('output-path').disabled = locked || Boolean(S.mergeRetry);
+  $('start-merge').disabled = locked || !S.plan || !selected.length || hasPlanErrors() || selected.some(hasErrors) || !samePath($('output-path').value.trim(),S.plan.output_dir);
+  $('choose-output').disabled = locked || Boolean(S.mergeRetry); $('output-path').disabled = locked || Boolean(S.mergeRetry);
   $('check-output').disabled = locked;
-  $('deselect-errors').hidden = !selected.some(hasErrors);
-  $('deselect-errors').disabled = locked;
+  $('deselect-errors').hidden = !selected.some(hasErrors); $('deselect-errors').disabled = locked;
   $('summary-selected').textContent = `已选 ${fmt(selected.length)}`;
   $('group-selection-count').textContent = `已选择 ${fmt(selected.length)} / ${fmt(groups.length)}`;
-  const external = S.jobs.find(job => active(job) && !batchJob(job));
-  $('external-task').hidden = !external;
-  $('external-task').textContent = external ? '旧版任务仍在处理中，完成或取消后才能开始新任务。当前任务进度与已有记录将保留。' : '';
+  $('cancel-scan').disabled = !active(S.scan) || Boolean(S.scan.cancelRequested);
+  const external = S.jobs.find(job => active(job) && !batchJob(job)); $('external-task').hidden = !external;
+  $('external-task').textContent = external ? '旧版任务仍在处理中，完成或取消后即可开始新任务。' : '';
 }
 function changedSource() {
+  S.namingEpoch++;
   if (S.plan) S.sourceDirty = true;
-  if (S.initialization && !samePath($('root-path').value.trim(), S.initialization.root)) {
-    S.initialization = null; $('level-hint').textContent = '文件夹已更改，请重新读取实际目录层级。';
+  if (S.initialization && !samePath($('root-path').value.trim(),S.initialization.root)) {
+    S.initialization = null; S.renamePreview = null; $('directory-preview').hidden = true; $('level-hint').textContent = '选择文件夹后自动获取';
   }
   controls();
 }
@@ -195,108 +217,228 @@ function issueList(issues) {
   }
   return list;
 }
-async function initializeFolder() {
-  const root = $('root-path').value.trim(); if (!root) throw new Error('请先选择待处理文件夹。');
-  const previous = S.initialization && samePath(S.initialization.root, root) ? Number($('merge-level').value || 0) : 0;
-  return operation('正在读取文件夹层级…', async () => {
-    const result = await api('/batch/initialize', {method:'POST',body:{root}});
-    S.initialization = result; $('root-path').value = prettyPath(result.root);
-    renderLevels(previous); $('initialization-note').hidden = false;
-    const count = result.file_count ?? result.supported_files ?? result.total_files;
-    const summary = count === undefined ? `已读取 ${Number(result.max_level || 0) + 1} 个可选层级。` : `已读取目录结构：${fmt(count)} 个候选文件，${Number(result.max_level || 0) + 1} 个可选层级。`;
-    const warnings = result.issues?.length ? ` ${fmt(result.issues.length)} 条目录提示，扫描后可查看详情。` : '';
-    $('initialization-note').textContent = summary + ' 此处尚未应用排除规则。' + warnings;
-    changedSource(); return result;
+async function initializeFolder({level} = {}) {
+  const root = $('root-path').value.trim(); if (!root) throw new Error('请选择目标文件夹。');
+  const previous = level ?? (S.initialization && samePath(S.initialization.root,root) ? Number($('merge-level').value || 0) : 0);
+  const epoch = ++S.preparationEpoch;
+  return operation('正在准备目录…',async () => {
+    $('initialization-note').hidden = false; $('initialization-note').textContent = '正在获取目录信息…';
+    const result = await api('/batch/initialize',{method:'POST',body:{root,level:previous,exclude_rules:$('exclude-rules').value}});
+    if (epoch !== S.preparationEpoch || !samePath(root,$('root-path').value.trim())) return null;
+    S.initialization = result; S.renamePreview = null; $('root-path').value = prettyPath(result.root);
+    renderLevels(result.level ?? previous); renderDirectoryPreview(result);
+    $('initialization-note').hidden = true; changedSource(); return result;
   });
 }
 function renderLevels(preferred = 0) {
   const select = $('merge-level'); select.replaceChildren();
-  const levels = S.initialization?.levels || Array.from({length:Number(S.initialization?.max_level || 0) + 1}, (_, level) => ({level}));
+  const levels = S.initialization?.levels || [];
   for (const info of levels) {
-    const option = el('option', '', info.level === 0 ? '当前文件夹 · 递归合并为一份' : `第 ${info.level} 级文件夹 · 每个目录一份`);
-    option.value = info.level; select.append(option);
+    const option = el('option','',info.level === 0 ? '当前文件夹' : `第 ${info.level} 级文件夹`); option.value = info.level; select.append(option);
   }
-  if (!select.options.length) { const option = el('option', '', '当前文件夹 · 递归合并为一份'); option.value = 0; select.append(option); }
+  if (!select.options.length) { const option = el('option','','当前文件夹'); option.value = 0; select.append(option); }
   select.value = [...select.options].some(option => Number(option.value) === preferred) ? String(preferred) : '0';
   renderLevelHint(); controls();
 }
 function renderLevelHint() {
   if (!S.initialization) return;
-  const level = Number($('merge-level').value);
-  const info = S.initialization.levels?.find(item => Number(item.level) === level);
-  const samples = (info?.samples || []).slice(0, 2).map(value => typeof value === 'string' ? value : value.path || value.name).filter(Boolean);
-  if (!level) {
-    $('level-hint').textContent = `将“${basename(S.initialization.root)}”内及其全部子文件夹的文件合并为一个 PDF。`;
-  } else {
-    const count = info?.folder_count === undefined ? '' : `共 ${fmt(info.folder_count)} 个目标目录；`;
-    const example = samples.length ? `例如“${samples.join('”“')}”。` : '';
-    $('level-hint').textContent = `将每个第 ${level} 级目录内（含子目录）的文件分别合并为一份 PDF。${count}${example}更浅层的直属文件另列单元，不会遗漏。`;
-  }
+  const info = S.initialization.levels?.find(item => Number(item.level) === Number($('merge-level').value));
+  const count = S.initialization.summary?.nonempty_groups ?? S.initialization.groups?.filter(g => !g.empty && g.candidate_count).length ?? info?.folder_count ?? 0;
+  $('level-hint').textContent = `${fmt(count)} 个文件夹待合并`;
 }
-async function inspectIndex({sheet, headerRow} = {}) {
+function renderDirectoryPreview(data = S.initialization) {
+  const groups = data?.groups || []; $('directory-preview').hidden = !data;
+  const pending = data?.summary?.nonempty_groups ?? groups.filter(g => !g.empty && Number(g.candidate_count || 0) > 0).length;
+  const files = data?.summary?.candidate_count ?? groups.reduce((total,g) => total + Number(g.candidate_count || 0),0);
+  const empty = Math.max(0,Number(data?.summary?.group_count ?? groups.length) - Number(pending));
+  $('directory-count').textContent = `${fmt(pending)} 个待合并 · ${fmt(files)} 个文件 · ${fmt(empty)} 个空目录`;
+  const box = $('directory-list'); box.replaceChildren();
+  for (const group of groups) {
+    const row = el('div','directory-row'); const path = el('span','directory-path',group.relative_path || basename(data.root)); path.title = prettyPath(group.path || group.relative_path); row.append(el('span','directory-icon','▣'),path);
+    const count = Number(group.candidate_count ?? group.files?.length ?? 0);
+    row.append(el('span','directory-meta',count ? `${fmt(count)} 个文件` : '无待合并文件'));
+    if (group.shallow) row.append(el('span','pill','直属文件'));
+    box.append(row);
+  }
+  if (!groups.length) box.append(el('p','empty-pane','此范围内没有待合并文件，可调整合并级别或排除规则。'));
+  renderLevelHint();
+}
+async function refreshPreparation({level,inspect = false} = {}) {
+  await initializeFolder({level});
+  if ($('rename-enabled').checked && $('index-path').value.trim()) {
+    if (inspect || !S.indexInspection || !samePath(S.indexInspection.path,$('index-path').value.trim())) await inspectIndex();
+    else if (!S.indexInspection.sheet_error) await refreshNamingPreview();
+  } else renderNamingPreview();
+}
+function scheduleNamingPreview() {
+  clearTimeout(S.previewTimer); changedSource();
+  S.previewTimer = setTimeout(async () => {
+    if (busy()) { scheduleNamingPreview(); return; }
+    try { await refreshNamingPreview(); } catch (error) { showError(error); }
+  },350);
+}
+async function inspectIndex({sheet,headerRow,refresh = true} = {}) {
   const path = $('index-path').value.trim();
-  if (!path) { S.indexInspection = null; $('index-settings').hidden = true; changedSource(); return null; }
-  return operation('正在读取重命名索引…', async () => {
-    const body = {path}; if (sheet) body.sheet = sheet;
-    if (headerRow !== undefined) {
-      if (!Number.isInteger(headerRow) || headerRow < 1) throw new Error('表头行应为从 1 开始的整数。');
-      body.header_row = headerRow;
-    }
-    const data = await api('/batch/index/inspect', {method:'POST',body});
-    S.indexInspection = data; $('index-path').value = prettyPath(data.path);
-    $('index-settings').hidden = false;
-    $('index-sheet-warning').hidden = !data.sheet_error;
-    $('index-sheet-warning').textContent = data.sheet_error ? `${data.sheet_error}。可改选其他工作表；也可清空索引文件，按文件夹名命名。` : '';
-    $('index-sheet').replaceChildren(...data.sheets.map(info => { const option = el('option', '', info.name); option.value = info.name; return option; }));
-    $('index-sheet').value = data.sheet; $('header-row').value = data.header_row;
-    for (const id of ['index-column','name-column']) {
-      $(id).replaceChildren(...data.columns.map(column => {
-        const option = el('option', '', `${column.letter} · ${column.name || '未命名列'}`); option.value = column.index; return option;
-      }));
-    }
-    $('index-column').value = String(data.suggested_index_column ?? data.columns[0]?.index ?? '');
-    $('name-column').value = String(data.suggested_name_column ?? data.columns[1]?.index ?? data.columns[0]?.index ?? '');
-    renderIndexPreview(data); changedSource(); return data;
+  if (!path) { S.indexInspection = null; $('index-settings').hidden = true; S.renamePreview = null; renderNamingPreview(); changedSource(); return null; }
+  let data;
+  await operation('正在读取索引…',async () => {
+    $('index-loading').hidden = false;
+    try {
+      const body = {path}; if (sheet) body.sheet = sheet;
+      if (headerRow !== undefined) {
+        if (!Number.isInteger(headerRow) || headerRow < 1) throw new Error('表头行应为从 1 开始的整数。');
+        body.header_row = headerRow;
+      }
+      data = await api('/batch/index/inspect',{method:'POST',body});
+      S.indexInspection = data; $('index-path').value = prettyPath(data.path); $('index-settings').hidden = false;
+      $('index-sheet-warning').hidden = !data.sheet_error;
+      $('index-sheet-warning').textContent = data.sheet_error ? `${data.sheet_error}。可改选其他工作表，也可关闭重命名。` : '';
+      $('index-sheet').replaceChildren(...data.sheets.map(info => { const option = el('option','',info.name); option.value = info.name; return option; }));
+      $('index-sheet').value = data.sheet; $('header-row').value = data.header_row;
+      for (const id of ['index-column','name-column']) {
+        $(id).replaceChildren(...data.columns.map(column => { const option = el('option','',`${column.letter} · ${column.name || '未命名列'}`); option.value = column.index; return option; }));
+      }
+      $('index-column').value = String(data.suggested_index_column ?? data.columns[0]?.index ?? '');
+      $('name-column').value = String(data.suggested_name_column ?? data.columns[1]?.index ?? data.columns[0]?.index ?? '');
+      renderIndexPreview(data); changedSource();
+    } finally { $('index-loading').hidden = true; }
   });
+  if (refresh && data && !data.sheet_error && $('root-path').value.trim()) await refreshNamingPreview();
+  else { S.renamePreview = null; renderNamingPreview(); }
+  return data;
 }
 function renderIndexPreview(data) {
   if (!data.columns.length) { $('index-preview-table').replaceChildren(el('p','help','当前工作表没有可预览的列，请改选工作表或调整表头行。')); return; }
-  const table = el('table'); const head = el('thead'); const headRow = el('tr'); headRow.append(el('th', '', '行号'));
-  for (const column of data.columns) headRow.append(el('th', '', `${column.letter} · ${column.name || '未命名列'}`));
+  const table = el('table'); const head = el('thead'); const headRow = el('tr'); headRow.append(el('th','','行号'));
+  for (const column of data.columns) headRow.append(el('th','',`${column.letter} · ${column.name || '未命名列'}`));
   head.append(headRow); table.append(head); const body = el('tbody');
-  for (const record of (data.preview_rows || []).slice(0, 8)) {
-    const row = el('tr'); row.append(el('td', '', record.row));
-    for (const column of data.columns) {
-      const value = record.values[column.index] ?? ''; const cell = el('td', '', value); cell.title = value; row.append(cell);
-    }
+  for (const record of (data.preview_rows || []).slice(0,8)) {
+    const row = el('tr'); row.append(el('td','',record.row));
+    for (const column of data.columns) { const value = record.values[column.index] ?? ''; const cell = el('td','',value); cell.title = value; row.append(cell); }
     body.append(row);
   }
   table.append(body); $('index-preview-table').replaceChildren(table);
 }
 function indexRequest() {
+  if (!$('rename-enabled').checked) return null;
   const path = $('index-path').value.trim(); if (!path) return null;
-  if (!S.indexInspection || !samePath(S.indexInspection.path, path)) throw new Error('重命名索引已更改，请先读取工作表与列。');
-  if (S.indexInspection.sheet_error) throw new Error(`${S.indexInspection.sheet_error}。请改选其他工作表，或清空索引文件后扫描。`);
-  const index = Number($('index-column').value); const name = Number($('name-column').value);
-  if ($('index-column').value === '' || $('name-column').value === '') throw new Error('请选择索引列与文件名列。');
-  if (Number($('header-row').value) !== Number(S.indexInspection.header_row)) throw new Error('表头行已更改，请先点击“读取列”再扫描。');
-  return {path,sheet:$('index-sheet').value,index_column:index,name_column:name,header_row:Number($('header-row').value),match_rule:$('match-rule').value,naming:$('naming-mode').value,duplicates:$('duplicate-mode').value};
+  if (!S.indexInspection || !samePath(S.indexInspection.path,path)) throw new Error('索引尚未读取，请重新选择索引文件。');
+  if (S.indexInspection.sheet_error) throw new Error(`${S.indexInspection.sheet_error}。请改选工作表，或关闭重命名。`);
+  if ($('index-column').value === '' || $('name-column').value === '') throw new Error('请选择文件夹名称索引和重命名文件名。');
+  if (Number($('header-row').value) !== Number(S.indexInspection.header_row)) throw new Error('表头行正在更新，请稍候再扫描。');
+  return {path,sheet:$('index-sheet').value,index_column:Number($('index-column').value),name_column:Number($('name-column').value),header_row:Number($('header-row').value),match_rule:$('match-rule').value,naming:$('naming-mode').value,duplicates:'first'};
+}
+function preparationRequest() {
+  const validPaths = new Set((S.initialization?.groups || []).map(g => g.relative_path));
+  const output_names = [...S.renameOverrides].filter(([path]) => validPaths.has(path)).map(([relative_path,output_name]) => ({relative_path,output_name}));
+  return {root:$('root-path').value.trim(),level:Number($('merge-level').value),exclude_rules:$('exclude-rules').value,index:indexRequest(),sort:{mode:'name',descending:false},output_names:$('rename-enabled').checked ? output_names : []};
+}
+async function refreshNamingPreview() {
+  if (!$('rename-enabled').checked || !$('root-path').value.trim() || !$('index-path').value.trim()) { S.renamePreview = null; renderNamingPreview(); return; }
+  if (!S.initialization || !samePath(S.initialization.root,$('root-path').value.trim())) await initializeFolder();
+  await operation('正在更新命名预览…',async () => {
+    $('rename-preview-note').textContent = '正在生成文件名预览…';
+    const epoch = ++S.namingEpoch; const request = preparationRequest(); const signature = JSON.stringify(request);
+    const data = await api('/batch/preview',{method:'POST',body:request});
+    if (epoch !== S.namingEpoch || !$('rename-enabled').checked || !samePath(request.root,$('root-path').value.trim()) || request.level !== Number($('merge-level').value)) return;
+    try { if (JSON.stringify(preparationRequest()) !== signature) return; } catch (_) { return; }
+    S.renamePreview = data;
+    const allowed = new Set(data.groups.map(g => g.relative_path)); S.renameOverrides = new Map([...S.renameOverrides].filter(([path]) => allowed.has(path)));
+    for (const group of data.groups) if (S.renameOverrides.has(group.relative_path)) S.renameOverrides.set(group.relative_path,group.output_name);
+    renderNamingPreview();
+  });
+}
+function canonicalOutputName(value) { const name = String(value || '').trim(); return (name.toLowerCase().endsWith('.pdf') ? name : name + '.pdf').normalize('NFC').toLocaleLowerCase(); }
+function namingCollisions(groups, valueOf) {
+  const map = new Map(); for (const group of groups.filter(g => !g.empty)) { const key = canonicalOutputName(valueOf(group)); if (!map.has(key)) map.set(key,[]); map.get(key).push(group.relative_path || group.id); }
+  return new Set([...map.values()].filter(paths => paths.length > 1).flat());
+}
+function renderNamingPreview() {
+  const box = $('rename-preview-list'); box.replaceChildren();
+  const groups = S.renamePreview?.groups || [];
+  $('rename-preview-count').textContent = groups.length ? `${fmt(groups.length)} 个文件夹` : '';
+  $('rename-collision').hidden = true;
+  if (!groups.length) { $('rename-preview-note').textContent = S.indexInspection?.sheet_error ? '请改选可读取的工作表。' : '选择索引文件并指定两列后，自动显示预期文件名。'; return; }
+  const valueOf = group => S.renameOverrides.get(group.relative_path) ?? group.output_name;
+  const collisions = namingCollisions(groups,valueOf);
+  $('rename-collision').hidden = !collisions.size;
+  $('rename-collision').textContent = `${fmt(collisions.size)} 个文件夹的输出名称相同，请直接修改下方文件名。`;
+  $('rename-preview-note').textContent = S.renamePreview.index_error ? `索引未生效：${S.renamePreview.index_error}。当前使用文件夹名。` : '可直接修改单个文件名；修改会用于本次扫描。';
+  const heading = el('div','rename-preview-row rename-preview-columns'); heading.append(el('span','','原文件夹'),el('span','','输出 PDF 文件名'),el('span','','匹配情况')); box.append(heading);
+  for (const group of groups) {
+    const row = el('div',`rename-preview-row${collisions.has(group.relative_path) ? ' has-collision' : ''}`);
+    const path = el('span','rename-source',group.relative_path || basename(S.initialization.root)); path.title = group.relative_path; row.append(path);
+    const field = el('div','rename-name-field'); const input = el('input'); input.value = valueOf(group); input.setAttribute('aria-label',`预期文件名 ${group.relative_path || group.name}`);
+    input.addEventListener('input',() => { S.renameOverrides.set(group.relative_path,input.value); changedSource(); updateNamingCollisionLabels(); });
+    input.addEventListener('change',action(refreshNamingPreview)); field.append(input);
+    if (S.renameOverrides.has(group.relative_path)) { const reset = el('button','text-button','恢复'); reset.type = 'button'; reset.setAttribute('aria-label',`恢复自动命名 ${group.relative_path || group.name}`); reset.addEventListener('click',action(async () => { S.renameOverrides.delete(group.relative_path); changedSource(); await refreshNamingPreview(); })); field.append(reset); }
+    row.append(field,el('span','rename-match',group.rename?.message || (group.rename?.status === 'matched' ? '已匹配' : '使用文件夹名'))); row.dataset.path = group.relative_path; box.append(row);
+  }
+}
+function updateNamingCollisionLabels() {
+  const groups = S.renamePreview?.groups || []; const collisions = namingCollisions(groups,group => S.renameOverrides.get(group.relative_path) ?? group.output_name);
+  $('rename-collision').hidden = !collisions.size;
+  $('rename-collision').textContent = `${fmt(collisions.size)} 个文件夹的输出名称相同，请修改文件名。`;
+  $('rename-preview-list').querySelectorAll('[data-path]').forEach(row => row.classList.toggle('has-collision',collisions.has(row.dataset.path)));
 }
 async function scan() {
   if (busy()) return;
-  return operation('正在扫描资料…', async () => {
-    if (!S.initialization || !samePath(S.initialization.root, $('root-path').value.trim())) await initializeFolder();
-    if ($('index-path').value.trim() && (!S.indexInspection || !samePath(S.indexInspection.path, $('index-path').value.trim()))) await inspectIndex();
-    const request = {root:$('root-path').value.trim(),level:Number($('merge-level').value),exclude_rules:$('exclude-rules').value,index:indexRequest(),sort:{mode:'name',descending:false}};
-    const plan = await api('/batch/scan', {method:'POST',body:request});
-    acceptPlan(plan, {syncForm:true,collapse:true,preserveSelection:false}); S.job = null; $('job-panel').hidden = true;
-    await refreshHistory(false); toast('扫描完成，请在三栏中核对合并单元、文件顺序和方向。');
+  clearTimeout(S.previewTimer); clearTimeout(S.editTimer);
+  return operation('正在扫描资料…',async () => {
+    if (!S.initialization || !samePath(S.initialization.root,$('root-path').value.trim())) await initializeFolder();
+    if ($('rename-enabled').checked && $('index-path').value.trim() && (!S.indexInspection || !samePath(S.indexInspection.path,$('index-path').value.trim()))) await inspectIndex({refresh:false});
+    const started = await api('/batch/scans',{method:'POST',body:preparationRequest()});
+    S.job = null; $('job-panel').hidden = true; S.events = []; await followScan(started);
   });
 }
+async function followScan(initial,{syncForm = false} = {}) {
+  if (S.scanPolling) return; S.scanPolling = true; S.scan = initial;
+  $('welcome').hidden = true; $('workspace').hidden = false; $('scan-progress-panel').hidden = false; $('scan-details').hidden = false;
+  $('scan-results').hidden = true; $('merge-section').hidden = true;
+  try {
+    while (true) {
+      renderScanProgress(); renderLogs(); controls();
+      if (!active(S.scan)) break;
+      await new Promise(resolve => setTimeout(resolve,450));
+      try { S.scan = await api(`/batch/scans/${S.scan.id}`); }
+      catch (error) { showError(error); await new Promise(resolve => setTimeout(resolve,1200)); }
+    }
+    if (S.scan.status === 'completed' && S.scan.plan_id) {
+      const plan = await api(`/batch/plans/${S.scan.plan_id}`);
+      if (!S.initialization || !samePath(S.initialization.root,plan.root)) {
+        try { S.initialization = await api('/batch/initialize',{method:'POST',body:{root:plan.root,level:plan.level,exclude_rules:plan.exclude_rules}}); renderLevels(plan.level); renderDirectoryPreview(); } catch (_) { S.initialization = null; }
+      }
+      acceptPlan(plan,{syncForm,collapse:true,preserveSelection:false});
+      toast('扫描完成，可以调整文件名、顺序和方向。');
+    } else if (S.scan.error) showError(new Error(S.scan.error));
+  } finally {
+    S.scanPolling = false;
+    if (!active(S.scan)) { try { await refreshHistory(false); } catch (error) { showError(error); } }
+    if (S.plan) { $('scan-results').hidden = false; $('merge-section').hidden = false; }
+    renderScanProgress(); renderLogs(); controls();
+  }
+}
+function renderScanProgress() {
+  const scan = S.scan; if (!scan) return;
+  const phases = {enumerating:'正在获取目录',validating:'正在检查文件',naming:'正在生成文件名',saving:'正在保存扫描结果',completed:'扫描完成'};
+  $('scan-progress-panel').hidden = scan.status === 'completed';
+  $('scan-progress-title').textContent = active(scan) ? phases[scan.phase] || '正在扫描资料' : labels[scan.status] || scan.status;
+  $('scan-progress-detail').textContent = scan.total ? `${fmt(scan.done)} / ${fmt(scan.total)} 个文件` : '正在统计待处理文件';
+  $('scan-progress-bar').style.width = `${scan.total ? Math.min(100,Number(scan.done) / Number(scan.total) * 100) : 0}%`;
+  $('scan-current-file').textContent = scan.current_file || (active(scan) ? '请稍候，完成后将显示文件详情。' : scan.error || '');
+  $('scan-elapsed').textContent = scan.elapsed_ms === undefined ? '' : `已用 ${formatDuration(scan.elapsed_ms)}`;
+  $('cancel-scan').hidden = !active(scan);
+}
+async function cancelScan() {
+  if (!active(S.scan)) return; S.scan.cancelRequested = true; controls();
+  try { await api(`/jobs/${S.scan.id}/cancel`,{method:'POST'}); toast('已请求取消扫描，正在保存已完成状态。'); }
+  catch (error) { S.scan.cancelRequested = false; throw error; }
+}
+function formatDuration(ms) { const seconds = Math.max(0,Math.round(Number(ms || 0) / 1000)); return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`; }
 function acceptPlan(plan, {syncForm = false, collapse = S.preparationCollapsed, preserveSelection = true} = {}) {
   const previous = S.plan; const oldGroup = selectedGroup(); const oldFile = selectedFile();
   const oldIds = new Set(S.selected); const oldPaths = new Set((previous?.groups || []).filter(g => oldIds.has(g.id)).map(g => g.relative_path));
-  S.plan = plan; S.drafts.clear(); S.sourceDirty = false;
+  S.plan = plan; S.drafts.clear(); S.editError = false; S.sourceDirty = false; rememberPlan(plan);
   S.selected = new Set(plan.groups.filter(g => !g.empty && g.files.length && (!previous || !preserveSelection || oldIds.has(g.id) || oldPaths.has(g.relative_path))).map(g => g.id));
   S.groupId = plan.groups.find(g => g.id === oldGroup?.id)?.id || plan.groups.find(g => g.relative_path === oldGroup?.relative_path)?.id || plan.groups.find(g => g.files.length)?.id || plan.groups[0]?.id || null;
   const currentGroup = selectedGroup();
@@ -307,11 +449,12 @@ function acceptPlan(plan, {syncForm = false, collapse = S.preparationCollapsed, 
     $('root-path').value = prettyPath(plan.root); $('merge-level').value = plan.level;
     if (!S.initialization || !samePath(S.initialization.root, plan.root)) {
       S.initialization = null; const option = el('option','',plan.level ? `第 ${plan.level} 级（历史配置）` : '当前文件夹（历史配置）'); option.value = plan.level;
-      $('merge-level').replaceChildren(option); $('level-hint').textContent = '已载入历史分组设置；如需更改级别，请重新读取实际文件夹层级。'; $('initialization-note').hidden = true;
+      $('merge-level').replaceChildren(option); $('level-hint').textContent = `${fmt(plan.groups.filter(g => !g.empty).length)} 个文件夹待合并`; $('initialization-note').hidden = true;
     } else { $('merge-level').value = String(plan.level); renderLevelHint(); }
     $('exclude-rules').value = plan.exclude_rules ?? DEFAULT_RULES;
     const index = plan.index?.request || plan.index?.config || plan.index;
-    $('index-path').value = prettyPath(index?.path || '');
+    $('index-path').value = prettyPath(index?.path || ''); $('rename-enabled').checked = Boolean(index?.path);
+    $('naming-history-note').hidden = !index?.path || index.duplicates === 'first';
     if (index?.path) {
       const inspected = S.indexInspection && samePath(S.indexInspection.path, index.path) && S.indexInspection.sheet === index.sheet && Number(S.indexInspection.header_row) === Number(index.header_row) && S.indexInspection.columns.length > 0;
       if (!inspected) S.indexInspection = {path:index.path,sheet:index.sheet,header_row:index.header_row,columns:[],sheets:[]};
@@ -324,37 +467,81 @@ function acceptPlan(plan, {syncForm = false, collapse = S.preparationCollapsed, 
         if (!inspected) { const option = el('option', '', `第 ${Number(value) + 1} 列`); option.value = value; $(id).replaceChildren(option); }
         $(id).value = String(value);
       }
-      $('match-rule').value = index.match_rule || 'auto'; $('naming-mode').value = index.naming || 'index'; $('duplicate-mode').value = index.duplicates || 'fallback';
+      $('match-rule').value = index.match_rule || 'auto'; $('naming-mode').value = index.naming || 'index';
       if (!inspected) $('index-preview-table').replaceChildren(el('p','help','历史配置已载入；更换工作表或列前可重新读取索引。'));
     } else { S.indexInspection = null; $('index-settings').hidden = true; $('index-sheet-warning').hidden = true; }
   }
   $('source-summary').textContent = `${prettyPath(plan.root)} · ${plan.level ? `第 ${plan.level} 级分组` : '当前文件夹'} · ${fmt(plan.groups.length)} 个单元`;
-  $('welcome').hidden = true; $('workspace').hidden = false; $('toggle-preparation').hidden = false;
+  $('welcome').hidden = true; $('workspace').hidden = false; $('scan-results').hidden = false; $('merge-section').hidden = false; $('scan-details').hidden = false; $('toggle-preparation').hidden = false;
   setPreparationCollapsed(collapse); renderPlan(); controls();
+}
+function rememberPlan(plan) {
+  const summary = {id:plan.id,parent_plan_id:plan.parent_plan_id,created_at:plan.created_at,root:plan.root,output_dir:plan.output_dir,level:plan.level,index:plan.index,group_count:plan.groups.length,file_count:allFiles(plan).length,pages:allFiles(plan).reduce((n,f) => n + Number(f.pages || 0),0),removed_file_count:plan.removed_sources?.length || 0};
+  S.plans = [summary,...S.plans.filter(p => p.id !== plan.id)]; $('history-count').textContent = fmt(historyFamilies(S.plans).length);
+}
+function groupProblems(group) {
+  const changedName = S.drafts.get(group.id)?.output_name;
+  const errors = (group.issues || []).filter(issue => !['source_error','output_collision','output_existing'].includes(issue.code) && !(changedName !== undefined && changedName !== group.output_name && ['output_name','output_is_source'].includes(issue.code)));
+  for (const file of group.files) if (file.error) errors.push({severity:'error',code:'source_error',message:`${file.name}：${file.error}`,path:file.relative_path});
+  const name = groupDraft(group).output_name;
+  if (!String(name || '').trim()) errors.push({severity:'error',code:'output_name',message:'输出文件名不能为空。'});
+  const conflicts = (S.plan?.groups || []).filter(other => other.id !== group.id && !other.empty && canonicalOutputName(groupDraft(other).output_name) === canonicalOutputName(name));
+  if (!group.empty && conflicts.length) errors.push({severity:'error',code:'output_collision',message:`输出名称与“${conflicts.map(g => g.relative_path || g.name).join('”“')}”相同，请修改文件名。`});
+  return errors;
+}
+function currentLogs() {
+  if (active(S.scan)) return (S.scan.logs || []).map(log => ({...log,level:log.level || 'info'}));
+  const plan = S.plan; const logs = [];
+  if (!plan) return (S.scan?.logs || []).map(log => ({...log,level:log.level || 'info'}));
+  if (S.scan?.status === 'failed' && S.scan.error) logs.push({level:'error',message:S.scan.error});
+  for (const issue of plan.issues || []) if (issue.code !== 'output_existing') logs.push({level:issue.severity || 'warning',message:issue.message,path:issue.path});
+  for (const group of plan.groups) for (const issue of groupProblems(group)) logs.push({level:issue.severity || 'warning',message:`${group.relative_path || group.name}：${issue.message}`});
+  if (plan.index_error) logs.push({level:'warning',message:`索引未生效：${plan.index_error}，当前使用文件夹名。`});
+  for (const file of allFiles(plan).filter(autoTouched)) {
+    const change = appliedAutoChange(file); logs.push({level:'info',code:'auto_rotation_change',message:`${file.relative_path}：自动调整 ${change.from_cw}° → ${change.to_cw}°。`});
+  }
+  const orientationJob = [S.job,...S.jobs].find(job => job?.kind === 'batch_analyze' && job.plan_id === plan.id && job.orientation_summary);
+  if (orientationJob) logs.push({level:'info',code:'orientation_summary',message:orientationSummaryText(orientationJob)});
+  else {
+    const failures = allFiles(plan).filter(file => imageFile(file) && file.orientation_error && !file.manual_rotation).length;
+    if (failures) logs.push({level:'info',code:'orientation_summary',message:`${fmt(failures)} 张图片方向识别未完成，未因该结果调整方向。`});
+  }
+  logs.push({level:'info',message:`当前 ${fmt(plan.groups.filter(g => !g.empty).length)} 个合并文件夹，${fmt(allFiles(plan).length)} 个文件，共 ${fmt(allFiles(plan).reduce((n,f) => n + Number(f.pages || 0),0))} 页。`});
+  for (const rule of plan.exclusions || []) if (rule.matches?.length) logs.push({level:'info',message:`排除“${rule.rule}”，命中 ${fmt(rule.matches.length)} 个文件或目录。`});
+  if (plan.ignored_files) logs.push({level:'info',message:`已跳过 ${fmt(plan.ignored_files)} 个非支持格式或辅助文件。`});
+  if (plan.removed_sources?.length) logs.push({level:'info',message:`本次合并已移除 ${fmt(plan.removed_sources.length)} 个文件，原文件保留，可在文件列表下方撤销。`});
+  logs.push(...S.events);
+  const seen = new Set(); return logs.filter(log => { const key = `${log.level}:${log.message}:${log.path || ''}`; if (seen.has(key)) return false; seen.add(key); return true; });
+}
+function renderLogs() {
+  const logs = currentLogs(); const counts = {all:logs.length,warning:0,error:0,info:0};
+  for (const log of logs) if (log.level in counts) counts[log.level]++;
+  for (const level of ['all','warning','error','info']) { $(`log-count-${level}`).textContent = fmt(counts[level]); $(`log-filter-${level}`).classList.toggle('active',S.logFilter === level); }
+  $('summary-issues').textContent = fmt(counts.error + counts.warning);
+  $('scan-log-summary').textContent = counts.error ? `${fmt(counts.error)} 个错误 · ${fmt(counts.warning)} 个警告` : counts.warning ? `${fmt(counts.warning)} 个警告` : '当前无错误';
+  const box = $('scan-issues'); box.replaceChildren();
+  for (const log of logs.filter(log => S.logFilter === 'all' || log.level === S.logFilter)) {
+    const row = el('div',`scan-log-row ${log.level}`); row.append(el('span','log-level',{info:'信息',warning:'警告',error:'错误'}[log.level] || '信息'),el('span','scan-log-message',log.message + (log.path ? ` · ${prettyPath(log.path)}` : ''))); box.append(row);
+  }
+  if (!box.children.length) box.append(el('div','empty-pane','此分类没有日志。'));
+  const metrics = S.scan || S.plan?.scan_metrics;
+  $('scan-timing').hidden = !metrics?.timings;
+  if (metrics?.timings) {
+    const t = metrics.timings; const counts = metrics.counts || {};
+    $('scan-timing').textContent = `扫描用时 ${formatDuration(metrics.elapsed_ms)} · 图片 ${fmt(counts.image_files)} 张 · PDF ${fmt(counts.pdf_files)} 份。目录 ${formatDuration(t.metadata_ms)}，读取 ${formatDuration(t.read_ms)}，校验 ${formatDuration(t.hash_ms)}，PDF检查 ${formatDuration(t.pdf_ms)}，图片检查 ${formatDuration(t.image_ms)}。阶段数据为累计工时。`;
+  }
 }
 function renderPlan() {
   const p = S.plan; if (!p) return;
   const files = allFiles(p); $('summary-groups').textContent = fmt(p.groups.length); $('summary-files').textContent = fmt(files.length);
-  $('summary-pages').textContent = fmt(files.reduce((n, f) => n + Number(f.pages || 0), 0));
-  $('summary-review').textContent = fmt(files.reduce((n, f) => n + pendingReview(f), 0));
-  $('groups-count').textContent = fmt(p.groups.length);
-  const issues = [...(p.issues || []), ...p.groups.flatMap(g => (g.issues || []).map(i => ({...i,path:i.path || g.relative_path || g.name})))];
-  if (p.index_error) issues.unshift({severity:'warning',message:`索引未启用：${p.index_error}`});
-  $('summary-issues').textContent = fmt(issues.length);
-  $('scan-issues').replaceChildren(issues.length ? issueList(issues) : el('p', 'help', '未发现扫描问题。生成前仍会核验来源和输出归属。'));
+  $('summary-pages').textContent = fmt(files.reduce((n,f) => n + Number(f.pages || 0),0)); $('summary-review').textContent = fmt(files.reduce((n,f) => n + pendingReview(f),0)); $('groups-count').textContent = fmt(p.groups.length);
   const box = $('scan-exclusions'); box.replaceChildren();
   for (const rule of p.exclusions || []) {
-    const detail = el('details', 'exclusion-detail');
-    const title = rule.kind === 'output' ? '输出目录自动排除' : rule.kind === 'state' ? '处理记录自动排除' : '排除规则';
-    detail.append(el('summary', '', `${title}：${rule.rule} · ${fmt(rule.matches?.length)} 个命中项`));
-    const list = el('ul'); list.append(...(rule.matches || []).map(path => el('li', '', path))); detail.append(list); box.append(detail);
+    const detail = el('details','exclusion-detail'); const title = rule.kind === 'output' ? '输出目录自动排除' : rule.kind === 'state' ? '处理记录自动排除' : '排除规则';
+    detail.append(el('summary','',`${title}：${rule.rule} · ${fmt(rule.matches?.length)} 个命中项`)); const list = el('ul'); list.append(...(rule.matches || []).map(path => el('li','',path))); detail.append(list); box.append(detail);
   }
-  if (p.ignored_files) box.append(el('p', 'help', `跳过 ${fmt(p.ignored_files)} 个非支持格式或辅助文件。被排除目录只列目录项，不估算内部文件数量。`));
-  if (p.empty_directories?.length) {
-    const detail = el('details', 'exclusion-detail'); detail.append(el('summary', '', `空目录 · ${fmt(p.empty_directories.length)}`));
-    const list = el('ul'); list.append(...p.empty_directories.map(path => el('li', '', path || '资料根目录'))); detail.append(list); box.append(detail);
-  }
-  renderGroups(); renderFiles(); renderPreview().catch(showError);
+  if (p.empty_directories?.length) box.append(el('p','help',`当前范围包含 ${fmt(p.empty_directories.length)} 个空目录，不生成空 PDF。`));
+  renderGroups(); renderFiles(); renderLogs(); renderPreview().catch(showError);
 }
 function renameDescription(group) {
   const rename = group.rename; if (!rename) return '';
@@ -366,7 +553,7 @@ function renderGroups() {
   const box = $('group-list'); const scroll = box.scrollTop; box.replaceChildren();
   const search = $('group-search').value.trim().toLocaleLowerCase();
   for (const group of S.plan.groups.filter(g => `${g.relative_path} ${g.output_name} ${groupDraft(g).output_name}`.toLocaleLowerCase().includes(search))) {
-    const tone = groupTone(group); const row = el('div', `group-row tone-${tone}${group.id === S.groupId ? ' active' : ''}`); row.setAttribute('role','listitem');
+    const tone = groupTone(group); const row = el('div', `group-row tone-${tone}${group.id === S.groupId ? ' active' : ''}`); row.setAttribute('role','listitem'); row.dataset.groupId = group.id;
     const main = el('div', 'group-main'); const check = document.createElement('input'); check.type = 'checkbox'; check.value = group.id; check.checked = S.selected.has(group.id); check.setAttribute('aria-label', `选择合并单元 ${group.relative_path || group.name}`);
     check.addEventListener('change', () => { if (check.checked) S.selected.add(group.id); else S.selected.delete(group.id); controls(); });
     const open = el('button', 'group-open'); open.type = 'button'; open.title = group.relative_path || group.name;
@@ -375,32 +562,48 @@ function renderGroups() {
     const meta = el('div', 'group-meta'); meta.append(el('span','',`${fmt(group.files.length)} 文件 · ${fmt(group.pages)} 页`));
     if (group.shallow) meta.append(el('span', 'pill', '浅层直属'));
     const pending = group.files.reduce((n, f) => n + pendingReview(f), 0);
-    if (pending) meta.append(el('span','pill warning',`${fmt(pending)} 待核对`));
+    if (pending) meta.append(el('span','pill warning',`${fmt(pending)} 方向提示`));
     if (group.empty) meta.append(el('span','pill','空单元'));
-    if (hasErrors(group)) meta.append(el('span','pill error','需处理问题'));
+    const signatureWarning = group.issues?.find(issue => issue.code === 'pdf_signature');
+    const signed = signatureWarning || group.files.some(file => file.pdf_has_signature);
+    if (signed) meta.append(el('span','pill warning','含签名 PDF'));
     row.append(meta);
+    if (signed) row.append(el('span','group-status warning',signatureWarning?.message || '按静态页面合并，不保留签名验证；原文件不变。'));
     const naming = renameDescription(group);
     if (naming) {
       const warning = group.rename && ['unmatched','conflict','empty'].includes(group.rename.status);
       row.append(el('span', `group-status${warning ? ' warning' : ''}`, naming));
     }
     if (group.id === S.groupId) {
-      const edit = el('div', 'group-rename'); const name = document.createElement('input'); name.value = groupDraft(group).output_name; name.dataset.edit = 'name'; name.setAttribute('aria-label', `输出文件名 ${group.relative_path || group.name}`); name.title = '修改名称后点击“保存顺序与名称”';
-      name.addEventListener('input', () => { setDraft(group, {output_name:name.value}); open.querySelector('.group-output').textContent = name.value; });
+      const edit = el('div', 'group-rename'); const name = document.createElement('input'); name.value = groupDraft(group).output_name; name.dataset.edit = 'name'; name.dataset.groupId = group.id; name.setAttribute('aria-label', `输出文件名 ${group.relative_path || group.name}`); name.title = '名称会在输入暂停或失去焦点后自动保存';
+      name.addEventListener('input', () => { setDraft(group, {output_name:name.value}); open.querySelector('.group-output').textContent = name.value; updateGroupProblemViews(); scheduleEdits(); });
+      name.addEventListener('change',() => scheduleEdits(0));
       const prefix = el('button', 'text-button', '加原名'); prefix.type = 'button'; prefix.dataset.edit = 'name'; prefix.title = '在当前名称前加入文件夹路径，区分同名输出';
       prefix.addEventListener('click', () => {
         const base = group.relative_path ? group.relative_path.replace(/[\\/]/g, '__') : basename(S.plan.root);
-        const value = `${base}-${groupDraft(group).output_name}`; name.value = value; setDraft(group,{output_name:value}); open.querySelector('.group-output').textContent = value;
+        const value = `${base}-${groupDraft(group).output_name}`; name.value = value; setDraft(group,{output_name:value}); open.querySelector('.group-output').textContent = value; updateGroupProblemViews(); scheduleEdits(0);
       });
       edit.append(name, prefix); row.append(edit);
     }
+    const problems = el('ul','group-problems'); const errors = groupProblems(group).filter(i => i.severity === 'error'); problems.hidden = !errors.length;
+    problems.append(...errors.map(issue => el('li','',issue.message))); row.append(problems);
     box.append(row);
   }
   if (!box.children.length) box.append(el('div','empty-pane',S.plan.groups.length ? '没有匹配的合并单元' : '没有可合并文件，请检查文件格式、层级和排除规则。'));
   box.scrollTop = scroll; controls();
 }
+function updateGroupProblemViews() {
+  $('group-list').querySelectorAll('[data-group-id]').forEach(row => {
+    if (!row.classList.contains('group-row')) return;
+    const group = S.plan.groups.find(g => g.id === row.dataset.groupId); if (!group) return;
+    row.className = `group-row tone-${groupTone(group)}${group.id === S.groupId ? ' active' : ''}`;
+    const box = row.querySelector('.group-problems'); const errors = groupProblems(group).filter(i => i.severity === 'error'); box.hidden = !errors.length; box.replaceChildren(...errors.map(issue => el('li','',issue.message)));
+  });
+  renderLogs(); controls();
+}
 function selectGroup(id) {
   if (id === S.groupId) return;
+  clearDragState();
   S.groupId = id; S.fileId = selectedGroup()?.files[0]?.id || null; resetSourceView();
   renderGroups(); renderFiles(); renderPreview().catch(showError); controls();
 }
@@ -408,71 +611,159 @@ function resetSourceView() {
   S.sourcePage = 1; S.fit = true; S.zoom = 1;
   $('rotation-scope').value = pdfFile(selectedFile()) ? 'page' : 'file';
 }
+let sortingPointer = null;
+function clearDragState() {
+  const state = sortingPointer; sortingPointer = null;
+  if (state?.frame) cancelAnimationFrame(state.frame);
+  if (state) {
+    try { if (state.handle.hasPointerCapture(state.pointerId)) state.handle.releasePointerCapture(state.pointerId); }
+    catch (_) { /* A detached handle may already have lost pointer capture. */ }
+  }
+  const list = $('file-list'); list.classList.remove('pointer-sorting');
+  list.querySelectorAll('.dragging,.drop-target').forEach(row => row.classList.remove('dragging','drop-target'));
+}
+function validSortPointer(state) {
+  return sortingPointer === state && !busy() && !S.sourceDirty && !hasDrafts() && state.groupId === S.groupId && state.row.isConnected && $('file-list').contains(state.row) && state.handle.hasPointerCapture(state.pointerId) && Boolean(selectedGroup()?.files.some(file => file.id === state.fileId));
+}
+function pointerSortTarget(state,x,y) {
+  const list = $('file-list'); const bounds = list.getBoundingClientRect();
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < bounds.left || x >= bounds.right || y < bounds.top || y >= bounds.bottom) return null;
+  const hit = document.elementFromPoint(x,y); const row = hit?.closest('.file-row');
+  if (!row || !list.contains(row) || row.dataset.groupId !== state.groupId || !selectedGroup()?.files.some(file => file.id === row.dataset.fileId)) return null;
+  return row;
+}
+function updateSortPointer(state,x,y) {
+  state.x = x; state.y = y;
+  const target = pointerSortTarget(state,x,y);
+  if (state.target !== target) {
+    state.target?.classList.remove('drop-target'); state.target = target;
+    if (target && target !== state.row) target.classList.add('drop-target');
+  }
+  const list = $('file-list'); const bounds = list.getBoundingClientRect(); const max = Math.max(0,list.scrollHeight - list.clientHeight);
+  let step = target && y < bounds.top + 28 ? -10 : target && y > bounds.bottom - 28 ? 10 : 0;
+  if ((step < 0 && list.scrollTop <= 0) || (step > 0 && list.scrollTop >= max)) step = 0;
+  state.scrollStep = step;
+  if (step && !state.frame) state.frame = requestAnimationFrame(scrollSortPointer);
+  if (!step && state.frame) { cancelAnimationFrame(state.frame); state.frame = null; }
+}
+function scrollSortPointer() {
+  const state = sortingPointer; if (!state) return; state.frame = null;
+  if (!state.dragging || !validSortPointer(state)) { clearDragState(); return; }
+  const list = $('file-list'); const previous = list.scrollTop; const max = Math.max(0,list.scrollHeight - list.clientHeight);
+  list.scrollTop = Math.min(max,Math.max(0,previous + state.scrollStep));
+  if (list.scrollTop !== previous) updateSortPointer(state,state.x,state.y);
+}
+function beginSortPointer(event,handle,row,groupId,fileId) {
+  if (!event.isPrimary || event.button !== 0 || !Number.isInteger(event.pointerId) || handle.disabled || busy() || S.sourceDirty || hasDrafts() || groupId !== S.groupId) return;
+  clearDragState(); event.preventDefault();
+  sortingPointer = {pointerId:event.pointerId,handle,row,groupId,fileId,startX:event.clientX,startY:event.clientY,x:event.clientX,y:event.clientY,dragging:false,target:null,frame:null,scrollStep:0};
+  try { handle.setPointerCapture(event.pointerId); if (!handle.hasPointerCapture(event.pointerId)) clearDragState(); }
+  catch (_) { clearDragState(); }
+}
+function moveSortPointer(event) {
+  const state = sortingPointer; if (!state || event.pointerId !== state.pointerId) return;
+  if (!validSortPointer(state)) { clearDragState(); return; }
+  if (!state.dragging && Math.hypot(event.clientX - state.startX,event.clientY - state.startY) < 6) return;
+  if (!state.dragging) { state.dragging = true; state.row.classList.add('dragging'); $('file-list').classList.add('pointer-sorting'); }
+  event.preventDefault(); updateSortPointer(state,event.clientX,event.clientY);
+}
+function finishSortPointer(event) {
+  const state = sortingPointer; if (!state || event.pointerId !== state.pointerId) return;
+  const target = state.dragging && event.button === 0 && event.isPrimary && validSortPointer(state) ? pointerSortTarget(state,event.clientX,event.clientY) : null;
+  const ids = target ? groupDraft(selectedGroup()).file_ids : [];
+  const from = ids.indexOf(state.fileId); const to = ids.indexOf(target?.dataset.fileId);
+  clearDragState();
+  if (target && from >= 0 && to >= 0 && from !== to) { event.preventDefault(); moveFile(from,to).catch(showError); }
+}
+function cancelSortPointer(event) {
+  if (sortingPointer?.pointerId === event.pointerId) clearDragState();
+}
 function renderFiles() {
-  const box = $('file-list'); const scroll = box.scrollTop; box.replaceChildren(); const group = selectedGroup();
+  clearDragState(); const box = $('file-list'); const scroll = box.scrollTop; box.replaceChildren(); const group = selectedGroup();
   $('files-count').textContent = fmt(group?.files.length); $('selected-group-name').textContent = group?.relative_path || (group ? basename(S.plan.root) : '');
   $('selected-group-name').title = group?.relative_path || '';
-  if (!group) { box.append(el('div','empty-pane','选择左栏合并单元，查看文件顺序。')); $('file-list-summary').textContent = '选择合并单元'; controls(); return; }
+  if (!group) { box.append(el('div','empty-pane','选择左栏文件夹，查看文件顺序。')); $('file-list-summary').textContent = '选择文件夹'; renderRemovedFiles(); controls(); return; }
   const sort = groupDraft(group).sort || group.sort || S.plan.sort || {mode:'name',descending:false};
   $('file-sort').value = S.drafts.get(group.id)?.file_ids ? 'manual' : sort.mode || 'name';
   if (group.sort?.mode === 'manual') $('file-sort').value = 'manual';
   $('sort-direction').value = sort.descending ? 'desc' : 'asc'; $('sort-separator').value = sort.separator || '';
   renderSortHint(); const files = orderedFiles(group); let first = 1;
   files.forEach((file,index) => {
-    const status = fileStatus(file); const row = el('div',`file-row tone-${status.tone}${file.id === S.fileId ? ' active' : ''}`); row.setAttribute('role','listitem'); row.draggable = !busy() && !S.sourceDirty;
-    const line = el('div','file-line'); const position = el('span','file-position',index + 1); position.title = '拖动调整顺序';
+    const status = fileStatus(file); const row = el('div',`file-row tone-${status.tone}${file.id === S.fileId ? ' active' : ''}`); row.setAttribute('role','listitem'); row.dataset.groupId = group.id; row.dataset.fileId = file.id;
+    const line = el('div','file-line'); const position = el('button','file-position file-drag-handle',index + 1); position.type = 'button'; position.draggable = false; position.dataset.edit = 'drag'; position.title = '按住左侧手柄拖动，松开后保存顺序'; position.setAttribute('aria-label',`拖动调整顺序：${file.name}`);
+    position.addEventListener('pointerdown',event => beginSortPointer(event,position,row,group.id,file.id));
     const select = el('button','file-select'); select.type = 'button'; select.title = file.relative_path;
-    select.append(el('span','file-name',file.name), el('span','file-meta',`${imageFile(file) ? '图片' : 'PDF'} · ${fmt(file.pages)} 页 · 合并后 ${fmt(first)}–${fmt(first + Number(file.pages || 0) - 1)} 页`));
+    const pages = Number(file.pages || 0);
+    select.append(el('span','file-name',file.name), el('span','file-meta',pages ? `${imageFile(file) ? '图片' : 'PDF'} · ${fmt(pages)} 页 · 合并后 ${fmt(first)}–${fmt(first + pages - 1)} 页` : `${imageFile(file) ? '图片' : 'PDF'} · 无法读取页数`));
     select.addEventListener('click', () => { S.fileId = file.id; resetSourceView(); renderFiles(); renderPreview().catch(showError); controls(); });
     line.append(position,select); row.append(line); first += Number(file.pages || 0);
     const bottom = el('div','file-bottom'); bottom.append(el('span','file-review-label',`${status.symbol} ${status.label}`));
     const moves = el('div','file-moves');
     for (const [label,text,to,limit] of [['置顶','置顶',0,index === 0],['上移','↑',index - 1,index === 0],['下移','↓',index + 1,index === files.length - 1]]) {
       const button = el('button',label === '置顶' ? 'to-top' : '',text); button.type = 'button'; button.dataset.edit = 'order'; button.dataset.limit = String(limit); button.setAttribute('aria-label',`${label} ${file.name}`);
-      button.addEventListener('click', () => moveFile(index,to)); moves.append(button);
+      button.addEventListener('click',action(() => moveFile(index,to))); moves.append(button);
     }
+    const remove = el('button','remove-file','移除'); remove.type = 'button'; remove.dataset.edit = 'remove'; remove.title = '从本次合并中移除，原文件保留'; remove.setAttribute('aria-label',`移除 ${file.name}，原文件保留`); remove.addEventListener('click',action(() => removeFile(file.id))); moves.append(remove);
     bottom.append(moves); row.append(bottom);
     if (file.error) row.append(el('p','file-error',file.error));
-    row.addEventListener('dragstart',event => {
-      if (busy() || S.sourceDirty) { event.preventDefault(); return; }
-      event.dataTransfer.setData('text/plain',`${group.id}:${file.id}`); event.dataTransfer.effectAllowed = 'move'; row.classList.add('dragging');
-    });
-    row.addEventListener('dragend',() => { row.classList.remove('dragging'); box.querySelectorAll('.drop-target').forEach(node => node.classList.remove('drop-target')); });
-    row.addEventListener('dragover',event => { if (!busy() && !S.sourceDirty) { event.preventDefault(); row.classList.add('drop-target'); event.dataTransfer.dropEffect = 'move'; } });
-    row.addEventListener('dragleave',() => row.classList.remove('drop-target'));
-    row.addEventListener('drop',event => {
-      event.preventDefault(); row.classList.remove('drop-target');
-      const value = event.dataTransfer.getData('text/plain'); if (!value.startsWith(`${group.id}:`)) return;
-      moveFile(groupDraft(group).file_ids.indexOf(value.slice(group.id.length + 1)),index);
-    });
+    if (file.pdf_has_signature) row.append(el('p','file-warning','签名 PDF：合并不保留签名验证，原文件不变。'));
     box.append(row);
   });
   if (!files.length) box.append(el('div','empty-pane','该单元为空，不生成空 PDF。'));
   $('file-list-summary').textContent = `${fmt(files.length)} 个文件 · ${fmt(group.pages)} 页`;
-  box.scrollTop = scroll; controls();
+  renderRemovedFiles(); box.scrollTop = scroll; controls();
 }
 function renderSortHint() {
   const mode = $('file-sort').value; const segmented = ['prefix','suffix'].includes(mode); $('sort-separator').hidden = !segmented;
-  $('sort-hint').textContent = mode === 'modified' ? '按修改时间排序，时间相同则按文件名自然顺序。' : segmented ? `去除扩展名后，按${mode === 'prefix' ? '第一段' : '最后一段'}自然排序；默认用 _、- 或空格分段。应用会替换本组手动顺序。` : mode === 'manual' ? '当前为手动顺序；可继续拖动、上下移动或置顶，修改后保存。' : '2 在 10 前。可拖动文件，或用上下移动、置顶按钮调整。';
+  const ordering = mode === 'modified' ? '按修改时间排序。' : segmented ? `按${mode === 'prefix' ? '第一段' : '最后一段'}自然排序，默认以 _、- 或空格分段。` : mode === 'manual' ? '当前为手动顺序。' : '自然顺序：2 在 10 前。';
+  $('sort-hint').textContent = `${ordering}拖动左侧手柄，或使用置顶、上下移调整顺序。`;
 }
-function moveFile(from,to) {
+async function moveFile(from,to) {
   const group = selectedGroup(); if (!group || busy() || S.sourceDirty) return;
   const ids = [...groupDraft(group).file_ids]; if (from < 0 || to < 0 || from >= ids.length || to >= ids.length || from === to) return;
-  const [id] = ids.splice(from,1); ids.splice(to,0,id); setDraft(group,{file_ids:ids,sort:{mode:'manual',descending:false}}); renderFiles(); controls();
+  const [id] = ids.splice(from,1); ids.splice(to,0,id); setDraft(group,{file_ids:ids,sort:{mode:'manual',descending:false}}); renderFiles(); await saveEdits();
 }
 async function editPlan(body) {
   if (!S.plan || busy() || S.sourceDirty) return;
   return operation('正在保存调整…', async () => {
     const plan = await api(`/batch/plans/${S.plan.id}/edit`, {method:'POST',body});
-    acceptPlan(plan,{preserveSelection:true}); await refreshHistory(false); return plan;
+    acceptPlan(plan,{preserveSelection:true}); return plan;
   });
+}
+function scheduleEdits(delay = 800) {
+  clearTimeout(S.editTimer);
+  S.editTimer = setTimeout(async () => {
+    if (!hasDrafts() || S.sourceDirty) return;
+    if (busy()) { scheduleEdits(200); return; }
+    try { await saveEdits(); } catch (error) { showError(error); }
+  },delay);
 }
 async function saveEdits() {
   if (!hasDrafts()) return;
+  clearTimeout(S.editTimer);
+  const focused = document.activeElement; const restore = focused?.dataset?.edit === 'name' ? {groupId:focused.dataset.groupId,start:focused.selectionStart,end:focused.selectionEnd} : null;
   const groups = [...S.drafts.values()].map(value => {
     const {sort,...rest} = value; return rest;
   });
-  await editPlan({groups}); toast('顺序与名称已保存。');
+  try { await editPlan({groups}); S.editError = false; }
+  catch (error) { S.editError = true; throw error; }
+  finally {
+    controls();
+    if (restore) { const input = $('group-list').querySelector(`input[data-group-id="${restore.groupId}"]`); if (input && !input.disabled) { input.focus({preventScroll:true}); input.setSelectionRange(restore.start,restore.end); } }
+  }
+}
+async function removeFile(fileId) {
+  if (hasDrafts()) await saveEdits();
+  const file = allFiles(S.plan).find(f => f.id === fileId); if (!file) return;
+  await editPlan({remove_file_ids:[fileId]}); S.events.push({level:'info',message:`已移除“${file.relative_path}”，原文件保留。`}); renderLogs(); toast('已从本次合并中移除，原文件保留，可在列表下方撤销。');
+}
+function renderRemovedFiles() {
+  const removed = (S.plan?.removed_sources || []).filter(item => item.group_id === S.groupId);
+  $('removed-files').hidden = !removed.length; $('removed-count').textContent = fmt(removed.length); const box = $('removed-file-list'); box.replaceChildren();
+  for (const item of removed) {
+    const row = el('div','removed-file-row'); const name = el('span','',item.file.name); name.title = item.file.relative_path; const restore = el('button','text-button','撤销移除'); restore.type = 'button'; restore.setAttribute('aria-label',`撤销移除 ${item.file.name}`);
+    restore.addEventListener('click',action(async () => { if (hasDrafts()) await saveEdits(); await editPlan({restore_file_ids:[item.file.id]}); S.selected.add(item.group_id); S.events.push({level:'info',message:`已恢复“${item.file.relative_path}”到本次合并。`}); renderGroups(); renderLogs(); controls(); })); row.append(name,restore); box.append(row);
+  }
 }
 async function applySort() {
   const group = selectedGroup(); if (!group || $('file-sort').value === 'manual') return;
@@ -506,18 +797,17 @@ function renderPreviewMeta() {
   $('source-page-number').value = S.sourcePage; $('source-page-number').max = file?.pages || 1; $('source-page-total').textContent = `/ ${fmt(file?.pages)}`;
   const status = file ? fileStatus(file) : null;
   $('preview-file-status').textContent = status ? `${status.symbol} ${status.label}` : '';
-  $('preview-file-status').className = status ? ({review:'warning',error:'error',reviewed:'success'}[status.tone] || '') : '';
+  $('preview-file-status').className = status ? ({review:'warning',error:'error',reviewed:'success',manual:'manual'}[status.tone] || '') : '';
   $('rotation-scope').value = pdfFile(file) ? $('rotation-scope').value : 'file';
-  $('reviewed-label').textContent = pdfFile(file) && $('rotation-scope').value === 'page' ? '当前页已人工核对' : '此文件已人工核对';
-  $('reviewed-file').checked = Boolean(file && (pdfFile(file) && $('rotation-scope').value === 'page' ? file.reviewed_pages?.[S.sourcePage - 1] : pdfFile(file) ? pdfReviewedPages(file).every(Boolean) : file.reviewed));
   const angle = file ? (Number(file.rotation_cw || 0) + Number(pdfFile(file) ? file.page_rotations?.[S.sourcePage - 1] || 0 : 0)) % 360 : 0;
   $('rotation-note').textContent = angle ? `额外旋转 ${angle}°` : '旋转不改动原文件';
   $('preview-summary').textContent = !file ? '原件保留' : `${pdfFile(file) ? `第 ${fmt(S.sourcePage)} / ${fmt(file.pages)} 页` : '已应用照片自身方向信息'} · ${S.fit ? '适合窗口' : `${Math.round(S.zoom * 100)}%`}`;
   let evidence = '';
-  if (file?.orientation_error) evidence = `识别未完成：${file.orientation_error}。可手动调整，也可按当前角度合并。`;
+  if (file?.orientation_error) evidence = file.manual_rotation ? '先前自动识别未完成，当前使用您手动设置的角度。' : `识别未完成：${file.orientation_error}。可手动调整，也可按当前角度合并。`;
   else if (file?.orientation) evidence = `${file.manual_rotation ? '人工角度优先。' : '自动结果仅供参考。'}${file.orientation.title ? `文字证据：${file.orientation.title}。` : ''}${file.orientation.reason || ''}`;
   else if (pdfFile(file)) evidence = 'PDF保持原有页向；当前操作是在原有旋转上追加角度。自动方向识别仅处理图片。';
-  else if (file) evidence = '可直接按当前方向合并，也可手动调整；勾选“已人工核对”才记录核对状态。';
+  else if (file) evidence = '可直接使用当前方向，也可手动调整；原文件保留，调整自动保存。';
+  if (file?.pdf_has_signature) evidence = `签名 PDF 按静态页面合并，不保留签名验证；原文件不变。${evidence}`;
   $('preview-evidence').textContent = evidence; controls();
 }
 async function renderPreview() {
@@ -601,16 +891,7 @@ async function rotateFile(delta, reset = false) {
     change.rotation_cw = reset ? 0 : (Number(file.rotation_cw || 0) + delta + 360) % 360;
     if (reset && pdfFile(file)) change.page_rotations = Array(file.pages).fill(0);
   }
-  await editPlan({files:[change]}); toast('方向已保存，核对状态待您确认。');
-}
-async function markReviewed() {
-  const file = selectedFile(); if (!file || busy() || hasDrafts()) return;
-  const checked = $('reviewed-file').checked; const change = {file_id:file.id};
-  if (pdfFile(file) && $('rotation-scope').value === 'page') {
-    const pages = pdfReviewedPages(file); pages[S.sourcePage - 1] = checked; change.reviewed_pages = pages;
-  } else change.reviewed = checked;
-  try { await editPlan({files:[change]}); toast(checked ? '已记录人工核对。' : '已取消核对标记。'); }
-  finally { renderPreviewMeta(); }
+  await editPlan({files:[change]}); toast('方向已保存。');
 }
 function selectedImageCount() { return selectedGroups().reduce((n, group) => n + group.files.filter(file => imageFile(file) && !file.error).length, 0); }
 function openOrientation(retry = null) {
@@ -651,9 +932,11 @@ function renderMergeSummary() {
   summary.append(line,el('p','help',`图片 ${fmt(files.filter(imageFile).length)} 张 · PDF ${fmt(files.filter(pdfFile).length)} 份 · 每个合并单元独立输出。`));
   if (S.mergeRetry) summary.append(el('p','help',`沿用原任务的计划、输出位置和 ${S.mergeRetry.threads || 4} 线程设置，已核验的成品可以复用。`));
   const warning = [];
-  if (pending) warning.push(`本次有 ${fmt(pending)} 个文件的方向调整结果尚未人工核对。可以按当前角度继续合并；请在交付前检查成品内容与方向，最终由您自行确认。`);
-  const autoErrors = files.filter(f => f.orientation_error).length;
-  if (autoErrors) warning.push(`${fmt(autoErrors)} 张图片自动识别失败，将使用当前原向或人工角度。`);
+  if (pending) warning.push(`本次有 ${fmt(pending)} 张图片的方向被自动调整。可以继续合并；请在交付前检查成品内容与方向。`);
+  const autoErrors = files.filter(f => f.orientation_error && !f.manual_rotation).length;
+  if (autoErrors) summary.append(el('p','help',`${fmt(autoErrors)} 张图片方向识别未完成，将使用当前方向。`));
+  const signed = files.filter(file => file.pdf_has_signature).length;
+  if (signed) warning.push(`${fmt(signed)} 份来源 PDF 含签名，本次仅合并静态页面，不保留签名验证。原文件保持不变。`);
   const renamedFallbacks = groups.filter(g => ['unmatched','conflict','empty'].includes(g.rename?.status)).length;
   if (renamedFallbacks) warning.push(`${fmt(renamedFallbacks)} 个单元使用文件夹名回退命名，详情见下方交付名称与左栏提示。`);
   $('merge-warning').hidden = !warning.length; $('merge-warning').textContent = warning.join(' ');
@@ -686,19 +969,69 @@ async function startMerge() {
     $('merge-dialog').close(); S.mergeRetry = null; trackJob(job); toast(`合并已开始 · ${job.threads || threads} 线程`);
   });
 }
+function pendingOutputConflict(job = S.job) {
+  return active(job) && job.kind === 'batch_generate' && S.cancelRequestedJobId !== job.id ? job.output_conflict || null : null;
+}
+function conflictIdentity(job = S.job) {
+  const conflict = pendingOutputConflict(job); return conflict ? `${job.id}:${conflict.id}` : null;
+}
+function clearOutputConflict() {
+  S.conflictKey = null; S.conflictBusy = false; S.conflictRequest++;
+  $('output-conflict-apply').checked = false; $('output-conflict-error').hidden = true;
+  if ($('output-conflict-dialog').open) $('output-conflict-dialog').close();
+}
+function conflictButtons() {
+  const waiting = Boolean(S.conflictKey && S.conflictKey === conflictIdentity());
+  const cancelling = S.cancelInFlightId === S.job?.id || S.cancelRequestedJobId === S.job?.id;
+  for (const id of ['output-conflict-skip','output-conflict-overwrite','output-conflict-apply']) $(id).disabled = !waiting || S.conflictBusy || cancelling;
+  $('output-conflict-cancel').disabled = !active(S.job) || cancelling;
+  $('output-conflict-cancel').textContent = cancelling ? '正在取消…' : '取消任务';
+}
+function renderOutputConflict() {
+  const conflict = pendingOutputConflict(); const key = conflictIdentity();
+  if (!conflict || !key) { clearOutputConflict(); return; }
+  if (S.conflictKey !== key) {
+    S.conflictKey = key; S.conflictBusy = false; S.conflictRequest++;
+    $('output-conflict-apply').checked = false; $('output-conflict-error').hidden = true;
+    $('output-conflict-hint').textContent = '请明确选择跳过、覆盖或取消任务；已完成的其他 PDF 会保留。';
+  }
+  $('output-conflict-name').textContent = basename(conflict.output_path) || conflict.group_name;
+  $('output-conflict-path').textContent = prettyPath(conflict.output_path);
+  $('output-conflict-reason').textContent = conflict.reason;
+  conflictButtons();
+  if (!$('output-conflict-dialog').open) $('output-conflict-dialog').showModal();
+}
+async function resolveOutputConflict(action) {
+  const job = S.job; const conflict = pendingOutputConflict(job); const key = conflictIdentity(job);
+  if (!conflict || !key || S.conflictKey !== key || S.conflictBusy || S.cancelInFlightId === job.id || !['skip','overwrite'].includes(action)) return;
+  S.conflictBusy = true; const request = ++S.conflictRequest;
+  const apply = $('output-conflict-apply').checked; $('output-conflict-error').hidden = true; conflictButtons();
+  try {
+    const updated = await api(`/batch/jobs/${job.id}/output-conflict`,{method:'POST',body:{conflict_id:conflict.id,action,apply_to_batch:apply}});
+    if (S.job?.id !== job.id || S.conflictKey !== key || S.conflictRequest !== request) return;
+    trackJob(updated);
+  } catch (error) {
+    if (S.job?.id === job.id && S.conflictKey === key && S.conflictRequest === request) {
+      $('output-conflict-error').textContent = `${error.message}。可重试当前选择，或取消任务。`; $('output-conflict-error').hidden = false;
+    }
+  } finally {
+    if (S.conflictKey === key && S.conflictRequest === request) { S.conflictBusy = false; conflictButtons(); }
+  }
+}
 function trackJob(job) {
-  clearTimeout(S.polling); S.job = job; S.pollCount = 0;
+  if (S.job?.id !== job.id) { S.cancelInFlightId = null; S.cancelRequestedJobId = null; }
+  S.pollEpoch++; clearTimeout(S.polling); S.job = job; S.pollCount = 0;
   S.jobs = [job,...S.jobs.filter(j => j.id !== job.id)]; renderJob(); controls();
   if (active(job)) S.polling = setTimeout(pollJob,700);
 }
 async function pollJob() {
   if (!S.job) return;
-  const id = S.job.id;
+  const id = S.job.id; const epoch = S.pollEpoch; S.polling = null;
   try {
-    const job = await api(`/jobs/${id}`); if (S.job?.id !== id) return;
+    const job = await api(`/jobs/${id}`); if (S.job?.id !== id || S.pollEpoch !== epoch) return;
     S.job = job; S.pollCount++; S.jobs = [job,...S.jobs.filter(j => j.id !== id)];
     if (batchJob(job) && S.plan?.id === job.plan_id && (job.kind === 'batch_analyze' || !active(job))) {
-      const plan = await api(`/batch/plans/${job.plan_id}`); acceptPlan(plan,{preserveSelection:true});
+      const plan = await api(`/batch/plans/${job.plan_id}`); if (S.job?.id !== id || S.pollEpoch !== epoch) return; acceptPlan(plan,{preserveSelection:true});
     }
     renderJob(); controls();
     if (!active(job)) {
@@ -706,33 +1039,47 @@ async function pollJob() {
       toast(job.kind === 'batch_analyze' ? '方向调整已结束，可核对修正，也可按当前结果合并。' : labels[job.status] || '处理已结束');
       return;
     }
-  } catch (error) { showError(error); }
+  } catch (error) { if (S.job?.id !== id || S.pollEpoch !== epoch) return; showError(error); }
   S.polling = setTimeout(pollJob,1200);
 }
 function renderJob() {
   const job = S.job; if (!job) return;
-  $('job-panel').hidden = false; const analysis = job.kind === 'batch_analyze';
+  $('job-panel').hidden = false; const analysis = ['batch_analyze','analyze'].includes(job.kind);
   $('job-title').textContent = analysis ? '图片方向调整' : '批量合并进度';
   $('job-status').textContent = labels[job.status] || job.status;
-  $('job-status').className = `pill${job.status === 'failed' ? ' error' : ['completed_with_errors','cancelled','interrupted'].includes(job.status) ? ' warning' : ''}`;
+  $('job-status').className = `pill${analysis ? '' : job.status === 'failed' ? ' error' : ['completed_with_errors','cancelled','interrupted'].includes(job.status) ? ' warning' : ''}`;
   $('job-threads').textContent = `${job.threads || 4} 线程`;
   $('job-current').textContent = job.current || labels[job.status] || '准备中';
   $('job-progress-text').textContent = `${fmt(job.done)} / ${fmt(job.total)}${analysis ? ' 张' : ' 页'}`;
   $('job-progress').style.width = `${job.total ? Math.min(100,Number(job.done) / Number(job.total) * 100) : 0}%`;
-  $('cancel-job').hidden = !active(job); $('retry-job').hidden = active(job) || job.status === 'completed' || !batchJob(job);
-  $('save-report').hidden = active(job); $('job-error').hidden = !job.error; $('job-error').textContent = job.error || '';
+  $('cancel-job').hidden = !active(job); $('cancel-job').disabled = S.cancelInFlightId === job.id || S.cancelRequestedJobId === job.id; $('retry-job').hidden = active(job) || job.status === 'completed' || !batchJob(job);
+  $('save-report').hidden = active(job); $('job-error').hidden = !job.error; $('job-error').className = analysis ? 'notice neutral' : 'notice error'; $('job-error').textContent = job.error || '';
   const box = $('job-results'); box.replaceChildren();
-  for (const result of job.results || []) {
+  const successes = (job.results || []).filter(successfulOutput); const skippedExisting = (job.results || []).filter(result => result.status === 'skipped_existing').length;
+  $('job-result-summary').textContent = analysis ? orientationSummaryText(job) : `已生成 ${fmt(successes.length)} 份 · 成功 ${fmt(successes.reduce((n,result) => n + Number(result.pages || 0),0))} 页 · 跳过同名 ${fmt(skippedExisting)} 份 · 失败 ${fmt((job.results || []).filter(result => result.status === 'failed').length)} 份`;
+  const details = analysis ? (job.results || []).filter(result => rotationChange(result.rotation_change)) : job.results || [];
+  for (const result of details) {
+    if (analysis) {
+      const change = rotationChange(result.rotation_change); const row = el('div','result-row orientation-result');
+      row.append(el('span','',result.folder),el('span','',`${change.from_cw}° → ${change.to_cw}°`),el('span','','已调整')); box.append(row); continue;
+    }
     const resultLabel = analysis && result.status === 'skipped' ? '保留人工角度或核对结果' : labels[result.status] || result.status;
     const row = el('div','result-row'); row.append(el('span','',result.folder),el('span','',analysis ? '' : `${fmt(result.pages)} 页`),el('span',result.status === 'failed' ? 'error-text' : '',resultLabel));
-    if (result.output_path && result.status !== 'failed') {
+    if (successfulOutput(result)) {
       const save = el('button','text-button','保存 PDF'); save.type = 'button'; save.addEventListener('click',action(() => saveOutput(job,result))); row.append(save);
     } else row.append(el('span'));
     if (result.error) row.append(el('div','result-error',result.error));
-    else if (result.needs_review) row.append(el('div','result-error warning-text','包含尚未人工核对的方向结果，请检查成品。'));
+    else if (result.needs_review) row.append(el('div','result-error warning-text','请检查成品内容与方向。'));
     box.append(row);
   }
-  $('open-output').hidden = analysis || !(job.results || []).some(r => r.output_path && r.status !== 'failed');
+  if (analysis && !details.length) box.append(el('p','help',job.orientation_summary ? '本次暂无实际调整的文件。' : '历史记录未保存明确的角度变化明细。'));
+  $('open-output').hidden = analysis || !successes.length;
+  renderOutputConflict();
+}
+function orientationSummaryText(job) {
+  const summary = job.orientation_summary;
+  const processed = `已处理 ${fmt(job.done)} / ${fmt(job.total)} 张`;
+  return summary ? `${processed} · 调整 ${fmt(summary.changed)} · 未变 ${fmt(summary.unchanged)} · 跳过 ${fmt(summary.skipped)} · 失败 ${fmt(summary.failed)}` : `${processed} · 历史记录未保存分类汇总，仅显示明确的角度变化。`;
 }
 async function retryJob() {
   const job = S.job; if (!job || busy() || !batchJob(job) || hasDrafts() || S.sourceDirty) return;
@@ -742,10 +1089,20 @@ async function retryJob() {
   if (job.kind === 'batch_analyze') openOrientation(job); else openMerge(job);
 }
 async function cancelJob() {
-  if (!S.job || !active(S.job)) return;
-  $('cancel-job').disabled = true;
-  try { const job = await api(`/jobs/${S.job.id}/cancel`,{method:'POST'}); trackJob(job); toast('已请求取消，等待当前工作安全收尾。'); }
-  finally { $('cancel-job').disabled = false; }
+  const id = S.job?.id; if (!id || !active(S.job) || S.cancelInFlightId === id || S.cancelRequestedJobId === id) return;
+  S.cancelInFlightId = id; S.conflictRequest++; conflictButtons(); $('cancel-job').disabled = true;
+  try {
+    const job = await api(`/jobs/${id}/cancel`,{method:'POST'}); if (S.job?.id !== id) return;
+    S.cancelRequestedJobId = id; trackJob(job); toast('已请求取消，等待当前工作安全收尾；已完成的成品保留。');
+  } catch (error) {
+    if (S.job?.id !== id) return;
+    if (S.conflictKey) { $('output-conflict-error').textContent = `取消任务失败：${error.message}。可重试取消。`; $('output-conflict-error').hidden = false; }
+    else showError(error);
+    S.conflictBusy = false;
+  } finally {
+    if (S.cancelInFlightId === id) S.cancelInFlightId = null;
+    if (S.job?.id === id) renderJob();
+  }
 }
 async function downloadBlob(path,name) {
   const blob = await api(path,{blob:true}); const url = URL.createObjectURL(blob);
@@ -767,7 +1124,7 @@ async function saveOutput(job,result) {
 async function refreshHistory(render = true) {
   if (S.historyLoading) return; S.historyLoading = true;
   try {
-    const [plans,jobs] = await Promise.all([api('/batch/plans'),api('/jobs')]);
+    const [plans,jobs] = await Promise.all([api('/batch/plans?summary=true'),api('/jobs')]);
     S.plans = plans; S.jobs = jobs; $('history-count').textContent = fmt(historyFamilies(plans).length);
     if (render) renderHistory(); controls();
   } finally { S.historyLoading = false; }
@@ -785,20 +1142,23 @@ function historyFamilies(plans) {
   }
   return [...families.values()].sort((a,b) => b.latest.created_at.localeCompare(a.latest.created_at));
 }
-async function loadPlan(planId, job = null) {
+async function loadPlan(planId,job = null) {
   if (busy() && (!job || S.job?.id !== job.id)) throw new Error('当前任务仍在运行，请等待完成或取消后再切换资料。');
-  if (hasDrafts() || S.sourceDirty) throw new Error('当前有未保存的调整或资料设置。请保存调整，或重新扫描后再切换记录。');
-  const plan = await api(`/batch/plans/${planId}`);
-  if (!S.initialization || !samePath(S.initialization.root,plan.root)) {
-    try { S.initialization = await api('/batch/initialize',{method:'POST',body:{root:plan.root}}); renderLevels(plan.level); }
-    catch (_) { S.initialization = null; }
+  if (hasDrafts() && !S.sourceDirty) await saveEdits();
+  clearTimeout(S.editTimer); clearTimeout(S.previewTimer);
+  const plan = await api(`/batch/plans/${planId}`); S.scan = null; S.events = []; S.renamePreview = null; S.renameOverrides.clear();
+  if (!S.initialization || !samePath(S.initialization.root,plan.root) || Number(S.initialization.level) !== plan.level) {
+    try { S.initialization = await api('/batch/initialize',{method:'POST',body:{root:plan.root,level:plan.level,exclude_rules:plan.exclude_rules}}); renderLevels(plan.level); renderDirectoryPreview(); }
+    catch (_) { S.initialization = null; $('directory-preview').hidden = true; }
   }
-  acceptPlan(plan,{syncForm:true,collapse:true,preserveSelection:false}); setView('batch');
+  acceptPlan(plan,{syncForm:true,collapse:true,preserveSelection:false}); setView('batch'); $('scan-progress-panel').hidden = true;
   if (job) {
     const loaded = await api(`/jobs/${job.id}`); const ids = loaded.request?.voucher_ids;
     if (ids) { S.selected = new Set(ids); renderGroups(); }
-    trackJob(loaded);
-  } else { clearTimeout(S.polling); S.job = null; $('job-panel').hidden = true; controls(); }
+    if (scanJob(loaded)) { S.scan = await api(`/batch/scans/${loaded.id}`); S.job = null; $('job-panel').hidden = true; renderLogs(); }
+    else trackJob(loaded);
+  } else { clearTimeout(S.polling); S.job = null; $('job-panel').hidden = true; }
+  controls();
 }
 function renderHistory() {
   const box = $('history-list'); box.replaceChildren(); const families = historyFamilies(S.plans);
@@ -807,14 +1167,14 @@ function renderHistory() {
     const plan = family.latest; const card = el('article','card history-card'); const info = el('div');
     info.append(el('h2','',basename(plan.root)),el('p','',prettyPath(plan.root)));
     const meta = el('div','history-meta');
-    meta.append(el('span','',`${fmt(plan.groups.length)} 个合并单元`),el('span','',`${fmt(plan.groups.reduce((n,g) => n + Number(g.pages || 0),0))} 页`),el('span','',plan.level ? `第 ${plan.level} 级分组` : '当前文件夹'),el('span','',plan.index ? '使用重命名索引' : '按文件夹名命名'));
+    meta.append(el('span','',`${fmt(plan.group_count ?? plan.groups?.length)} 个合并文件夹`),el('span','',`${fmt(plan.pages ?? plan.groups?.reduce((n,g) => n + Number(g.pages || 0),0))} 页`),el('span','',plan.level ? `第 ${plan.level} 级分组` : '当前文件夹'),el('span','',plan.index ? '使用重命名索引' : '按文件夹名命名'));
     info.append(meta,el('small','',shortTime(plan.created_at)));
     const jobs = S.jobs.filter(job => batchJob(job) && family.ids.has(job.plan_id));
     if (jobs.length) {
       const taskBox = el('div','history-tasks');
       for (const job of jobs.slice(0,12)) {
         const row = el('div','history-task'); const content = el('div');
-        content.append(el('span','',job.kind === 'batch_analyze' ? '图片方向调整' : '批量合并'),el('span',`pill${['failed','completed_with_errors'].includes(job.status) ? ' warning' : ''}`,labels[job.status] || job.status),el('small','',`${shortTime(job.created_at)} · ${job.threads || 4} 线程`));
+        content.append(el('span','',jobKindLabel(job)),el('span',`pill${['failed','completed_with_errors'].includes(job.status) ? ' warning' : ''}`,labels[job.status] || job.status),el('small','',`${shortTime(job.created_at)} · ${job.threads || 4} 线程`));
         const open = el('button','text-button','查看任务'); open.type = 'button'; open.addEventListener('click',action(() => loadPlan(job.plan_id,job)));
         row.append(content,open); taskBox.append(row);
       }
@@ -838,11 +1198,15 @@ function renderHistory() {
   }
 }
 async function syncGlobal() {
-  if (S.syncing || S.operations || active(S.job)) return; S.syncing = true;
+  if (S.syncing || S.operations || active(S.scan) || active(S.job)) return; S.syncing = true;
   try {
-    const [status,jobs] = await Promise.all([api('/status'),api('/jobs')]); S.status = status; S.jobs = jobs;
+    S.status = await api('/status');
+    const runningJobs = S.status.running_jobs;
+    const jobs = Array.isArray(runningJobs) ? [...runningJobs,...S.jobs.filter(job => !active(job) && !runningJobs.some(running => running.id === job.id))] : await api('/jobs');
+    S.jobs = jobs;
     const running = jobs.find(job => active(job) && batchJob(job));
-    if (running && !active(S.job)) {
+    if (scanJob(running)) await followScan(await api(`/batch/scans/${running.id}`),{syncForm:true});
+    else if (running && !active(S.job)) {
       trackJob(running);
       if (!S.plan) acceptPlan(await api(`/batch/plans/${running.plan_id}`),{syncForm:true,collapse:true,preserveSelection:false});
     }
@@ -879,12 +1243,12 @@ async function choosePath(kind, target) {
   if (invoke) {
     const value = await invoke(kind === 'index' ? 'select_index_file' : 'select_folder',{initialPath:initial});
     if (!value) return; $(target).value = prettyPath(value);
-    if (target === 'root-path') { changedSource(); await initializeFolder(); }
+    if (target === 'root-path') { S.renameOverrides.clear(); changedSource(); await refreshPreparation(); }
     else if (target === 'index-path') { changedSource(); await inspectIndex(); }
     else updateOutputDraft();
     return;
   }
-  S.browser = {kind,target,path:'',parent:null,selected:null}; $('folder-browser-title').textContent = kind === 'index' ? '选择重命名索引文件' : target === 'output-path' ? '选择输出文件夹' : '选择待处理文件夹';
+  S.browser = {kind,target,path:'',parent:null,selected:null}; $('folder-browser-title').textContent = kind === 'index' ? '选择重命名索引文件' : target === 'output-path' ? '选择输出文件夹' : '选择目标文件夹';
   $('confirm-folder').textContent = kind === 'index' ? '选择此索引文件' : '选择此文件夹'; $('folder-browser').showModal();
   let directory = initial;
   if (kind === 'index' && directory && /\.xlsx?$/i.test(directory)) directory = directory.replace(/[\\/][^\\/]+$/, '');
@@ -893,7 +1257,7 @@ async function choosePath(kind, target) {
 async function confirmBrowserSelection() {
   const value = S.browser.kind === 'index' ? S.browser.selected : S.browser.path; if (!value) return;
   const target = S.browser.target; $(target).value = prettyPath(value); $('folder-browser').close();
-  if (target === 'root-path') { changedSource(); await initializeFolder(); }
+  if (target === 'root-path') { S.renameOverrides.clear(); changedSource(); await refreshPreparation(); }
   else if (target === 'index-path') { changedSource(); await inspectIndex(); }
   else updateOutputDraft();
 }
@@ -919,7 +1283,8 @@ async function initialize() {
     catch (error) { showError(new Error(`无法读取线程偏好，当前使用默认 4 线程。${error.message}`)); }
     await refreshHistory(false);
     const running = S.jobs.find(job => active(job) && batchJob(job));
-    if (running) { acceptPlan(await api(`/batch/plans/${running.plan_id}`),{syncForm:true,collapse:true,preserveSelection:false}); trackJob(running); }
+    if (scanJob(running)) await followScan(await api(`/batch/scans/${running.id}`),{syncForm:true});
+    else if (running) { acceptPlan(await api(`/batch/plans/${running.plan_id}`),{syncForm:true,collapse:true,preserveSelection:false}); trackJob(running); }
     setInterval(syncGlobal,4000); controls();
   } catch (error) { $('connection').classList.add('offline'); $('connection').replaceChildren(el('i'),el('span','','连接失败')); showError(error); }
 }
@@ -929,22 +1294,36 @@ $('tab-history').addEventListener('click',() => setView('history'));
 document.querySelector('.brand').addEventListener('click',event => { event.preventDefault(); setView('batch'); });
 $('toggle-preparation').addEventListener('click',() => setPreparationCollapsed(!S.preparationCollapsed));
 $('source-form').addEventListener('submit',action(async event => { event.preventDefault(); await scan(); }));
-for (const id of ['root-path','index-path','merge-level','index-column','name-column','header-row','match-rule','naming-mode','duplicate-mode','exclude-rules']) $(id).addEventListener('input',changedSource);
-$('initialize-folder').addEventListener('click',action(initializeFolder));
-$('merge-level').addEventListener('change',() => { renderLevelHint(); changedSource(); });
+$('root-path').addEventListener('input',changedSource);
+$('root-path').addEventListener('change',action(async () => { S.renameOverrides.clear(); changedSource(); if ($('root-path').value.trim()) await refreshPreparation({level:0}); }));
 $('choose-root').addEventListener('click',action(() => choosePath('folder','root-path')));
+$('merge-level').addEventListener('change',action(async () => { S.renameOverrides.clear(); changedSource(); await refreshPreparation({level:Number($('merge-level').value)}); }));
+$('exclude-rules').addEventListener('input',changedSource);
+$('exclude-rules').addEventListener('change',action(async () => { if ($('root-path').value.trim()) await refreshPreparation({level:Number($('merge-level').value)}); }));
+$('reset-rules').addEventListener('click',action(async () => { $('exclude-rules').value = DEFAULT_RULES; changedSource(); if ($('root-path').value.trim()) await refreshPreparation({level:Number($('merge-level').value)}); }));
+$('rename-enabled').addEventListener('change',action(async () => { S.renameOverrides.clear(); changedSource(); if ($('rename-enabled').checked && $('index-path').value.trim()) await inspectIndex(); else { S.renamePreview = null; renderNamingPreview(); } }));
+$('index-path').addEventListener('input',changedSource);
+$('index-path').addEventListener('change',action(async () => { changedSource(); await inspectIndex(); }));
 $('choose-index').addEventListener('click',action(() => choosePath('index','index-path')));
-$('inspect-index').addEventListener('click',action(() => inspectIndex()));
 $('index-sheet').addEventListener('change',action(() => inspectIndex({sheet:$('index-sheet').value})));
-$('reload-columns').addEventListener('click',action(() => inspectIndex({sheet:$('index-sheet').value,headerRow:Number($('header-row').value)})));
-$('reset-rules').addEventListener('click',() => { $('exclude-rules').value = DEFAULT_RULES; changedSource(); });
-$('show-issues').addEventListener('click',() => { $('scan-details').open = !$('scan-details').open; });
+$('header-row').addEventListener('change',action(() => inspectIndex({sheet:$('index-sheet').value,headerRow:Number($('header-row').value)})));
+for (const id of ['index-column','name-column','match-rule','naming-mode']) $(id).addEventListener('change',scheduleNamingPreview);
+$('refresh-names').addEventListener('click',action(async () => { if (!S.indexInspection?.columns?.length) await inspectIndex({sheet:$('index-sheet').value,headerRow:Number($('header-row').value) || 1}); else await refreshNamingPreview(); }));
+$('show-issues').addEventListener('click',() => { $('scan-details').open = !$('scan-details').open; if ($('scan-details').open) $('scan-details').scrollIntoView({block:'nearest',behavior:'smooth'}); });
+for (const level of ['all','warning','error','info']) $(`log-filter-${level}`).addEventListener('click',() => { S.logFilter = level; renderLogs(); });
+$('cancel-scan').addEventListener('click',action(cancelScan));
 $('group-search').addEventListener('input',() => renderGroups());
 $('select-all-groups').addEventListener('change',() => {
   S.selected = new Set($('select-all-groups').checked ? S.plan.groups.filter(group => !group.empty && group.files.length).map(group => group.id) : []); renderGroups(); controls();
 });
 $('deselect-errors').addEventListener('click',() => { S.selected = new Set(selectedGroups().filter(group => !hasErrors(group)).map(group => group.id)); renderGroups(); controls(); });
 $('save-edits').addEventListener('click',action(saveEdits));
+document.addEventListener('pointermove',moveSortPointer,true);
+document.addEventListener('pointerup',finishSortPointer,true);
+for (const type of ['pointercancel','lostpointercapture']) document.addEventListener(type,cancelSortPointer,true);
+document.addEventListener('keydown',event => { if (event.key === 'Escape') clearDragState(); },true);
+document.addEventListener('visibilitychange',() => { if (document.hidden) clearDragState(); });
+window.addEventListener('blur',clearDragState);
 $('file-sort').addEventListener('change',renderSortHint);
 $('apply-sort').addEventListener('click',action(applySort));
 $('rotation-scope').addEventListener('change',renderPreviewMeta);
@@ -958,7 +1337,6 @@ $('rotate-left').addEventListener('click',action(() => rotateFile(270)));
 $('rotate-right').addEventListener('click',action(() => rotateFile(90)));
 $('rotate-half').addEventListener('click',action(() => rotateFile(180)));
 $('reset-rotation').addEventListener('click',action(() => rotateFile(0,true)));
-$('reviewed-file').addEventListener('change',action(markReviewed));
 $('auto-orient').addEventListener('click',action(() => openOrientation()));
 $('orientation-consent').addEventListener('change',controls);
 $('start-orientation').addEventListener('click',action(startOrientation));
@@ -968,6 +1346,11 @@ $('merge-button').addEventListener('click',action(() => openMerge()));
 $('start-merge').addEventListener('click',action(startMerge));
 $('close-merge').addEventListener('click',() => $('merge-dialog').close());
 $('merge-dialog').addEventListener('close',() => { S.mergeRetry = null; controls(); });
+$('output-conflict-skip').addEventListener('click',action(() => resolveOutputConflict('skip')));
+$('output-conflict-overwrite').addEventListener('click',action(() => resolveOutputConflict('overwrite')));
+$('output-conflict-cancel').addEventListener('click',action(cancelJob));
+$('output-conflict-dialog').addEventListener('cancel',event => { event.preventDefault(); $('output-conflict-hint').textContent = '此任务仍在等待选择。请点击跳过、覆盖或取消任务；Esc 不会关闭此提示。'; });
+$('output-conflict-dialog').addEventListener('close',() => { if (S.conflictKey && S.conflictKey === conflictIdentity()) renderOutputConflict(); });
 $('output-path').addEventListener('input',updateOutputDraft);
 $('choose-output').addEventListener('click',action(() => choosePath('folder','output-path')));
 $('check-output').addEventListener('click',action(checkOutput));
@@ -982,5 +1365,5 @@ $('folder-path-form').addEventListener('submit',event => { event.preventDefault(
 $('confirm-folder').addEventListener('click',action(confirmBrowserSelection));
 let resizeTimer;
 new ResizeObserver(() => { if (S.fit && (S.image || S.pdf)) { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => drawPreview().catch(showError),100); } }).observe($('preview-surface'));
-window.addEventListener('beforeunload',() => { clearTimeout(S.polling); clearPreview(); });
+window.addEventListener('beforeunload',() => { clearTimeout(S.polling); clearDragState(); clearPreview(); });
 initialize();

@@ -36,6 +36,20 @@ jobs:
           rustup toolchain install $settings.rust_toolchain --profile minimal --component rustfmt --component clippy --target $settings.target
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
 
+      - name: Restore public dependency and compilation cache
+        id: build-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/target/windows-dist
+            app/desktop/target/windows-dist
+            ${{ runner.temp }}/pdf-dependency-cache
+          key: pdf-windows-msvc-static-v1-${{ hashFiles('app/Cargo.lock', 'app/desktop/Cargo.lock', 'app/distribution/windows-dependencies.json') }}-${{ github.run_id }}
+          restore-keys: |
+            pdf-windows-msvc-static-v1-${{ hashFiles('app/Cargo.lock', 'app/desktop/Cargo.lock', 'app/distribution/windows-dependencies.json') }}-
+
       - name: Test Rust core and Tauri desktop; optionally assemble release attachments
         env:
           PACKAGE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' }}
@@ -71,8 +85,21 @@ jobs:
           path: |
             dist/desktop-verification/desktop-smoke-report.json
             dist/desktop-verification/desktop-window.png
+            dist/desktop-verification/desktop-output-conflict.png
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save public build cache after success or failure
+        if: always() && steps.build-cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/target/windows-dist
+            app/desktop/target/windows-dist
+            ${{ runner.temp }}/pdf-dependency-cache
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
       - name: Upload verified test package
         if: success() && github.event_name == 'workflow_dispatch'

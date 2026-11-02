@@ -110,6 +110,8 @@ try {
     Invoke-DesktopCargo -Arguments @('test','--manifest-path',$manifest,'--locked','--all-targets','--target',$target,'--target-dir',$targetDirectory)
     & node --check (Join-Path $app 'web/workbench.js')
     if ($LASTEXITCODE -ne 0) { throw 'Desktop frontend syntax check failed.' }
+    & node (Join-Path $PSScriptRoot 'test-workbench-ui.cjs')
+    if ($LASTEXITCODE -ne 0) { throw 'Synthetic desktop UI contract tests failed.' }
     if ($CheckOnly) { Write-Host 'Core and desktop Windows checks passed.'; return }
     $metadataText = & cargo "+$toolchain" metadata --manifest-path $manifest --locked --format-version 1 --filter-platform $target
     if ($LASTEXITCODE -ne 0) { throw 'Desktop cargo metadata failed.' }

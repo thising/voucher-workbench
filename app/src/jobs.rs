@@ -51,6 +51,8 @@ pub struct JobResult {
     pub pages: u32,
     pub error: Option<String>,
     pub needs_review: bool,
+    #[serde(default)]
+    pub rotation_change: Option<batch::RotationChange>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
@@ -68,6 +70,10 @@ pub struct Job {
     pub request: GenerateRequest,
     #[serde(default = "default_threads")]
     pub threads: usize,
+    #[serde(default)]
+    pub output_conflict: Option<batch::OutputConflict>,
+    #[serde(default)]
+    pub orientation_summary: Option<batch::AnalysisSummary>,
 }
 impl Job {
     pub fn active(&self) -> bool {
@@ -89,6 +95,8 @@ pub struct AppState {
     pub engine: Mutex<Option<Engine>>,
     pub model_error: Option<String>,
     pub shutting_down: AtomicBool,
+    pub(crate) scan_progress: Mutex<HashMap<String, batch::ScanProgress>>,
+    pub(crate) output_conflicts: Mutex<HashMap<String, Arc<batch::ConflictCoordinator>>>,
     pub(crate) model_path: PathBuf,
     pub(crate) runtime_path: Option<PathBuf>,
 }
@@ -162,8 +170,9 @@ impl AppState {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let plan: batch::Plan = serde_json::from_slice(&fs::read(&path)?)
+            let mut plan: batch::Plan = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("批量计划文件损坏：{}", path.display()))?;
+            batch::normalize_review_counts(&mut plan);
             data.batch_plans.insert(plan.id.clone(), plan);
         }
         for entry in fs::read_dir(dir.join("jobs"))? {
@@ -174,6 +183,7 @@ impl AppState {
             let mut j: Job = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("任务文件损坏：{}", path.display()))?;
             ProcessingSettings { threads: j.threads }.validate()?;
+            let had_conflict = j.output_conflict.take().is_some();
             if j.active() {
                 if j.kind == "analyze" {
                     if let Some(plan) = data.plans.get_mut(&j.plan_id) {
@@ -198,6 +208,9 @@ impl AppState {
                 j.updated_at = now();
                 pdf::atomic_json(&path, &j)?;
             }
+            if had_conflict && !j.active() {
+                pdf::atomic_json(&path, &j)?;
+            }
             data.jobs.insert(j.id.clone(), j);
         }
         let (engine, error) = match Engine::new(model, runtime) {
@@ -215,6 +228,8 @@ impl AppState {
             engine: Mutex::new(engine),
             model_error: error,
             shutting_down: AtomicBool::new(false),
+            scan_progress: Mutex::new(HashMap::new()),
+            output_conflicts: Mutex::new(HashMap::new()),
             model_path: model.to_owned(),
             runtime_path: runtime.map(Path::to_owned),
         }))
@@ -235,7 +250,7 @@ impl AppState {
     pub fn save_plan(&self, p: &Plan) -> Result<()> {
         pdf::atomic_json(&self.dir.join("plans").join(format!("{}.json", p.id)), p)
     }
-    fn save_job(&self, j: &Job) -> Result<()> {
+    pub(crate) fn save_job(&self, j: &Job) -> Result<()> {
         pdf::atomic_json(&self.dir.join("jobs").join(format!("{}.json", j.id)), j)
     }
     pub fn insert_plan(&self, p: Plan) -> Result<Plan> {
@@ -577,6 +592,8 @@ impl AppState {
             results: vec![],
             request,
             threads,
+            output_conflict: None,
+            orientation_summary: (kind == "batch_analyze").then(batch::AnalysisSummary::default),
         };
         if kind == "analyze" {
             let mut updated = data.plans.get(plan_id).context("计划不存在")?.clone();
@@ -589,8 +606,11 @@ impl AppState {
         data.cancels.insert(j.id.clone(), cancel.clone());
         data.jobs.insert(j.id.clone(), j.clone());
         drop(data);
+        self.launch_job(j.clone(), cancel);
+        Ok(j)
+    }
+    pub(crate) fn launch_job(self: &Arc<Self>, task: Job, cancel: Arc<AtomicBool>) {
         let state = self.clone();
-        let task = j.clone();
         std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 state.execute(&task, &cancel)
@@ -601,7 +621,10 @@ impl AppState {
                 Err(_) => Some("任务内部异常；源文件未改动，可检查后重试".into()),
             };
             let _ = state.update_job(&task.id, |j| {
-                let unit = if task.kind == "batch_analyze" {
+                j.output_conflict = None;
+                let unit = if task.kind == "batch_scan" {
+                    "来源文件"
+                } else if task.kind == "batch_analyze" {
                     "文件"
                 } else if task.kind == "batch_generate" {
                     "合并单元"
@@ -612,7 +635,11 @@ impl AppState {
                 };
                 if cancel.load(Ordering::Relaxed) {
                     j.status = "cancelled".into();
-                    j.current = format!("已取消，完成的{unit}保留，可重试继续");
+                    j.current = if task.kind == "batch_scan" {
+                        "已取消扫描，原有计划保留；可重新扫描".into()
+                    } else {
+                        format!("已取消，完成的{unit}保留，可重试继续")
+                    };
                 } else if let Some(err) = error {
                     j.status = "failed".into();
                     j.error = Some(err);
@@ -625,13 +652,13 @@ impl AppState {
                     j.current = "处理完成".into();
                 }
             });
+            batch::close_output_conflicts(&state, &task.id);
             state.data.lock().unwrap().cancels.remove(&task.id);
         });
-        Ok(j)
     }
     pub fn cancel(&self, id: &str) -> Result<Job> {
         let mut data = self.data.lock().unwrap();
-        let j = data.jobs.get(id).context("任务不存在")?.clone();
+        let mut j = data.jobs.get(id).context("任务不存在")?.clone();
         if j.active() {
             if j.kind == "analyze" {
                 let mut plan = data.plans.get(&j.plan_id).cloned().context("计划不存在")?;
@@ -643,12 +670,29 @@ impl AppState {
                 c.store(true, Ordering::Relaxed);
             }
         }
+        if j.output_conflict.take().is_some() {
+            if let Some(live) = data.jobs.get_mut(id) {
+                live.output_conflict = None;
+                self.save_job(live)?;
+            }
+        }
+        drop(data);
+        batch::close_output_conflicts(self, id);
         Ok(j)
     }
     pub fn retry(self: &Arc<Self>, id: &str) -> Result<Job> {
         let old = self.job(id)?;
         if old.active() {
             bail!("任务仍在运行");
+        }
+        if old.kind == "batch_scan" {
+            let request = serde_json::from_slice(&fs::read(
+                self.dir
+                    .join("reports")
+                    .join(&old.id)
+                    .join("scan-request.json"),
+            )?)?;
+            return batch::start_scan(self, request);
         }
         if old.kind == "batch_analyze" {
             let original = self.batch_plan(&old.plan_id)?;
@@ -882,6 +926,7 @@ impl AppState {
                                     pages: output.manifest.pages,
                                     error: None,
                                     needs_review: output.manifest.needs_review,
+                                    rotation_change: None,
                                 }
                             }
                             Err(error) => JobResult {
@@ -895,6 +940,7 @@ impl AppState {
                                     .files
                                     .iter()
                                     .any(|f| pdf::requires_manual_review(plan, f)),
+                                rotation_change: None,
                             },
                         };
                         let pages = voucher.files.iter().map(|f| f.pages).sum::<u32>();

@@ -47,6 +47,7 @@
 !/app/tools/fetch-title-models.sh
 !/app/tools/*.ps1
 !/app/tools/smoke-windows-desktop.mjs
+!/app/tools/test-workbench-ui.cjs
 !/app/distribution/**/*
 !/app/models/README.md
 !/app/models/title-ocr/manifest.json

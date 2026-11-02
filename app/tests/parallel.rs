@@ -263,6 +263,8 @@ fn synthetic_job(plan: &Plan, status: &str, threads: usize) -> Job {
         total: 1,
         done: 0,
         threads,
+        output_conflict: None,
+        orientation_summary: None,
         current: "synthetic job".into(),
         error: None,
         results: vec![],

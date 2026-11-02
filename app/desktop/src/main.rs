@@ -532,7 +532,9 @@ async fn launch_service(
         on_main(&app,move|app|{
             app.add_capability(json!({"identifier":"desktop-main-files","description":"仅当前PDF工作台窗口可以打开系统选择器及另存登记任务结果","windows":["main"],"local":false,"remote":{"urls":[format!("{origin}/*")]},"permissions":["allow-select-folder","allow-select-index-file","allow-save-job-report","allow-save-job-output","allow-request-close"]}).to_string())?;
             let navigation_origin=origin.clone();let loaded_state=window_state.clone();
-            let mut builder=WebviewWindowBuilder::new(&app,"main",tauri::WebviewUrl::External(url)).title("PDF工作台").inner_size(1420.0,900.0).min_inner_size(1000.0,640.0).center()
+            // The frontend owns file ordering and its pointer gestures. Keep
+            // native file-drop interception out of the list's event handling.
+            let mut builder=WebviewWindowBuilder::new(&app,"main",tauri::WebviewUrl::External(url)).disable_drag_drop_handler().title("PDF工作台").inner_size(1420.0,900.0).min_inner_size(1000.0,640.0).center()
                 .on_navigation(move|url|url.origin().ascii_serialization()==navigation_origin)
                 .on_new_window(|_,_|tauri::webview::NewWindowResponse::Deny)
                 .on_page_load(move|window,payload|{

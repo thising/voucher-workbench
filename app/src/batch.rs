@@ -1,9 +1,9 @@
 //! The product's general batch workflow. Source data is immutable; edits create
 //! new plans, and optional OCR/review never becomes an export permission gate.
+#[path = "batch_conflicts.rs"]
+mod conflicts;
 use crate::{
-    generic::{
-        absolute_checked, checked_metadata, glob_regex, inspect_pdf, natural_compare, output_name,
-    },
+    generic::{absolute_checked, checked_metadata, glob_regex, natural_compare, output_name},
     jobs::{self, AppState, GenerateRequest, Job, JobResult},
     model::Orientation,
     orientation::{self, Engine},
@@ -20,6 +20,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+pub(crate) use conflicts::close_output_conflicts;
+pub(crate) use conflicts::ConflictCoordinator;
+pub use conflicts::OutputConflict;
 use lopdf::{dictionary, Document, Object};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -33,7 +36,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::UNIX_EPOCH,
+    time::{Instant, UNIX_EPOCH},
 };
 
 pub const DISCLAIMER_VERSION: &str = "batch-orientation-disclaimer-v2";
@@ -101,7 +104,28 @@ pub struct ScanRequest {
     pub index: Option<rename_index::Config>,
     #[serde(default)]
     pub sort: Sort,
+    #[serde(default)]
+    pub output_names: Vec<OutputName>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputName {
+    pub relative_path: String,
+    pub output_name: String,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotationChange {
+    pub from_cw: u16,
+    pub to_cw: u16,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalysisSummary {
+    pub changed: u32,
+    pub unchanged: u32,
+    pub skipped: u32,
+    pub failed: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct File {
     pub id: String,
@@ -112,6 +136,8 @@ pub struct File {
     pub modified_ms: u64,
     pub sha256: String,
     pub pages: u32,
+    #[serde(default)]
+    pub pdf_has_signature: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub rotation_cw: u16,
@@ -121,6 +147,8 @@ pub struct File {
     pub manual_rotation: bool,
     pub orientation: Option<Orientation>,
     pub orientation_error: Option<String>,
+    #[serde(default)]
+    pub auto_rotation_change: Option<RotationChange>,
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -187,6 +215,10 @@ pub struct Plan {
     pub orientation_workflow: Workflow,
     #[serde(default)]
     pub omitted_sources: Vec<OmittedSource>,
+    #[serde(default)]
+    pub removed_sources: Vec<OmittedSource>,
+    #[serde(default)]
+    pub scan_metrics: Option<ScanMetrics>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Level {
@@ -203,6 +235,84 @@ pub struct Initialization {
     pub folder_count: usize,
     pub file_count: usize,
     pub issues: Vec<Issue>,
+    pub output_dir: String,
+    pub level: u16,
+    pub groups: Vec<PreviewGroup>,
+    pub summary: Summary,
+    pub exclusions: Vec<Exclusion>,
+    pub ignored_files: usize,
+    pub elapsed_ms: u64,
+    pub index: Option<rename_index::Snapshot>,
+    pub index_error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PreviewGroup {
+    pub relative_path: String,
+    pub path: String,
+    pub name: String,
+    pub shallow: bool,
+    pub candidate_count: usize,
+    pub image_count: usize,
+    pub pdf_count: usize,
+    pub bytes: u64,
+    pub output_name: String,
+    pub rename: Evidence,
+    pub issues: Vec<Issue>,
+    pub empty: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct Summary {
+    pub group_count: usize,
+    pub nonempty_groups: usize,
+    pub candidate_count: usize,
+    pub image_count: usize,
+    pub pdf_count: usize,
+    pub bytes: u64,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScanTimings {
+    pub metadata_ms: f64,
+    pub read_ms: f64,
+    pub hash_ms: f64,
+    pub pdf_ms: f64,
+    pub image_ms: f64,
+    pub index_ms: f64,
+    pub output_ms: f64,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScanCounts {
+    pub image_files: usize,
+    pub pdf_files: usize,
+    pub source_errors: usize,
+    pub bytes_read: u64,
+    pub hash_calls: usize,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScanMetrics {
+    pub elapsed_ms: u64,
+    pub timings: ScanTimings,
+    pub counts: ScanCounts,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanLog {
+    pub level: String,
+    pub code: String,
+    pub message: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanProgress {
+    pub id: String,
+    pub status: String,
+    pub plan_id: Option<String>,
+    pub phase: String,
+    pub done: u32,
+    pub total: u32,
+    pub elapsed_ms: u64,
+    pub current_file: Option<String>,
+    pub timings: ScanTimings,
+    pub counts: ScanCounts,
+    pub logs: Vec<ScanLog>,
+    pub error: Option<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -229,6 +339,10 @@ pub struct EditRequest {
     pub groups: Vec<GroupEdit>,
     #[serde(default)]
     pub files: Vec<FileEdit>,
+    #[serde(default)]
+    pub remove_file_ids: Vec<String>,
+    #[serde(default)]
+    pub restore_file_ids: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -322,25 +436,23 @@ fn sort_files(files: &mut [File], sort: &Sort) {
     });
 }
 pub fn needs_review(file: &File) -> bool {
-    if file.kind == "image" {
-        (file.manual_rotation || file.orientation.is_some() || file.orientation_error.is_some())
-            && !file.reviewed
-    } else {
-        file.reviewed_pages.iter().enumerate().any(|(i, r)| {
-            !r && (file.rotation_cw != 0 || file.page_rotations.get(i).copied().unwrap_or(0) != 0)
+    file.kind == "image"
+        && !file.manual_rotation
+        && file.auto_rotation_change.is_some_and(|change| {
+            change.from_cw != change.to_cw && file.rotation_cw == change.to_cw
         })
+}
+pub(crate) fn normalize_review_counts(plan: &mut Plan) {
+    // review_count is derived UI state, not evidence that old pictures changed.
+    // Reinterpret in memory only; historical JSON files are not rewritten.
+    for group in &mut plan.groups {
+        group.review_count = group.files.iter().filter(|file| needs_review(file)).count();
     }
 }
 fn unreviewed_pages(file: &File) -> usize {
-    if file.kind == "pdf" {
-        file.reviewed_pages
-            .iter()
-            .filter(|reviewed| !**reviewed)
-            .count()
-    } else {
-        usize::from(!file.reviewed)
-    }
+    usize::from(needs_review(file))
 }
+
 fn refresh_group(group: &mut Group) -> Result<()> {
     group.pages = group.files.iter().try_fold(0u32, |n, f| {
         n.checked_add(f.pages).context("分组页数超出支持范围")
@@ -349,7 +461,17 @@ fn refresh_group(group: &mut Group) -> Result<()> {
     group.review_count = group.files.iter().filter(|f| needs_review(f)).count();
     group.image_count = group.files.iter().filter(|f| f.kind == "image").count();
     group.pdf_count = group.files.len() - group.image_count;
-    group.issues.retain(|i| i.code != "source_error");
+    group
+        .issues
+        .retain(|i| !matches!(i.code.as_str(), "source_error" | "pdf_signature"));
+    let signed = group
+        .files
+        .iter()
+        .filter(|file| file.pdf_has_signature && file.error.is_none())
+        .count();
+    if signed > 0 {
+        group.issues.push(issue("warning","pdf_signature",format!("包含{signed}份带签名PDF；合并仅保留可用静态外观，不保留原数字签名验证。原件不会修改。"),Some(group.relative_path.clone())));
+    }
     group.issues.extend(group.files.iter().filter_map(|f| {
         f.error.as_ref().map(|e| {
             issue(
@@ -364,101 +486,17 @@ fn refresh_group(group: &mut Group) -> Result<()> {
 }
 
 pub fn initialize(root: &str, state_dir: Option<&Path>) -> Result<Initialization> {
-    if root.trim().is_empty() {
-        bail!("请选择待处理文件夹");
-    }
-    let root = absolute_checked(Path::new(root), true)?;
-    if root.file_name().is_none() {
-        bail!("不能选择磁盘根目录作为待处理文件夹");
-    }
-    if !checked_metadata(&root)?.is_dir() {
-        bail!("请选择待处理文件夹");
-    }
-    let state = state_dir.map(|p| absolute_checked(p, true)).transpose()?;
-    if state.as_ref().is_some_and(|s| root.starts_with(s)) {
-        bail!("处理记录目录不能作为待处理资料目录");
-    }
-    let mut stack = vec![(root.clone(), String::new(), 0u16)];
-    let mut dirs: BTreeMap<u16, Vec<String>> = BTreeMap::new();
-    let mut files = vec![];
-    let mut issues = vec![];
-    while let Some((path, relative, level)) = stack.pop() {
-        if level > MAX_DEPTH {
-            bail!("目录层级超过256层，请缩小待处理范围");
-        }
-        dirs.entry(level).or_default().push(relative.clone());
-        for entry in fs::read_dir(&path)
-            .with_context(|| format!("无法读取目录：{}，请检查权限", path.display()))?
-        {
-            let entry = entry?;
-            if state
-                .as_ref()
-                .is_some_and(|s| path_key(s) == path_key(&entry.path()))
-            {
-                continue;
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("目录包含非Unicode文件名，请改名后重试"))?;
-            let relative = if relative.is_empty() {
-                name.clone()
-            } else {
-                format!("{relative}/{name}")
-            };
-            match checked_metadata(&entry.path()) {
-                Ok(m) if m.is_dir() => stack.push((entry.path(), relative, level + 1)),
-                Ok(m) if m.is_file() && is_source(&name) => files.push(relative),
-                Ok(_) => {}
-                Err(e) => issues.push(issue(
-                    "warning",
-                    "unsupported_path",
-                    format!("未访问：{e:#}"),
-                    Some(relative),
-                )),
-            }
-        }
-    }
-    let max_level = *dirs.keys().max().unwrap_or(&0);
-    let folder_count = dirs.values().map(Vec::len).sum();
-    let levels = (0..=max_level)
-        .map(|level| {
-            let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-            if let Some(directories) = dirs.get(&level) {
-                for directory in directories {
-                    groups.entry(directory.clone()).or_default();
-                }
-            }
-            for f in &files {
-                *groups.entry(group_key(f, level)).or_default() += 1;
-            }
-            let mut samples = if level == 0 {
-                vec![root
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()]
-            } else {
-                dirs.get(&level).cloned().unwrap_or_default()
-            };
-            samples.sort_by(|a, b| natural_compare(a, b));
-            samples.truncate(3);
-            Level {
-                level,
-                folder_count: groups.len(),
-                file_count: files.len(),
-                samples,
-            }
-        })
-        .collect();
-    Ok(Initialization {
-        root: path_text(&root)?,
-        max_level,
-        levels,
-        folder_count,
-        file_count: files.len(),
-        issues,
-    })
+    preview(
+        ScanRequest {
+            root: root.into(),
+            level: 0,
+            exclude_rules: default_rules(),
+            index: None,
+            sort: Sort::default(),
+            output_names: vec![],
+        },
+        state_dir,
+    )
 }
 
 struct Rule {
@@ -478,7 +516,7 @@ struct Scanner {
     ignored: usize,
 }
 impl Scanner {
-    fn walk(&mut self, relative: &str) -> Result<()> {
+    fn walk(&mut self, relative: &str, cancel: &AtomicBool) -> Result<()> {
         if depth(relative) > MAX_DEPTH as usize {
             bail!("目录层级超过256层，请缩小待处理范围");
         }
@@ -503,6 +541,9 @@ impl Scanner {
             )
         });
         for entry in entries {
+            if cancel.load(Ordering::Acquire) {
+                bail!("扫描已取消，未保存不完整计划");
+            }
             let name = entry
                 .file_name()
                 .into_string()
@@ -557,14 +598,14 @@ impl Scanner {
                 continue;
             }
             if is_dir {
-                self.walk(&rel)?;
+                self.walk(&rel, cancel)?;
                 continue;
             }
             if !raw.is_file() || !is_source(&name) {
                 self.ignored += 1;
                 continue;
             }
-            let mut file = File {
+            let file = File {
                 id: uuid::Uuid::new_v4().to_string(),
                 name,
                 relative_path: rel.clone(),
@@ -579,6 +620,7 @@ impl Scanner {
                     .unwrap_or(u64::MAX),
                 sha256: String::new(),
                 pages: 0,
+                pdf_has_signature: false,
                 width: None,
                 height: None,
                 rotation_cw: 0,
@@ -588,34 +630,9 @@ impl Scanner {
                 manual_rotation: false,
                 orientation: None,
                 orientation_error: None,
+                auto_rotation_change: None,
                 error: None,
             };
-            let result = (|| -> Result<()> {
-                file.sha256 = pdf::sha256_file(&entry.path())?;
-                if file.kind == "pdf" {
-                    file.pages = inspect_pdf(&entry.path())?;
-                    file.page_rotations = vec![0; file.pages as usize];
-                    file.reviewed_pages = vec![false; file.pages as usize];
-                } else {
-                    let reader = image::ImageReader::open(entry.path())?.with_guessed_format()?;
-                    crate::scan::reject_multiframe(&entry.path(), reader.format())?;
-                    let image = orientation::load_image(&entry.path())?;
-                    file.width = Some(image.width());
-                    file.height = Some(image.height());
-                    file.pages = 1;
-                }
-                let after = fs::metadata(entry.path())?;
-                if after.len() != raw.len()
-                    || after.modified()? != raw.modified()?
-                    || pdf::sha256_file(&entry.path())? != file.sha256
-                {
-                    bail!("源文件在扫描时变化，请重新扫描");
-                }
-                Ok(())
-            })();
-            if let Err(e) = result {
-                file.error = Some(format!("无法纳入{}：{e:#}", file.relative_path));
-            }
             self.groups
                 .entry(group_key(&rel, self.level))
                 .or_default()
@@ -624,7 +641,11 @@ impl Scanner {
         Ok(())
     }
 }
-pub fn scan(request: ScanRequest, state_dir: Option<&Path>) -> Result<Plan> {
+fn metadata_scanner(
+    request: &ScanRequest,
+    state_dir: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<Scanner> {
     validate_sort(&request.sort, false)?;
     if request.level > MAX_DEPTH {
         bail!("合并级别超出支持范围，请重新初始化目录");
@@ -685,19 +706,9 @@ pub fn scan(request: ScanRequest, state_dir: Option<&Path>) -> Result<Plan> {
             });
         }
     }
-    let index_result = request.index.map(rename_index::Index::read);
-    let (index, index_error) = match index_result {
-        None => (None, None),
-        Some(Ok(index)) => (Some(index), None),
-        Some(Err(e)) => {
-            let e = format!("重命名索引未启用，所有分组回退文件夹名：{e:#}");
-            issues.push(issue("warning", "index_unavailable", e.clone(), None));
-            (None, Some(e))
-        }
-    };
     let mut scanner = Scanner {
-        root: root.clone(),
-        output: output.clone(),
+        root,
+        output,
         state,
         level: request.level,
         rules,
@@ -707,7 +718,37 @@ pub fn scan(request: ScanRequest, state_dir: Option<&Path>) -> Result<Plan> {
         exclusions,
         ignored: 0,
     };
-    scanner.walk("")?;
+    scanner.walk("", cancel)?;
+    Ok(scanner)
+}
+fn read_index(
+    config: Option<rename_index::Config>,
+    issues: &mut Vec<Issue>,
+) -> (Option<rename_index::Index>, Option<String>) {
+    let index_result = config.map(|mut config| {
+        config.duplicates = "first".into();
+        rename_index::Index::read(config)
+    });
+    let (index, index_error) = match index_result {
+        None => (None, None),
+        Some(Ok(index)) => (Some(index), None),
+        Some(Err(e)) => {
+            let e = format!("重命名索引未启用，所有分组回退文件夹名：{e:#}");
+            issues.push(issue("warning", "index_unavailable", e.clone(), None));
+            (None, Some(e))
+        }
+    };
+    (index, index_error)
+}
+fn assemble_plan(request: ScanRequest, scanner: Scanner) -> Result<Plan> {
+    let root = scanner.root.clone();
+    let output = scanner.output.clone();
+    let root_name = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("目录名称无效")?;
+    let mut scanner = scanner;
+    let (index, index_error) = read_index(request.index.clone(), &mut scanner.issues);
     let included: Vec<_> = scanner
         .groups
         .values()
@@ -812,11 +853,11 @@ pub fn scan(request: ScanRequest, state_dir: Option<&Path>) -> Result<Plan> {
         empty_directories,
         orientation_workflow: Workflow::default(),
         omitted_sources: vec![],
+        removed_sources: vec![],
+        scan_metrics: None,
     };
+    apply_output_names(&mut plan, &request.output_names)?;
     refresh_output_issues(&mut plan)?;
-    if let Some(state) = state_dir {
-        inspect_existing_outputs(state, &mut plan)?;
-    }
     for e in &plan.exclusions {
         if e.kind == "glob" && e.matches.is_empty() {
             plan.issues.push(issue(
@@ -827,6 +868,333 @@ pub fn scan(request: ScanRequest, state_dir: Option<&Path>) -> Result<Plan> {
             ));
         }
     }
+    Ok(plan)
+}
+
+fn work_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+fn apply_output_names(plan: &mut Plan, names: &[OutputName]) -> Result<()> {
+    let mut unique = HashSet::new();
+    for item in names {
+        if !unique.insert(&item.relative_path) {
+            bail!("预扫描名称包含重复目录，请刷新预览后重试");
+        }
+        let group = plan
+            .groups
+            .iter_mut()
+            .find(|g| g.relative_path == item.relative_path)
+            .context("预扫描名称所属目录已变化，请刷新目录预览后重试")?;
+        group.output_name = output_name(&item.output_name)?;
+        group.issues.retain(|i| i.code != "output_name");
+    }
+    Ok(())
+}
+fn available_levels(scanner: &Scanner) -> Vec<Level> {
+    let max = scanner.dirs.iter().map(|d| depth(d)).max().unwrap_or(0) as u16;
+    (0..=max)
+        .map(|level| {
+            let mut groups = HashSet::new();
+            for directory in &scanner.dirs {
+                if depth(directory) == level as usize {
+                    groups.insert(directory.clone());
+                }
+            }
+            for file in scanner.groups.values().flatten() {
+                groups.insert(group_key(&file.relative_path, level));
+            }
+            let mut samples: Vec<_> = scanner
+                .dirs
+                .iter()
+                .filter(|d| depth(d) == level as usize)
+                .cloned()
+                .collect();
+            samples.sort_by(|a, b| natural_compare(a, b));
+            samples.truncate(3);
+            if level == 0 {
+                samples = vec![scanner
+                    .root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()];
+            }
+            Level {
+                level,
+                folder_count: groups.len(),
+                file_count: scanner.groups.values().map(Vec::len).sum(),
+                samples,
+            }
+        })
+        .collect()
+}
+pub fn preview(request: ScanRequest, state_dir: Option<&Path>) -> Result<Initialization> {
+    let started = Instant::now();
+    let scanner = metadata_scanner(&request, state_dir, &AtomicBool::new(false))?;
+    let levels = available_levels(&scanner);
+    let max_level = levels.last().map(|l| l.level).unwrap_or(0);
+    let folder_count = scanner.dirs.len();
+    let plan = assemble_plan(request, scanner)?;
+    let mut summary = Summary {
+        group_count: plan.groups.len(),
+        nonempty_groups: 0,
+        candidate_count: 0,
+        image_count: 0,
+        pdf_count: 0,
+        bytes: 0,
+    };
+    let groups = plan
+        .groups
+        .iter()
+        .map(|g| {
+            summary.nonempty_groups += usize::from(!g.empty);
+            summary.candidate_count += g.files.len();
+            summary.image_count += g.image_count;
+            summary.pdf_count += g.pdf_count;
+            let bytes = g.files.iter().map(|f| f.bytes).sum();
+            summary.bytes += bytes;
+            Ok(PreviewGroup {
+                relative_path: g.relative_path.clone(),
+                path: path_text(&Path::new(&plan.root).join(&g.relative_path))?,
+                name: g.name.clone(),
+                shallow: g.shallow,
+                candidate_count: g.files.len(),
+                image_count: g.image_count,
+                pdf_count: g.pdf_count,
+                bytes,
+                output_name: g.output_name.clone(),
+                rename: g.rename.clone(),
+                issues: g.issues.clone(),
+                empty: g.empty,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Initialization {
+        root: plan.root,
+        output_dir: plan.output_dir,
+        level: plan.level,
+        max_level,
+        levels,
+        folder_count,
+        file_count: summary.candidate_count,
+        groups,
+        summary,
+        issues: plan.issues,
+        exclusions: plan.exclusions,
+        ignored_files: plan.ignored_files,
+        elapsed_ms: elapsed_ms(started),
+        index: plan.index,
+        index_error: plan.index_error,
+    })
+}
+fn inspect_candidate(root: &Path, source: &File) -> (File, ScanTimings, ScanCounts) {
+    let mut file = source.clone();
+    let mut times = ScanTimings::default();
+    let mut counts = ScanCounts::default();
+    if file.kind == "image" {
+        counts.image_files = 1;
+    } else {
+        counts.pdf_files = 1;
+    }
+    let result = (|| -> Result<()> {
+        let path = pdf::safe_source(root, &file.relative_path)?;
+        let before = checked_metadata(&path)?;
+        if !before.is_file()
+            || before.len() != file.bytes
+            || before.modified()?.duration_since(UNIX_EPOCH)?.as_millis() as u64 != file.modified_ms
+        {
+            bail!("来源在目录预览后发生变化，请重新扫描");
+        }
+        let t = Instant::now();
+        let bytes = fs::read(&path)?;
+        times.read_ms = work_ms(t);
+        counts.bytes_read = bytes.len() as u64;
+        let t = Instant::now();
+        file.sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+        times.hash_ms = work_ms(t);
+        counts.hash_calls = 1;
+        let t = Instant::now();
+        let inspected = (|| -> Result<()> {
+            if file.kind == "pdf" {
+                let inspected = crate::generic::inspect_batch_pdf_bytes(&bytes)?;
+                file.pages = inspected.pages;
+                file.pdf_has_signature = inspected.signature_notice;
+                file.page_rotations = vec![0; file.pages as usize];
+                file.reviewed_pages = vec![false; file.pages as usize];
+            } else {
+                let format = image::guess_format(&bytes).context("无法识别图片格式")?;
+                crate::scan::reject_multiframe_bytes(&bytes, Some(format))?;
+                let image = orientation::load_image_bytes(bytes)?;
+                file.width = Some(image.width());
+                file.height = Some(image.height());
+                file.pages = 1;
+            }
+            Ok(())
+        })();
+        if file.kind == "pdf" {
+            times.pdf_ms = work_ms(t);
+        } else {
+            times.image_ms = work_ms(t);
+        }
+        let after = checked_metadata(&path)?;
+        if after.len() != before.len() || after.modified()? != before.modified()? {
+            bail!("来源在内容校验时发生变化，请重新扫描");
+        }
+        inspected
+    })();
+    if let Err(error) = result {
+        counts.source_errors = 1;
+        file.error = Some(format!("无法纳入{}：{error:#}", file.relative_path));
+    }
+    (file, times, counts)
+}
+fn add_metrics(total: &mut ScanMetrics, times: &ScanTimings, counts: &ScanCounts) {
+    total.timings.read_ms += times.read_ms;
+    total.timings.hash_ms += times.hash_ms;
+    total.timings.pdf_ms += times.pdf_ms;
+    total.timings.image_ms += times.image_ms;
+    total.counts.image_files += counts.image_files;
+    total.counts.pdf_files += counts.pdf_files;
+    total.counts.source_errors += counts.source_errors;
+    total.counts.bytes_read += counts.bytes_read;
+    total.counts.hash_calls += counts.hash_calls;
+}
+pub fn scan(request: ScanRequest, state_dir: Option<&Path>) -> Result<Plan> {
+    scan_with_progress(request, state_dir, &AtomicBool::new(false), |_| Ok(()))
+}
+fn scan_with_progress(
+    request: ScanRequest,
+    state_dir: Option<&Path>,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(&ScanProgress) -> Result<()>,
+) -> Result<Plan> {
+    let started = Instant::now();
+    let mut status = ScanProgress {
+        id: String::new(),
+        status: "running".into(),
+        plan_id: None,
+        phase: "enumerating".into(),
+        done: 0,
+        total: 0,
+        elapsed_ms: 0,
+        current_file: None,
+        timings: ScanTimings::default(),
+        counts: ScanCounts::default(),
+        logs: vec![],
+        error: None,
+    };
+    progress(&status)?;
+    if cancel.load(Ordering::Acquire) {
+        bail!("扫描已取消");
+    }
+    let mut scanner = metadata_scanner(&request, state_dir, cancel)?;
+    let mut metrics = ScanMetrics::default();
+    metrics.timings.metadata_ms = work_ms(started);
+    let files: Vec<_> = scanner.groups.values().flatten().cloned().collect();
+    status.total = u32::try_from(files.len()).context("来源数量超过支持范围")?;
+    status.phase = "validating".into();
+    status.logs.push(ScanLog {
+        level: "info".into(),
+        code: "discovered".into(),
+        message: format!(
+            "目录读取完成：{}个候选来源；仅完整校验后保存计划",
+            files.len()
+        ),
+    });
+    for issue in scanner.issues.iter().filter(|i| i.severity == "warning") {
+        status.logs.push(ScanLog {
+            level: "warning".into(),
+            code: issue.code.clone(),
+            message: issue.message.clone(),
+        });
+    }
+    if status.logs.len() > 200 {
+        status.logs.drain(..status.logs.len() - 200);
+    }
+    status.timings = metrics.timings.clone();
+    status.elapsed_ms = elapsed_ms(started);
+    progress(&status)?;
+    let mut contexts = vec![(); DEFAULT_THREADS.min(files.len())];
+    let mut validated = HashMap::new();
+    workers::run(
+        &files,
+        &mut contexts,
+        cancel,
+        |_, file, _| inspect_candidate(&scanner.root, file),
+        |event| {
+            match event {
+                workers::Event::Started { index } => {
+                    status.current_file = Some(files[index].relative_path.clone());
+                }
+                workers::Event::Finished {
+                    result: (file, times, counts),
+                    ..
+                } => {
+                    add_metrics(&mut metrics, &times, &counts);
+                    status.done += 1;
+                    if let Some(error) = &file.error {
+                        status.logs.push(ScanLog {
+                            level: "error".into(),
+                            code: "source_error".into(),
+                            message: error.clone(),
+                        });
+                        if status.logs.len() > 200 {
+                            status.logs.remove(0);
+                        }
+                    }
+                    validated.insert(file.id.clone(), file);
+                }
+                workers::Event::Panicked => bail!("扫描工作线程异常，未保存不完整计划；请重试"),
+                workers::Event::Progress { .. } => {}
+            }
+            status.timings = metrics.timings.clone();
+            status.counts = metrics.counts.clone();
+            status.elapsed_ms = elapsed_ms(started);
+            progress(&status)
+        },
+    )?;
+    if cancel.load(Ordering::Acquire) {
+        bail!("扫描已取消，未保存不完整计划");
+    }
+    for file in scanner.groups.values_mut().flatten() {
+        *file = validated
+            .remove(&file.id)
+            .context("来源校验未完成，请重试扫描")?;
+    }
+    status.phase = "naming".into();
+    progress(&status)?;
+    let t = Instant::now();
+    let mut plan = assemble_plan(request, scanner)?;
+    metrics.timings.index_ms = work_ms(t);
+    status.phase = "saving".into();
+    let t = Instant::now();
+    if let Some(dir) = state_dir {
+        inspect_existing_outputs(dir, &mut plan)?;
+    }
+    metrics.timings.output_ms = work_ms(t);
+    if let Some(error) = &plan.index_error {
+        status.logs.push(ScanLog {
+            level: "warning".into(),
+            code: "index_unavailable".into(),
+            message: error.clone(),
+        });
+    }
+    if status.logs.len() > 200 {
+        status.logs.drain(..status.logs.len() - 200);
+    }
+    metrics.elapsed_ms = elapsed_ms(started);
+    status.timings = metrics.timings.clone();
+    status.counts = metrics.counts.clone();
+    status.elapsed_ms = metrics.elapsed_ms;
+    status.current_file = None;
+    progress(&status)?;
+    if cancel.load(Ordering::Acquire) {
+        bail!("扫描已取消，未保存不完整计划");
+    }
+    plan.scan_metrics = Some(metrics);
     Ok(plan)
 }
 
@@ -873,8 +1241,128 @@ fn refresh_output_issues(plan: &mut Plan) -> Result<()> {
     }
     Ok(())
 }
+type FilePositions = HashMap<String, HashMap<String, usize>>;
+
+fn virtual_file_positions(plan: &Plan) -> FilePositions {
+    let mut hidden: HashMap<&str, Vec<&OmittedSource>> = HashMap::new();
+    for source in plan.removed_sources.iter().chain(&plan.omitted_sources) {
+        hidden.entry(&source.group_id).or_default().push(source);
+    }
+    plan.groups
+        .iter()
+        .map(|group| {
+            let mut order: Vec<_> = group.files.iter().map(|f| f.id.clone()).collect();
+            if let Some(sources) = hidden.get_mut(group.id.as_str()) {
+                sources.sort_by_key(|s| s.position);
+                for source in sources {
+                    order.insert(source.position.min(order.len()), source.file.id.clone());
+                }
+            }
+            (
+                group.id.clone(),
+                order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, id)| (id, position))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn restore_file(group: &mut Group, source: OmittedSource, positions: &FilePositions) -> Result<()> {
+    let ranks = positions
+        .get(&group.id)
+        .context("恢复顺序所属合并单元不存在")?;
+    let rank = ranks.get(&source.file.id).context("恢复顺序缺少来源文件")?;
+    let insertion = group
+        .files
+        .iter()
+        .position(|file| ranks.get(&file.id).is_some_and(|position| position > rank))
+        .unwrap_or(group.files.len());
+    group.files.insert(insertion, source.file);
+    Ok(())
+}
+
 pub fn edit(original: &Plan, request: EditRequest) -> Result<Plan> {
     let mut plan = original.clone();
+    // Positions include hidden sources. Active-vector indices would drift as
+    // separate edits remove earlier files and could silently reorder pages.
+    let positions = if request.remove_file_ids.is_empty() && request.restore_file_ids.is_empty() {
+        HashMap::new()
+    } else {
+        virtual_file_positions(&plan)
+    };
+    let removing: HashSet<_> = request.remove_file_ids.iter().collect();
+    let restoring: HashSet<_> = request.restore_file_ids.iter().collect();
+    if removing.len() != request.remove_file_ids.len()
+        || restoring.len() != request.restore_file_ids.len()
+        || removing.iter().any(|id| restoring.contains(id))
+    {
+        bail!("移除/恢复文件ID重复或相互冲突");
+    }
+    for id in &request.remove_file_ids {
+        if !plan
+            .groups
+            .iter()
+            .flat_map(|g| &g.files)
+            .any(|f| &f.id == id)
+        {
+            bail!("待移除文件不属于当前合并工作，请刷新后重试");
+        }
+    }
+    for id in &request.restore_file_ids {
+        if !plan.removed_sources.iter().any(|s| &s.file.id == id) {
+            bail!("待恢复文件不在移除记录中");
+        }
+    }
+    for group in &mut plan.groups {
+        let mut retained = vec![];
+        for (position, file) in group.files.drain(..).enumerate() {
+            if removing.contains(&file.id) {
+                plan.removed_sources.push(OmittedSource {
+                    group_id: group.id.clone(),
+                    position: positions
+                        .get(&group.id)
+                        .and_then(|r| r.get(&file.id))
+                        .copied()
+                        .unwrap_or(position),
+                    file,
+                });
+            } else {
+                retained.push(file);
+            }
+        }
+        group.files = retained;
+    }
+    let output_relative = Path::new(&plan.output_dir)
+        .strip_prefix(Path::new(&plan.root))
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
+    let mut remaining = vec![];
+    for source in plan.removed_sources.drain(..) {
+        if restoring.contains(&source.file.id) {
+            if output_relative
+                .as_ref()
+                .is_some_and(|p| source.file.relative_path.starts_with(&format!("{p}/")))
+            {
+                plan.omitted_sources.push(source);
+            } else {
+                let group = plan
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == source.group_id)
+                    .context("恢复文件所属合并单元不存在")?;
+                restore_file(group, source, &positions)?;
+                if group.sort.mode != "manual" {
+                    sort_files(&mut group.files, &group.sort);
+                }
+            }
+        } else {
+            remaining.push(source);
+        }
+    }
+    plan.removed_sources = remaining;
     let mut groups = HashSet::new();
     for update in request.groups {
         if !groups.insert(update.group_id.clone()) {
@@ -920,6 +1408,7 @@ pub fn edit(original: &Plan, request: EditRequest) -> Result<Plan> {
         if let Some(angle) = update.rotation_cw {
             validate_angle(angle)?;
             file.rotation_cw = angle;
+            file.auto_rotation_change = None;
             file.manual_rotation = true;
             file.reviewed = false;
             if file.kind == "pdf" {
@@ -938,6 +1427,7 @@ pub fn edit(original: &Plan, request: EditRequest) -> Result<Plan> {
                     file.reviewed_pages[i] = false;
                 }
             }
+            file.auto_rotation_change = None;
             file.page_rotations = angles;
             file.manual_rotation = true;
             file.reviewed = false;
@@ -962,12 +1452,18 @@ pub fn edit(original: &Plan, request: EditRequest) -> Result<Plan> {
         if output.exists() && !checked_metadata(&output)?.is_dir() {
             bail!("输出位置不是文件夹");
         }
+        let positions = virtual_file_positions(&plan);
         for omitted in plan.omitted_sources.drain(..) {
             if let Some(g) = plan.groups.iter_mut().find(|g| g.id == omitted.group_id) {
-                g.files
-                    .insert(omitted.position.min(g.files.len()), omitted.file);
+                restore_file(g, omitted, &positions)?;
             }
         }
+        for group in &mut plan.groups {
+            if group.sort.mode != "manual" {
+                sort_files(&mut group.files, &group.sort);
+            }
+        }
+        let positions = virtual_file_positions(&plan);
         plan.exclusions.retain(|e| e.kind != "output");
         if let Ok(relative) = output.strip_prefix(Path::new(&plan.root)) {
             let relative = path_text(relative)?.replace('\\', "/");
@@ -977,7 +1473,11 @@ pub fn edit(original: &Plan, request: EditRequest) -> Result<Plan> {
                     if f.relative_path.starts_with(&format!("{relative}/")) {
                         plan.omitted_sources.push(OmittedSource {
                             group_id: g.id.clone(),
-                            position,
+                            position: positions
+                                .get(&g.id)
+                                .and_then(|r| r.get(&f.id))
+                                .copied()
+                                .unwrap_or(position),
                             file: f,
                         });
                     } else {
@@ -1045,11 +1545,14 @@ pub(crate) fn validate_generation(plan: &Plan, request: &GenerateRequest) -> Res
         bail!("没有可合并的来源文件");
     }
     if plan.issues.iter().any(|i| i.severity == "error")
-        || selected
-            .iter()
-            .any(|g| g.empty || g.issues.iter().any(|i| i.severity == "error"))
+        || selected.iter().any(|g| {
+            g.empty
+                || g.issues
+                    .iter()
+                    .any(|i| i.severity == "error" && i.code != "output_existing")
+        })
     {
-        bail!("所选合并单元含错误或空组，请修正或只选择有效组");
+        bail!("所选合并单元含错误或空组，请检查/移除错误来源或仅选择有效组；旧版PDF检查错误请重新扫描");
     }
     selected.iter().try_fold(0u32, |n, g| {
         n.checked_add(g.pages).context("总页数超过支持范围")
@@ -1088,65 +1591,49 @@ pub fn analysis_revision(original: &Plan, threads: usize) -> Result<Plan> {
     Ok(plan)
 }
 
-pub fn inspect_existing_outputs(state_dir: &Path, plan: &mut Plan) -> Result<()> {
+pub fn inspect_existing_outputs(_state_dir: &Path, plan: &mut Plan) -> Result<()> {
     for group in &mut plan.groups {
-        group.issues.retain(|i| i.code != "output_existing");
-        let path = Path::new(&group.output_path);
-        let missing =
-            fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-        if missing && !path.parent().is_some_and(Path::exists) {
-            continue;
-        }
+        group
+            .issues
+            .retain(|issue| !matches!(issue.code.as_str(), "output_existing" | "output_unsafe"));
         let check = (|| -> Result<()> {
-            checked_optional(path)?;
-            // A pending journal is recovered by generation. Do not overwrite
-            // its record in a preview or misclassify a missing manifest.
-            let record = pdf::manifest_path(state_dir, path)?;
-            let journal = record.with_file_name("transaction.json");
-            let journal = if journal.exists() {
-                journal
-            } else {
-                journal.with_extension("json.previous")
-            };
-            if journal.exists() {
-                let pending: Transaction<Manifest> = serde_json::from_slice(&fs::read(journal)?)
-                    .context("输出事务损坏或属于其他模式")?;
-                validate_manifest_owner(&pending.manifest, &plan.root, group, path)?;
-                return Ok(());
-            }
-            if missing {
-                return Ok(());
-            }
-            let record = if record.exists() {
-                record
-            } else {
-                record.with_extension("json.previous")
-            };
-            let old: Manifest =
-                serde_json::from_slice(&fs::read(record).context("存在来源不明的同名PDF")?)
-                    .context("同名输出的记录损坏或属于其他模式")?;
-            if old.mode != "batch_merge"
-                || old.producer != "pdf-workbench"
-                || old.root != plan.root
-                || old.group_key != group.relative_path
-                || old.output_name != group.output_name
-                || path_key(Path::new(&old.output_path)) != path_key(path)
-                || pdf::sha256_file(path)? != old.output_sha256
-            {
-                bail!("已有PDF被修改或不属于此分组");
+            let directory = absolute_checked(Path::new(&plan.output_dir), false)?;
+            if directory.exists() {
+                if !checked_metadata(&directory)?.is_dir() {
+                    bail!("输出位置不是普通文件夹");
+                }
+                let path = resolve_output_path(&directory, &group.output_name)?;
+                checked_optional(&path)?;
             }
             Ok(())
         })();
         if let Err(error) = check {
             group.issues.push(issue(
                 "error",
-                "output_existing",
-                format!("{error:#}；拒绝覆盖，请改名或更换输出目录"),
+                "output_unsafe",
+                format!("输出路径不安全：{error:#}"),
                 Some(group.output_path.clone()),
             ));
         }
     }
     Ok(())
+}
+
+fn resolve_output_path(directory: &Path, name: &str) -> Result<PathBuf> {
+    let desired = pdf::checked_output_child(directory, name)?;
+    let mut matches = vec![];
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().to_lowercase() == name.to_lowercase() {
+            matches.push(entry.path());
+        }
+    }
+    if matches.len() > 1 {
+        bail!("输出目录中存在多个仅大小写不同的同名文件，无法安全判断覆盖对象；请先改名");
+    }
+    let path = matches.pop().unwrap_or(desired);
+    checked_optional(&path)?;
+    Ok(path)
 }
 
 fn validate_manifest_owner(
@@ -1205,6 +1692,8 @@ fn check_file_content(plan: &Plan, file: &File) -> Result<PathBuf> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Mapping {
     pub kind: String,
+    #[serde(default)]
+    pub pdf_has_signature: bool,
     pub rotation_cw: u16,
     pub page_rotations: Vec<u16>,
     pub reviewed: bool,
@@ -1212,6 +1701,8 @@ pub struct Mapping {
     pub manual_rotation: bool,
     pub orientation: Option<Orientation>,
     pub orientation_error: Option<String>,
+    #[serde(default)]
+    pub auto_rotation_change: Option<RotationChange>,
     pub source: String,
     pub sha256: String,
     pub pages: u32,
@@ -1238,6 +1729,8 @@ pub struct Manifest {
     pub orientation_workflow: Workflow,
     pub unreviewed_files: usize,
     pub unreviewed_pages: usize,
+    #[serde(default)]
+    pub overwrite_authorization: Option<conflicts::OutputAuthorization>,
 }
 impl RecordHash for Manifest {
     fn output_hash(&self) -> &str {
@@ -1288,10 +1781,30 @@ pub fn build_group(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u32),
 ) -> Result<BuildResult> {
+    build_group_with_resolver(state_dir, plan, group, cancel, progress, None)?
+        .context("非交互生成不能跳过既存文件")
+}
+
+type ConflictResolver<'a> = dyn Fn(&Path, &str) -> Result<conflicts::Decision> + 'a;
+
+fn build_group_with_resolver(
+    state_dir: &Path,
+    plan: &Plan,
+    group: &Group,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u32),
+    resolver: Option<&ConflictResolver<'_>>,
+) -> Result<Option<BuildResult>> {
     if cancel.load(Ordering::Acquire) {
         bail!("已取消");
     }
-    if group.empty || group.files.is_empty() || group.issues.iter().any(|i| i.severity == "error") {
+    if group.empty
+        || group.files.is_empty()
+        || group
+            .issues
+            .iter()
+            .any(|i| i.severity == "error" && !(resolver.is_some() && i.code == "output_existing"))
+    {
         bail!("分组为空或存在预览错误");
     }
     if output_name(&group.output_name)? != group.output_name {
@@ -1301,20 +1814,16 @@ pub fn build_group(
         rename_index::verify(index)?;
     }
     let directory = prepare_output(plan)?;
-    let path = pdf::checked_output_child(&directory, &group.output_name)?;
+    let path = resolve_output_path(&directory, &group.output_name)?;
     if path_key(&path) != path_key(Path::new(&group.output_path)) {
         bail!("输出路径与计划不符");
     }
     checked_optional(&path)?;
-    // Detect case-only existing targets even on a case-sensitive build host.
-    for entry in fs::read_dir(&directory)? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().to_lowercase() == group.output_name.to_lowercase()
-            && entry.path() != path
-        {
-            bail!("输出目录中有仅大小写不同的同名文件，拒绝覆盖，请改名或换目录");
-        }
-    }
+    let physical_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("输出名称无效")?
+        .to_owned();
     for file in plan.groups.iter().flat_map(|g| &g.files) {
         if path_key(&Path::new(&plan.root).join(&file.relative_path)) == path_key(&path) {
             bail!("输出目标与源文件相同，拒绝覆盖");
@@ -1328,7 +1837,33 @@ pub fn build_group(
             .context("输出事务不属于当前批量合并模式，拒绝恢复")?;
         validate_manifest_owner(&pending.manifest, &plan.root, group, &path)?;
     }
-    pdf::recover_record_transaction::<Manifest>(&directory, &group.output_name, &records)?;
+    pdf::recover_record_transaction::<Manifest>(&directory, &physical_name, &records)?;
+    let mut authorization = None;
+    let mut interactive_previous = None;
+    if let Some(resolve) = resolver {
+        if path.exists() {
+            checked_optional(&records.manifest())?;
+            let hash = pdf::sha256_file(&path)?;
+            match resolve(&path, &hash)? {
+                conflicts::Decision::Skip => return Ok(None),
+                conflicts::Decision::Overwrite(approved) => {
+                    if approved.previous_sha256 != hash
+                        || path_key(Path::new(&approved.output_path)) != path_key(&path)
+                    {
+                        bail!("覆盖授权与当前目标不符，请重新确认");
+                    }
+                    checked_optional(&path)?;
+                    if resolve_output_path(&directory, &group.output_name)? != path
+                        || pdf::sha256_file(&path)? != hash
+                    {
+                        bail!("目标在等待确认期间发生变化，未覆盖；请重试并重新确认");
+                    }
+                    interactive_previous = Some(hash);
+                    authorization = Some(approved);
+                }
+            }
+        }
+    }
     let mut mappings = Vec::new();
     let mut next = 1u32;
     for file in &group.files {
@@ -1345,6 +1880,7 @@ pub fn build_group(
         }
         mappings.push(Mapping {
             kind: file.kind.clone(),
+            pdf_has_signature: file.pdf_has_signature,
             rotation_cw: file.rotation_cw,
             page_rotations: file.page_rotations.clone(),
             reviewed: file.reviewed,
@@ -1352,6 +1888,7 @@ pub fn build_group(
             manual_rotation: file.manual_rotation,
             orientation: file.orientation.clone(),
             orientation_error: file.orientation_error.clone(),
+            auto_rotation_change: file.auto_rotation_change,
             source: file.relative_path.clone(),
             sha256: file.sha256.clone(),
             pages: file.pages,
@@ -1377,10 +1914,13 @@ pub fn build_group(
         index: plan.index.clone(),
         rename: group.rename.clone(),
         orientation_workflow: plan.orientation_workflow.clone(),
-        unreviewed_files: group.files.iter().filter(|f| !f.reviewed).count(),
+        unreviewed_files: group.files.iter().filter(|f| needs_review(f)).count(),
         unreviewed_pages: group.files.iter().map(unreviewed_pages).sum(),
+        overwrite_authorization: authorization,
     };
-    let previous_hash = if path.exists() {
+    let previous_hash = if resolver.is_some() {
+        interactive_previous
+    } else if path.exists() {
         let old: Manifest = serde_json::from_slice(
             &fs::read(records.manifest())
                 .context("输出已存在且无通用模式生成记录，拒绝覆盖；请改名或换目录")?,
@@ -1405,11 +1945,11 @@ pub fn build_group(
             // Store a task-specific snapshot even when bytes are reused.
             manifest.output_sha256 = old.output_sha256;
             progress(manifest.pages);
-            return Ok(BuildResult {
+            return Ok(Some(BuildResult {
                 path,
                 manifest,
                 skipped: true,
-            });
+            }));
         }
         Some(old.output_sha256)
     } else {
@@ -1426,10 +1966,14 @@ pub fn build_group(
             }
             let source = check_file(plan, file)?;
             let pages = if file.kind == "pdf" {
-                if inspect_pdf(&source)? != file.pages {
+                let inspected = crate::generic::inspect_batch_pdf(&source)?;
+                if inspected.signature_notice != file.pdf_has_signature {
+                    bail!("PDF签名提示来自旧版检查，请重新扫描后再合并；历史计划未修改");
+                }
+                if inspected.pages != file.pages {
                     bail!("来源PDF页数发生变化，请重新扫描");
                 }
-                pdf::append_pdf_rotations(
+                pdf::append_batch_pdf_rotations(
                     &mut doc,
                     root_pages,
                     &mut kids,
@@ -1469,6 +2013,9 @@ pub fn build_group(
             rename_index::verify(index)?;
         }
         // Do not adopt an external edit that happened while we were assembling.
+        if resolve_output_path(&directory, &group.output_name)? != path {
+            bail!("输出路径或名称在生成期间发生变化，未覆盖，请重新确认");
+        }
         let current = if path.exists() {
             checked_optional(&path)?;
             Some(pdf::sha256_file(&path)?)
@@ -1481,24 +2028,24 @@ pub fn build_group(
         if cancel.load(Ordering::Acquire) {
             bail!("已取消");
         }
+        let replace_existing = previous_hash.is_some();
         let transaction = Transaction {
             temporary: temporary
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            output: group.output_name.clone(),
-            backup: previous_hash
-                .as_ref()
-                .map(|_| format!(".history/{}/{}", uuid::Uuid::new_v4(), group.output_name)),
+            output: physical_name.clone(),
+            backup: None,
             previous_hash,
             manifest: manifest.clone(),
+            replace_existing,
         };
         if let Some(backup) = &transaction.backup {
             pdf::checked_output_child(&directory, backup)?;
         }
         pdf::atomic_json(&records.journal(), &transaction)?;
-        pdf::recover_record_transaction::<Manifest>(&directory, &group.output_name, &records)?;
+        pdf::recover_record_transaction::<Manifest>(&directory, &physical_name, &records)?;
         Ok(BuildResult {
             path: path.clone(),
             manifest: manifest.clone(),
@@ -1508,7 +2055,7 @@ pub fn build_group(
     if result.is_err() && !records.journal().exists() {
         let _ = fs::remove_file(&temporary);
     }
-    result
+    result.map(Some)
 }
 fn checked_optional(path: &Path) -> Result<()> {
     match checked_metadata(path) {
@@ -1547,71 +2094,109 @@ fn execute_generation(state: &AppState, job: &Job, cancel: &AtomicBool) -> Resul
         .collect();
     let mut accounted = vec![0u32; work.len()];
     let mut contexts = vec![(); job.threads.min(work.len())];
-    workers::run(
+    let coordinator = Arc::new(ConflictCoordinator::default());
+    state
+        .output_conflicts
+        .lock()
+        .unwrap()
+        .insert(job.id.clone(), coordinator.clone());
+    workers::run_with_stop(
         &work,
         &mut contexts,
         cancel,
-        |_, group, progress| build_group(&state.dir, &plan, group, cancel, progress),
+        |_, group, progress, stop| {
+            let context = conflicts::RequestContext {
+                state,
+                job,
+                cancel,
+                stop,
+            };
+            let resolve =
+                |path: &Path, hash: &str| coordinator.request(&context, group, path, hash);
+            build_group_with_resolver(&state.dir, &plan, group, cancel, progress, Some(&resolve))
+        },
         |event| {
-            match event {
-                workers::Event::Started { index } => state.update_job(&job.id, |j| {
-                    j.current = format!("最近开始：{}", work[index].name)
-                })?,
-                workers::Event::Progress { index, pages } => {
-                    let increment = pages.min(work[index].pages.saturating_sub(accounted[index]));
-                    accounted[index] += increment;
-                    state.update_job(&job.id, |j| {
-                        j.done = j.done.saturating_add(increment).min(j.total)
-                    })?;
-                }
-                workers::Event::Finished { index, result } => {
-                    let group = work[index];
-                    if cancel.load(Ordering::Acquire) && result.is_err() {
-                        return Ok(());
+            let result = (|| {
+                match event {
+                    workers::Event::Started { index } => state.update_job(&job.id, |j| {
+                        j.current = format!("最近开始：{}", work[index].name)
+                    })?,
+                    workers::Event::Progress { index, pages } => {
+                        let increment =
+                            pages.min(work[index].pages.saturating_sub(accounted[index]));
+                        accounted[index] += increment;
+                        state.update_job(&job.id, |j| {
+                            j.done = j.done.saturating_add(increment).min(j.total)
+                        })?;
                     }
-                    let result = match result {
-                        Ok(output) => {
-                            pdf::atomic_json(
-                                &report_dir.join(format!("{}.json", group.id)),
-                                &output.manifest,
-                            )?;
-                            JobResult {
+                    workers::Event::Finished { index, result } => {
+                        let group = work[index];
+                        if cancel.load(Ordering::Acquire) && result.is_err() {
+                            return Ok(());
+                        }
+                        let result = match result {
+                            Ok(Some(output)) => {
+                                pdf::atomic_json(
+                                    &report_dir.join(format!("{}.json", group.id)),
+                                    &output.manifest,
+                                )?;
+                                JobResult {
+                                    voucher_id: group.id.clone(),
+                                    folder: group.name.clone(),
+                                    status: if output.skipped {
+                                        "skipped"
+                                    } else {
+                                        "completed"
+                                    }
+                                    .into(),
+                                    output_path: Some(path_text(&output.path)?),
+                                    pages: output.manifest.pages,
+                                    error: None,
+                                    needs_review: group.review_count > 0,
+                                    rotation_change: None,
+                                }
+                            }
+                            Ok(None) => JobResult {
                                 voucher_id: group.id.clone(),
                                 folder: group.name.clone(),
-                                status: if output.skipped {
-                                    "skipped"
-                                } else {
-                                    "completed"
-                                }
-                                .into(),
-                                output_path: Some(path_text(&output.path)?),
-                                pages: output.manifest.pages,
+                                status: "skipped_existing".into(),
+                                output_path: None,
+                                pages: 0,
                                 error: None,
-                                needs_review: group.review_count > 0,
-                            }
-                        }
-                        Err(error) => JobResult {
-                            voucher_id: group.id.clone(),
-                            folder: group.name.clone(),
-                            status: "failed".into(),
-                            output_path: None,
-                            pages: 0,
-                            error: Some(format!("{error:#}")),
-                            needs_review: false,
-                        },
-                    };
-                    state.update_job(&job.id, |j| {
-                        j.done = j
-                            .done
-                            .saturating_add(group.pages.saturating_sub(accounted[index]))
-                            .min(j.total);
-                        j.results.push(result);
-                        j.results.sort_by_key(|r| positions[&r.voucher_id]);
-                    })?;
+                                needs_review: false,
+                                rotation_change: None,
+                            },
+                            Err(error) => JobResult {
+                                voucher_id: group.id.clone(),
+                                folder: group.name.clone(),
+                                status: "failed".into(),
+                                output_path: None,
+                                pages: 0,
+                                error: Some(format!("{error:#}")),
+                                needs_review: false,
+                                rotation_change: None,
+                            },
+                        };
+                        state.update_job(&job.id, |j| {
+                            j.done = j
+                                .done
+                                .saturating_add(group.pages.saturating_sub(accounted[index]))
+                                .min(j.total);
+                            j.results.push(result);
+                            j.results.sort_by_key(|r| positions[&r.voucher_id]);
+                        })?;
+                    }
+                    workers::Event::Panicked => {
+                        bail!("PDF工作线程异常，已提交成品保留，可重试继续")
+                    }
                 }
-                workers::Event::Panicked => bail!("PDF工作线程异常，已提交成品保留，可重试继续"),
+                Ok(())
+            })();
+            if result.is_err() {
+                coordinator.close();
+                let _ = state.update_job(&job.id, |job| job.output_conflict = None);
             }
-            Ok(())
+            result
         },
     )
 }
@@ -1625,15 +2210,19 @@ fn snapshot(state: &AppState, job: &Job) -> Result<Plan> {
         .join("reports")
         .join(&job.id)
         .join("batch-plan.json");
-    let plan: Plan = serde_json::from_slice(
+    let mut plan: Plan = serde_json::from_slice(
         &fs::read(path).context("任务预览快照尚未保存或已丢失，请检查处理记录")?,
     )?;
     if plan.id != job.plan_id || plan.mode != "batch_merge" {
         bail!("任务预览快照与任务不符");
     }
+    normalize_review_counts(&mut plan);
     Ok(plan)
 }
 pub fn report(state: &AppState, job: &Job) -> Result<Value> {
+    if job.kind == "batch_scan" {
+        return Ok(serde_json::to_value(scan_status(state, &job.id)?)?);
+    }
     let plan = snapshot(state, job)?;
     let mut manifests = Vec::new();
     for result in &job.results {
@@ -1658,10 +2247,7 @@ pub fn report(state: &AppState, job: &Job) -> Result<Value> {
         0
     };
     let analyzed_files = if job.kind == "batch_analyze" {
-        job.results
-            .iter()
-            .filter(|r| matches!(r.status.as_str(), "completed" | "skipped"))
-            .count()
+        job.done as usize
     } else {
         0
     };
@@ -1669,7 +2255,7 @@ pub fn report(state: &AppState, job: &Job) -> Result<Value> {
     let unreviewed_files = selected
         .iter()
         .flat_map(|g| &g.files)
-        .filter(|f| !f.reviewed)
+        .filter(|f| needs_review(f))
         .count();
     let unreviewed_pages = selected
         .iter()
@@ -1679,7 +2265,7 @@ pub fn report(state: &AppState, job: &Job) -> Result<Value> {
     Ok(
         json!({"mode":"batch_merge","job":job,"plan_id":plan.id,"root":plan.root,"output_dir":plan.output_dir,
         "level":plan.level,"sort":plan.sort,"exclude_rules":plan.exclude_rules,"index":plan.index,"index_error":plan.index_error,"orientation_workflow":plan.orientation_workflow,
-        "exclusions":plan.exclusions,"issues":plan.issues,"groups":plan.groups,"successful_pages":successful_pages,"analyzed_files":analyzed_files,"unreviewed_files":unreviewed_files,"unreviewed_pages":unreviewed_pages,"manifests":manifests,
+        "exclusions":plan.exclusions,"removed_sources":plan.removed_sources,"omitted_sources":plan.omitted_sources,"scan_metrics":plan.scan_metrics,"issues":plan.issues,"groups":plan.groups,"successful_pages":successful_pages,"analyzed_files":analyzed_files,"orientation_summary":job.orientation_summary,"unreviewed_files":unreviewed_files,"unreviewed_pages":unreviewed_pages,"manifests":manifests,
         "review_notice":"自动识别和人工核对均不阻止合并；使用者应核查成品并承担最终判断责任"}),
     )
 }
@@ -1715,7 +2301,7 @@ pub fn output(state: &AppState, job: &Job, group_id: &str) -> Result<PathBuf> {
         .context("分组不属于此任务")?;
     let manifest = read_snapshot(state, job, group)?;
     let directory = absolute_checked(Path::new(&plan.output_dir), true)?;
-    let path = directory.join(&group.output_name);
+    let path = resolve_output_path(&directory, &group.output_name)?;
     checked_optional(&path)?;
     if path_key(&path) != path_key(Path::new(&manifest.output_path))
         || pdf::sha256_file(&path)? != manifest.output_sha256
@@ -1759,6 +2345,7 @@ pub(crate) fn requires_inference(plan: &Plan, request: &GenerateRequest) -> Resu
 
 pub(crate) fn execute(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<()> {
     match job.kind.as_str() {
+        "batch_scan" => execute_scan(state, job, cancel),
         "batch_generate" => execute_generation(state, job, cancel),
         "batch_analyze" => execute_analysis(state, job, cancel),
         _ => bail!("未知批量合并任务类型"),
@@ -1774,9 +2361,81 @@ fn finalize_analysis(plan: &Plan, file: &File, result: AnalysisResult) -> Analys
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalysisOutcome {
+    Changed(RotationChange),
+    Unchanged,
+    Skipped,
+    Failed,
+}
+fn apply_analysis_result(file: &mut File, result: AnalysisResult) -> AnalysisOutcome {
+    file.auto_rotation_change = None;
+    match result {
+        Ok(Some(direction)) => {
+            let from = file.rotation_cw;
+            let to = direction.rotation_cw;
+            let resolved = !direction.needs_review;
+            file.orientation = Some(direction);
+            file.orientation_error = None;
+            if resolved && from != to {
+                let change = RotationChange {
+                    from_cw: from,
+                    to_cw: to,
+                };
+                file.rotation_cw = to;
+                file.auto_rotation_change = Some(change);
+                AnalysisOutcome::Changed(change)
+            } else {
+                AnalysisOutcome::Unchanged
+            }
+        }
+        Ok(None) => AnalysisOutcome::Skipped,
+        Err((optional, error)) => {
+            let message = format!(
+                "{}：{error:#}",
+                if optional {
+                    "方向识别失败，可手动修正或按当前方向合并"
+                } else {
+                    "来源文件校验失败，请重新扫描"
+                }
+            );
+            if optional {
+                file.orientation_error = Some(message);
+            } else {
+                file.error = Some(message);
+            }
+            AnalysisOutcome::Failed
+        }
+    }
+}
+
 fn execute_analysis(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<()> {
-    let plan = state.batch_plan(&job.plan_id)?;
+    let mut plan = state.batch_plan(&job.plan_id)?;
     validate_analysis(&plan, &job.request)?;
+    let selected: HashSet<_> = selected_groups(&plan, &job.request)?
+        .iter()
+        .flat_map(|group| &group.files)
+        .filter(|file| file.kind == "image")
+        .map(|file| file.id.clone())
+        .collect();
+    {
+        let mut data = state.data.lock().unwrap();
+        let current = data
+            .batch_plans
+            .get_mut(&plan.id)
+            .context("批量合并计划不存在")?;
+        for file in current.groups.iter_mut().flat_map(|group| &mut group.files) {
+            if selected.contains(&file.id) {
+                file.auto_rotation_change = None;
+            }
+        }
+        for group in &mut current.groups {
+            refresh_group(group)?;
+        }
+        state.save_batch_plan(current)?;
+        plan = current.clone();
+    }
+
     let work: Vec<_> = selected_groups(&plan, &job.request)?
         .iter()
         .flat_map(|g| &g.files)
@@ -1809,7 +2468,7 @@ fn execute_analysis(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<
         .map(|(i, f)| (f.id.clone(), i))
         .collect();
     let mut completed = 0;
-    let mut failures = 0;
+    let mut summary = AnalysisSummary::default();
     let outcome = workers::run(
         &work,
         &mut engines,
@@ -1847,12 +2506,12 @@ fn execute_analysis(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<
         },
         |event| {
             match event {
-                workers::Event::Started { index } => state.update_job(&job.id, |j| {
-                    j.current = format!("最近开始：{}", work[index].relative_path)
+                workers::Event::Started { .. } => state.update_job(&job.id, |job| {
+                    job.current = format!("方向识别：{}/{}", job.done, job.total);
                 })?,
                 workers::Event::Finished { index, result } => {
                     let source = &work[index];
-                    let (status, error, needs_review) = {
+                    let classification = {
                         let mut data = state.data.lock().unwrap();
                         let current = data
                             .batch_plans
@@ -1864,35 +2523,7 @@ fn execute_analysis(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<
                             .flat_map(|g| &mut g.files)
                             .find(|f| f.id == source.id)
                             .context("图片不属于此计划")?;
-                        let (status, error) = match result {
-                            Ok(Some(direction)) => {
-                                file.rotation_cw = direction.rotation_cw;
-                                file.reviewed = false;
-                                file.orientation = Some(direction);
-                                file.orientation_error = None;
-                                ("completed", None)
-                            }
-                            Ok(None) => ("skipped", None),
-                            Err((ocr, error)) => {
-                                let message = format!(
-                                    "{}：{error:#}",
-                                    if ocr {
-                                        "方向识别失败，可手动修正或按当前方向合并"
-                                    } else {
-                                        "来源文件校验失败，请重新扫描"
-                                    }
-                                );
-                                if ocr {
-                                    file.orientation_error = Some(message.clone());
-                                    file.reviewed = false;
-                                } else {
-                                    file.error = Some(message.clone());
-                                }
-                                failures += 1;
-                                ("failed", Some(message))
-                            }
-                        };
-                        let pending = needs_review(file);
+                        let outcome = apply_analysis_result(file, result);
                         for group in &mut current.groups {
                             refresh_group(group)?;
                         }
@@ -1900,24 +2531,41 @@ fn execute_analysis(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<
                         if completed % 10 == 0 {
                             state.save_batch_plan(current)?;
                         }
-                        (status.to_owned(), error, pending)
+                        outcome
                     };
-                    state.update_job(&job.id, |j| {
-                        j.done = (j.done + 1).min(j.total);
-                        j.results.push(JobResult {
-                            voucher_id: source.id.clone(),
-                            folder: source.relative_path.clone(),
-                            status,
-                            output_path: None,
-                            pages: 1,
-                            error,
-                            needs_review,
-                        });
-                        j.results.sort_by_key(|r| positions[&r.voucher_id]);
+                    match classification {
+                        AnalysisOutcome::Changed(_) => summary.changed += 1,
+                        AnalysisOutcome::Unchanged => summary.unchanged += 1,
+                        AnalysisOutcome::Skipped => summary.skipped += 1,
+                        AnalysisOutcome::Failed => summary.failed += 1,
+                    }
+                    state.update_job(&job.id, |job| {
+                        job.done = (job.done + 1).min(job.total);
+                        job.orientation_summary = Some(summary);
+                        job.current = format!("方向识别：{}/{}", job.done, job.total);
+                        if let AnalysisOutcome::Changed(change) = classification {
+                            job.results.push(JobResult {
+                                voucher_id: source.id.clone(),
+                                folder: source.relative_path.clone(),
+                                status: "completed".into(),
+                                output_path: None,
+                                pages: 1,
+                                error: None,
+                                needs_review: true,
+                                rotation_change: Some(change),
+                            });
+                            job.results
+                                .sort_by_key(|result| positions[&result.voucher_id]);
+                        }
                     })?;
                 }
                 workers::Event::Panicked => {
-                    bail!("方向识别工作线程异常，已完成结果保留；可重试或按当前方向合并")
+                    summary.failed += 1;
+                    state.update_job(&job.id, |job| {
+                        job.done = (job.done + 1).min(job.total);
+                        job.orientation_summary = Some(summary);
+                    })?;
+                    bail!("方向识别工作线程异常，已完成结果保留；可重试或按当前方向合并");
                 }
                 workers::Event::Progress { .. } => {}
             }
@@ -1941,8 +2589,11 @@ fn execute_analysis(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<
         pdf::atomic_json(&report_dir.join("batch-plan.json"), current)?;
     }
     outcome?;
-    if failures > 0 {
-        bail!("{failures}个文件自动识别失败；可手动修正，或确认当前状态后合并，详情见文件列表");
+    if summary.failed > 0 {
+        bail!(
+            "{}个文件自动识别失败；当前角度未因失败改变，可检查来源或手动修正，详情保留在计划中",
+            summary.failed
+        );
     }
     Ok(())
 }
@@ -1967,6 +2618,10 @@ impl IntoResponse for ApiError {
 #[serde(deny_unknown_fields)]
 struct Initialize {
     root: String,
+    #[serde(default)]
+    level: u16,
+    #[serde(default = "default_rules")]
+    exclude_rules: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1984,6 +2639,9 @@ struct FileQuery {
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/initialize", post(api_initialize))
+        .route("/preview", post(api_preview))
+        .route("/scans", post(api_start_scan))
+        .route("/scans/{id}", get(api_scan_status))
         .route("/index/inspect", post(api_inspect))
         .route("/scan", post(api_scan))
         .route("/plans", get(api_plans))
@@ -1994,13 +2652,213 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/plans/{id}/files/{file_id}", get(api_file))
         .route("/plans/{id}/open-output", post(api_open_output))
         .route("/jobs", get(api_jobs))
+        .route("/jobs/{id}/output-conflict", post(conflicts::api_resolve))
 }
+pub fn start_scan(state: &Arc<AppState>, request: ScanRequest) -> Result<Job> {
+    validate_sort(&request.sort, false)?;
+    if request.root.trim().is_empty() {
+        bail!("请选择待处理文件夹");
+    }
+    let mut data = state.data.lock().unwrap();
+    if state.shutting_down.load(Ordering::Acquire) {
+        bail!("工作台正在退出，不能启动扫描");
+    }
+    if data.jobs.values().any(Job::active) {
+        bail!("已有任务运行，请等待或取消后重试");
+    }
+    let job = Job {
+        id: uuid::Uuid::new_v4().to_string(),
+        plan_id: uuid::Uuid::new_v4().to_string(),
+        kind: "batch_scan".into(),
+        status: "queued".into(),
+        created_at: now(),
+        updated_at: now(),
+        total: 0,
+        done: 0,
+        current: "等待扫描".into(),
+        error: None,
+        results: vec![],
+        request: GenerateRequest::default(),
+        threads: DEFAULT_THREADS,
+        output_conflict: None,
+        orientation_summary: None,
+    };
+    let report_dir = state.dir.join("reports").join(&job.id);
+    fs::create_dir_all(&report_dir)?;
+    pdf::atomic_json(&report_dir.join("scan-request.json"), &request)?;
+    let progress = ScanProgress {
+        id: job.id.clone(),
+        status: job.status.clone(),
+        plan_id: None,
+        phase: "enumerating".into(),
+        done: 0,
+        total: 0,
+        elapsed_ms: 0,
+        current_file: None,
+        timings: ScanTimings::default(),
+        counts: ScanCounts::default(),
+        logs: vec![],
+        error: None,
+    };
+    pdf::atomic_json(&report_dir.join("scan-progress.json"), &progress)?;
+    state.save_job(&job)?;
+    state
+        .scan_progress
+        .lock()
+        .unwrap()
+        .insert(job.id.clone(), progress);
+    let cancel = Arc::new(AtomicBool::new(false));
+    data.jobs.insert(job.id.clone(), job.clone());
+    data.cancels.insert(job.id.clone(), cancel.clone());
+    drop(data);
+    state.launch_job(job.clone(), cancel);
+    Ok(job)
+}
+pub fn scan_status(state: &AppState, id: &str) -> Result<ScanProgress> {
+    let job = state.job(id)?;
+    if job.kind != "batch_scan" {
+        bail!("该任务不是扫描任务");
+    }
+    let cached = state.scan_progress.lock().unwrap().get(id).cloned();
+    let mut progress = match cached {
+        Some(value) => value,
+        None => serde_json::from_slice(&fs::read(
+            state
+                .dir
+                .join("reports")
+                .join(id)
+                .join("scan-progress.json"),
+        )?)?,
+    };
+    progress.status = job.status.clone();
+    progress.error = job.error.clone();
+    progress.done = job.done;
+    progress.total = job.total;
+    if job.active() {
+        if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&job.created_at) {
+            progress.elapsed_ms = progress.elapsed_ms.max(
+                chrono::Utc::now()
+                    .signed_duration_since(started)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            );
+        }
+    }
+    if job.status == "completed" {
+        progress.plan_id = Some(job.plan_id);
+        progress.phase = "completed".into();
+    } else {
+        progress.plan_id = None;
+    }
+    Ok(progress)
+}
+fn execute_scan(state: &AppState, job: &Job, cancel: &AtomicBool) -> Result<()> {
+    let directory = state.dir.join("reports").join(&job.id);
+    let request = serde_json::from_slice(&fs::read(directory.join("scan-request.json"))?)?;
+    let result = scan_with_progress(request, Some(&state.dir), cancel, |status| {
+        let mut current = status.clone();
+        current.id = job.id.clone();
+        state
+            .scan_progress
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), current);
+        // Live progress is in memory; do not fsync a multi-KB job for every file.
+        let mut data = state.data.lock().unwrap();
+        let live = data.jobs.get_mut(&job.id).context("扫描任务不存在")?;
+        live.done = status.done;
+        live.total = status.total;
+        live.current = format!("扫描资料：{}/{}", status.done, status.total);
+        live.updated_at = now();
+        Ok(())
+    });
+    let outcome = result.and_then(|mut plan| {
+        plan.id = job.plan_id.clone();
+        let mut data = state.data.lock().unwrap();
+        if cancel.load(Ordering::Acquire) || state.shutting_down.load(Ordering::Acquire) {
+            bail!("扫描已取消，原有计划保留");
+        }
+        state.save_batch_plan(&plan)?;
+        data.batch_plans.insert(plan.id.clone(), plan);
+        Ok(())
+    });
+    // Persist the last counters even when cancellation races with publication.
+    let progress = scan_status(state, &job.id)?;
+    pdf::atomic_json(&directory.join("scan-progress.json"), &progress)?;
+    outcome
+}
+
+async fn api_preview(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ScanRequest>,
+) -> ApiResult<Json<Initialization>> {
+    Ok(Json(
+        tokio::task::spawn_blocking(move || preview(request, Some(&state.dir))).await??,
+    ))
+}
+async fn api_start_scan(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ScanRequest>,
+) -> ApiResult<Json<ScanProgress>> {
+    let job = start_scan(&state, request)?;
+    Ok(Json(scan_status(&state, &job.id)?))
+}
+async fn api_scan_status(
+    State(state): State<Arc<AppState>>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<Json<ScanProgress>> {
+    Ok(Json(scan_status(&state, &id)?))
+}
+
+pub fn resolve_output_conflict(
+    state: &AppState,
+    job_id: &str,
+    conflict_id: &str,
+    action: &str,
+    apply_to_batch: bool,
+) -> Result<Job> {
+    let action = match action {
+        "skip" => conflicts::Action::Skip,
+        "overwrite" => conflicts::Action::Overwrite,
+        _ => bail!("同名文件操作只能是skip或overwrite"),
+    };
+    let coordinator = state
+        .output_conflicts
+        .lock()
+        .unwrap()
+        .get(job_id)
+        .cloned()
+        .context("该任务当前没有等待处理的同名文件")?;
+    coordinator.resolve(
+        state,
+        job_id,
+        conflicts::ResolveRequest {
+            conflict_id: conflict_id.into(),
+            action,
+            apply_to_batch,
+        },
+    )
+}
+
 async fn api_initialize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Initialize>,
 ) -> ApiResult<Json<Initialization>> {
     Ok(Json(
-        tokio::task::spawn_blocking(move || initialize(&request.root, Some(&state.dir))).await??,
+        tokio::task::spawn_blocking(move || {
+            preview(
+                ScanRequest {
+                    root: request.root,
+                    level: request.level,
+                    exclude_rules: request.exclude_rules,
+                    index: None,
+                    sort: Sort::default(),
+                    output_names: vec![],
+                },
+                Some(&state.dir),
+            )
+        })
+        .await??,
     ))
 }
 async fn api_inspect(Json(request): Json<Inspect>) -> ApiResult<Json<rename_index::Inspection>> {
@@ -2023,18 +2881,25 @@ async fn api_scan(
     let plan = tokio::task::spawn_blocking(move || scan(request, Some(&dir))).await??;
     Ok(Json(state.insert_batch_plan(plan)?))
 }
-async fn api_plans(State(state): State<Arc<AppState>>) -> Json<Vec<Plan>> {
-    let mut plans: Vec<_> = state
-        .data
-        .lock()
-        .unwrap()
-        .batch_plans
-        .values()
-        .cloned()
-        .collect();
-    plans.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Json(plans)
+#[derive(Deserialize)]
+struct PlanQuery {
+    #[serde(default)]
+    summary: bool,
 }
+async fn api_plans(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PlanQuery>,
+) -> Json<Value> {
+    let data = state.data.lock().unwrap();
+    let mut plans: Vec<_> = data.batch_plans.values().collect();
+    plans.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    if query.summary {
+        Json(Value::Array(plans.iter().map(|p|json!({"id":p.id,"parent_plan_id":p.parent_plan_id,"created_at":p.created_at,"root":p.root,"output_dir":p.output_dir,"level":p.level,"group_count":p.groups.len(),"file_count":p.groups.iter().map(|g|g.files.len()).sum::<usize>(),"pages":p.groups.iter().map(|g|g.pages as u64).sum::<u64>(),"index":p.index,"orientation_workflow":p.orientation_workflow,"removed_file_count":p.removed_sources.len()})).collect()))
+    } else {
+        Json(serde_json::to_value(plans).expect("serializable saved batch plans"))
+    }
+}
+
 async fn api_plan(
     State(state): State<Arc<AppState>>,
     ApiPath(id): ApiPath<String>,
@@ -2239,6 +3104,7 @@ mod tests {
                 exclude_rules: String::new(),
                 index: None,
                 sort: Sort::default(),
+                output_names: vec![],
             },
             None,
         )
@@ -2259,5 +3125,103 @@ mod tests {
         let (optional, error) = changed.unwrap_err();
         assert!(!optional);
         assert!(error.to_string().contains("来源文件"));
+    }
+    #[test]
+    fn scanning_cancel_drains_workers_without_returning_a_partial_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for i in 0..20 {
+            image::RgbImage::from_pixel(20, 30, image::Rgb([255, 255, 255]))
+                .save(root.join(format!("{i}.png")))
+                .unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let mut done = 0;
+        let result = scan_with_progress(
+            ScanRequest {
+                root: root.to_str().unwrap().into(),
+                level: 0,
+                exclude_rules: String::new(),
+                index: None,
+                sort: Sort::default(),
+                output_names: vec![],
+            },
+            None,
+            &cancel,
+            |status| {
+                assert!(status.done >= done);
+                done = status.done;
+                if status.done > 0 {
+                    cancel.store(true, Ordering::Release);
+                }
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("取消"));
+        assert!(done > 0 && done < 20);
+        assert_eq!(fs::read_dir(root).unwrap().count(), 20);
+    }
+    #[test]
+    fn shutdown_at_publication_keeps_the_final_scan_counters_without_a_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("input");
+        fs::create_dir(&root).unwrap();
+        image::RgbImage::from_pixel(20, 30, image::Rgb([255, 255, 255]))
+            .save(root.join("page.png"))
+            .unwrap();
+        let state =
+            AppState::load(base.join("records"), &base.join("missing-model"), None).unwrap();
+        let job = Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            plan_id: uuid::Uuid::new_v4().to_string(),
+            kind: "batch_scan".into(),
+            status: "running".into(),
+            created_at: now(),
+            updated_at: now(),
+            total: 0,
+            done: 0,
+            current: String::new(),
+            error: None,
+            results: vec![],
+            request: GenerateRequest::default(),
+            threads: 4,
+            output_conflict: None,
+            orientation_summary: None,
+        };
+        let directory = state.dir.join("reports").join(&job.id);
+        fs::create_dir_all(&directory).unwrap();
+        pdf::atomic_json(
+            &directory.join("scan-request.json"),
+            &ScanRequest {
+                root: root.to_str().unwrap().into(),
+                level: 0,
+                exclude_rules: String::new(),
+                index: None,
+                sort: Sort::default(),
+                output_names: vec![],
+            },
+        )
+        .unwrap();
+        state
+            .data
+            .lock()
+            .unwrap()
+            .jobs
+            .insert(job.id.clone(), job.clone());
+        // Models a close between the shutdown guard and cancel-flag delivery.
+        state.shutting_down.store(true, Ordering::Release);
+        let result = execute_scan(&state, &job, &AtomicBool::new(false));
+        assert!(result.unwrap_err().to_string().contains("取消"));
+        let saved: ScanProgress =
+            serde_json::from_slice(&fs::read(directory.join("scan-progress.json")).unwrap())
+                .unwrap();
+        assert_eq!((saved.done, saved.total), (1, 1));
+        assert_eq!(saved.counts.hash_calls, 1);
+        assert!(state.data.lock().unwrap().batch_plans.is_empty());
+        assert_eq!(
+            fs::read_dir(state.dir.join("batch-plans")).unwrap().count(),
+            0
+        );
     }
 }

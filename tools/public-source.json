@@ -23,7 +23,7 @@
     "app/desktop/tauri.conf.json", "app/desktop/src/*.rs", "app/desktop/icons/*",
     "app/desktop/assets/index.html",
     "app/tools/cargo-local.sh", "app/tools/dev.sh", "app/tools/fetch-title-models.sh",
-    "app/tools/*.ps1", "app/tools/smoke-windows-desktop.mjs", "app/distribution/**/*",
+    "app/tools/*.ps1", "app/tools/smoke-windows-desktop.mjs", "app/tools/test-workbench-ui.cjs", "app/distribution/**/*",
     "app/models/README.md", "app/models/title-ocr/manifest.json",
     "app/models/title-ocr/LICENSE", "app/models/title-ocr/dictionary.txt",
     "app/models/title-ocr/det.yml", "app/models/title-ocr/rec.yml"

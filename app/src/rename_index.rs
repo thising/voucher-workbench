@@ -10,10 +10,10 @@ fn auto() -> String {
     "auto".into()
 }
 fn index_name() -> String {
-    "index".into()
+    "folder_index".into()
 }
 fn fallback() -> String {
-    "fallback".into()
+    "first".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -462,7 +462,9 @@ impl Index {
             key: Some(first.key.clone()),
             rows,
             value: Some(first.value.clone()),
-            message: if matches.len() > 1 {
+            message: if matches.len() > 1 && config.duplicates == "first" {
+                format!("匹配多行，已使用表内第一条（第 {} 行）", first.row)
+            } else if matches.len() > 1 {
                 "匹配多行，使用所选重复项策略".into()
             } else {
                 "已按索引重命名".into()

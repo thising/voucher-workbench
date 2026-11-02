@@ -164,6 +164,8 @@ fn synthetic_job(plan: &Plan, kind: &str, status: &str) -> Job {
         total: 2,
         done: 1,
         threads: 1,
+        output_conflict: None,
+        orientation_summary: None,
         current: "synthetic interrupted stage".into(),
         error: None,
         results: vec![],

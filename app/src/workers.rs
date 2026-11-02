@@ -21,6 +21,24 @@ pub(crate) fn run<T: Sync, W: Send, R: Send>(
     contexts: &mut [W],
     cancel: &AtomicBool,
     execute: impl Fn(&mut W, &T, &mut dyn FnMut(u32)) -> R + Sync,
+    on_event: impl FnMut(Event<R>) -> Result<()>,
+) -> Result<()> {
+    run_with_stop(
+        items,
+        contexts,
+        cancel,
+        |context, item, progress, _| execute(context, item, progress),
+        on_event,
+    )
+}
+
+/// A waiting worker must also observe coordinator/spawn failures, not only
+/// user cancellation, so every failure path can join all native workers.
+pub(crate) fn run_with_stop<T: Sync, W: Send, R: Send>(
+    items: &[T],
+    contexts: &mut [W],
+    cancel: &AtomicBool,
+    execute: impl Fn(&mut W, &T, &mut dyn FnMut(u32), &AtomicBool) -> R + Sync,
     mut on_event: impl FnMut(Event<R>) -> Result<()>,
 ) -> Result<()> {
     if items.is_empty() {
@@ -56,7 +74,7 @@ pub(crate) fn run<T: Sync, W: Send, R: Send>(
                         };
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                execute(context, &items[index], &mut progress)
+                                execute(context, &items[index], &mut progress, stop)
                             }));
                         match outcome {
                             Ok(result) => {
