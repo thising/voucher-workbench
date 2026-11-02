@@ -15,6 +15,14 @@ const expectedVersion=JSON.parse(await fs.readFile(path.join(path.dirname(exe),'
 const nativeScript = path.join(import.meta.dirname, 'windows-desktop-native.ps1');
 const report = {schema_version:1, synthetic_only:true, native_window:true, external_browser:false,
   version:expectedVersion, checks:[], artifacts:['desktop-window.png'], customer_windows10:'pending'};
+async function writeReport() {
+  const target=path.join(evidence,'desktop-smoke-report.json'),temporary=target+'.tmp';
+  await fs.writeFile(temporary,JSON.stringify(report,null,2));
+  await fs.rename(temporary,target);
+}
+async function checked(name) { report.checks.push(name);report.phase=name;await writeReport(); }
+function settle(promise) { return promise.then(value=>({ok:true,value}),error=>({ok:false,error})); }
+async function settledValue(promise) { const result=await promise;if(!result.ok)throw result.error;return result.value; }
 const owned = new Set();
 const childProcesses = new Set();
 let driver, session, driverPort;
@@ -96,8 +104,11 @@ async function dragFileHandle(from,to) {
 }
 async function probe(directory) { return JSON.parse(await fs.readFile(path.join(directory,'desktop-probe.json'),'utf8')); }
 async function native(pid,action,extra=[]) {
+  report.last_native_action={action,state:'requested'};await writeReport();
   const result=await exec('pwsh',['-NoProfile','-File',nativeScript,'-OwnedProcessId',String(pid),'-Action',action,...extra],{windowsHide:true,timeout:35000,maxBuffer:100000});
-  assert(JSON.parse(result.stdout).controlled,'Owned native control did not confirm its action.');
+  const control=JSON.parse(result.stdout);
+  assert(control.controlled,'Owned native control did not confirm its action.');
+  report.last_native_action={action,state:'controlled',save_target_verified:control.save_target_verified,filename_controls:control.filename_controls};await writeReport();
 }
 function start(args) {
   const child=spawn(exe,args,{stdio:['ignore','pipe','pipe'],windowsHide:false});
@@ -140,13 +151,14 @@ async function screenshot(name) {
   await fs.writeFile(path.join(evidence,name),Buffer.from(png,'base64'));
 }
 async function nativeSave(pid,command,args,destination) {
-  const pending=asyncJs(`const done=arguments[arguments.length-1];window.__TAURI__.core.invoke(arguments[0],arguments[1]).then(value=>done({ok:true,value}),()=>done({ok:false}));`,command,args);
+  const pending=settle(asyncJs(`const done=arguments[arguments.length-1];window.__TAURI__.core.invoke(arguments[0],arguments[1]).then(value=>done({ok:true,value}),()=>done({ok:false}));`,command,args));
   await native(pid,'save',['-SavePath',destination,'-ExpectedText','另存处理结果']);
-  return pending;
+  return settledValue(pending);
 }
 
 await fs.mkdir(evidence,{recursive:true});
 await fs.mkdir(work,{recursive:true});
+report.passed=false;report.phase='starting';await writeReport();
 try {
   driverPort=await freePort(); let nativePort=await freePort();while(nativePort===driverPort)nativePort=await freePort();
   driver=spawn(path.join(tools,'bin/tauri-driver.exe'),['--port',String(driverPort),'--native-port',String(nativePort),'--native-driver',path.join(tools,'edge/msedgedriver.exe')],{stdio:'ignore',windowsHide:true});
@@ -156,22 +168,22 @@ try {
   assert(generated.synthetic,'Only a synthetic fixture may be used.');
   const state=path.join(work,'处理记录 含空格'); const probes=path.join(work,'原生窗口探针');
   const pid=await open(state,probes);
-  report.checks.push('shipped-gui-exe-chinese-space-path-native-webview2');
+  await checked('shipped-gui-exe-chinese-space-path-native-webview2');
 
   // Exact remote origin capability and native pickers, with cancellation through
   // the real Windows file dialogs owned by this process.
   for(const command of ['select_folder','select_index_file']) {
-    const pending=asyncJs(`const done=arguments[arguments.length-1];window.__TAURI__.core.invoke(arguments[0],{}).then(value=>done({ok:true,value}),()=>done({ok:false}));`,command);
-    await native(pid,'cancel'); const result=await pending;
+    const pending=settle(asyncJs(`const done=arguments[arguments.length-1];window.__TAURI__.core.invoke(arguments[0],{}).then(value=>done({ok:true,value}),()=>done({ok:false}));`,command));
+    await native(pid,'cancel'); const result=await settledValue(pending);
     assert(result.ok && result.value===null,'A real native picker did not cancel cleanly.');
   }
-  report.checks.push('real-native-folder-and-index-picker-cancellation');
+  await checked('real-native-folder-and-index-picker-cancellation');
   const origin=await js(`return location.origin;`);
   await js(`location.href='https://example.invalid/blocked-navigation';`);
   await wait(300); assert.equal(await js(`return location.origin;`),origin,'Remote navigation was not blocked.');
   assert.equal(await js(`window.open('https://example.invalid/blocked-popup');return true;`),true);
   assert.equal((await wd('GET',`/session/${session}/window/handles`)).length,1,'Unexpected additional desktop window.');
-  report.checks.push('remote-navigation-and-new-window-blocked');
+  await checked('remote-navigation-and-new-window-blocked');
 
   await input('#root-path',path.join(fixtures,'合成分项'),'change');
   await until(()=>js(`return !document.querySelector('#merge-level').disabled && document.querySelector('#merge-level').options.length>=2;`),'actual folder levels');
@@ -186,7 +198,7 @@ try {
   const scanProgress=await api(`/batch/scans/${scanJob.id}`);
   assert.equal(scanProgress.counts.image_files,4);assert.equal(scanProgress.counts.pdf_files,2);
   assert.equal(scanProgress.counts.source_errors,0);
-  report.checks.push('real-ui-automatic-folder-initialization-asynchronous-scan-and-three-pane');
+  await checked('real-ui-automatic-folder-initialization-asynchronous-scan-and-three-pane');
   await js(`Array.from(document.querySelectorAll('#file-list .file-select')).find(n=>n.textContent.includes('.pdf')).click();`);
   await until(()=>js(`const c=document.querySelector('#preview-surface canvas');return !!c && c.width>0 && c.height>0;`),'offline PDF.js renders native PDF',60000);
   await input('#source-page-number',2,'change');
@@ -195,18 +207,18 @@ try {
   assert.equal(await js(`return document.querySelector('#rotation-scope').value;`),'page');
   assert.equal(await js(`return document.querySelector('#reviewed-file')===null;`),true);
   await screenshot('desktop-window.png');
-  report.checks.push('offline-pdfjs-real-canvas-and-per-page-manual-rotation');
+  await checked('offline-pdfjs-real-canvas-and-per-page-manual-rotation');
   const viewport=await js(`const area=document.querySelector('.work-area'),pane=document.querySelector('.preview-pane').getBoundingClientRect(),zoom=document.querySelector('#zoom-in').getBoundingClientRect();return {width:innerWidth,height:innerHeight,work_area_width:area.clientWidth,work_area_scroll_width:area.scrollWidth,preview_right:pane.right,zoom_right:zoom.right};`);
   assert(viewport.width>=1000,'The native host did not provide the supported minimum viewport.');
   assert(viewport.work_area_scroll_width<=viewport.work_area_width+1,'The three panes overflow the native viewport.');
   assert(viewport.preview_right<=viewport.width && viewport.zoom_right<=viewport.preview_right,'Native preview controls are clipped.');
   report.viewport=viewport;
-  report.checks.push('real-ui-three-pane-and-preview-controls-visible-at-native-viewport');
+  await checked('real-ui-three-pane-and-preview-controls-visible-at-native-viewport');
 
   // Exercise the native pointer gesture, then the existing move/top buttons.
   await dragFileHandle(2,0);
   await until(()=>js(`return document.querySelector('#file-list .file-select').textContent.includes('.pdf') && document.querySelector('#edit-state').textContent==='调整已保存';`),'native pointer sorting saved');
-  report.checks.push('native-webdriver-pointer-handle-reorder-and-autosave');
+  await checked('native-webdriver-pointer-handle-reorder-and-autosave');
   await js(`document.querySelectorAll('#file-list .file-moves')[0].querySelectorAll('button')[2].click();`);
   await until(()=>js(`return !document.querySelector('#file-list .file-select').textContent.includes('.pdf') && document.querySelector('#edit-state').textContent==='调整已保存';`),'move-down button saved');
   await js(`document.querySelectorAll('#file-list .to-top')[1].click();`);
@@ -227,7 +239,7 @@ try {
   assert.equal(completed.results.reduce((n,r)=>n+r.pages,0),8);
   const delivered=completed.results.find(r=>path.basename(r.output_path||'')==='桌面合成成品.pdf');assert(delivered,'UI rename did not reach generated output.');
   const outputBytes=await fs.readFile(delivered.output_path);assert(outputBytes.subarray(0,4).equals(Buffer.from('%PDF')));
-  report.checks.push('real-ui-manual-order-rename-threads-merge-without-review-gate');
+  await checked('real-ui-manual-order-rename-threads-merge-without-review-gate');
 
   const savedPDF=path.join(work,'原生另存 副本.pdf');
   const copy=await nativeSave(pid,'save_job_output',{jobId:completed.id,groupId:delivered.voucher_id},savedPDF);
@@ -239,7 +251,7 @@ try {
   assert(saved.ok && saved.value.saved);
   assert.equal(normalizedWindowsPath(saved.value.path),normalizedWindowsPath(savedReport),'Native report save selected an unexpected destination.');
   assert.equal(JSON.parse(await fs.readFile(savedReport,'utf8')).job.id,completed.id);
-  report.checks.push('real-native-save-pdf-and-report-verified-bytes');
+  await checked('real-native-save-pdf-and-report-verified-bytes');
 
   // Existing destinations are runtime decisions, including outputs produced
   // by this tool. Exercise the real controls rather than auto-answering APIs.
@@ -289,14 +301,14 @@ try {
   }
   await noArchives(path.dirname(completed.results[0].output_path));
   await noArchives(path.join(state,'outputs'));
-  report.checks.push('real-ui-runtime-output-conflict-skip-direct-overwrite-batch-scope-cancel-without-backups');
+  await checked('real-ui-runtime-output-conflict-skip-direct-overwrite-batch-scope-cancel-without-backups');
 
   await native(pid,'minimize');
   const before=(await probe(probes)).activations;
   await ended(start(['--state-dir',state]));
   await until(async()=>{const p=await probe(probes);return p.activations>before && p.window_visible && p.window_minimized===false;},'duplicate activation restores existing window');
   assert.equal((await probe(probes)).pid,pid);
-  report.checks.push('duplicate-launch-restores-original-window-and-exits-zero');
+  await checked('duplicate-launch-restores-original-window-and-exits-zero');
 
   // A bounded long OCR task allows proving activation/close semantics against
   // real work; each image is a copy of our generated bitmap, never customer data.
@@ -320,17 +332,17 @@ try {
   await exited(pid);await endSession();
   const stopped=JSON.parse(await fs.readFile(path.join(state,'jobs',`${busyJob.id}.json`),'utf8'));
   assert.equal(stopped.status,'cancelled','Safe close did not persist a cancelled task.');
-  report.checks.push('real-ocr-task-activation-progress-continue-and-safe-close');
+  await checked('real-ocr-task-activation-progress-continue-and-safe-close');
 
   let restarted=await open(state,probes);
   assert((await api('/jobs')).some(j=>j.id===completed.id),'Prior output history was lost.');
   assert.equal((await api('/batch/preferences')).merge_threads,3,'Batch thread preference was lost.');
   await native(restarted,'close');await exited(restarted);await endSession();
-  report.checks.push('normal-restart-history-results-and-thread-preferences');
+  await checked('normal-restart-history-results-and-thread-preferences');
   restarted=await open(state,probes);
   process.kill(restarted,'SIGKILL');await exited(restarted);await endSession();
   restarted=await open(state,probes);await native(restarted,'close');await exited(restarted);await endSession();
-  report.checks.push('abnormal-exit-restart-without-lock-file-deletion');
+  await checked('abnormal-exit-restart-without-lock-file-deletion');
 
   // Startup races require no WebDriver session; the actual WebView still emits
   // only bounded readiness/visibility evidence, with no discovery URL or token.
@@ -344,7 +356,7 @@ try {
     owned.add(ready.pid);const secondary=one.pid===ready.pid?two:one;
     await ended(secondary);await native(ready.pid,'close');await exited(ready.pid);
     const primary=one.pid===ready.pid?one:two;await ended(primary);
-    report.checks.push(name+'-one-real-window');
+    await checked(name+'-one-real-window');
   }
 
   // A legacy HTTP instance uses protocol 1. Desktop protocol 2 must explain the
@@ -355,24 +367,25 @@ try {
   const blocked=start(['--state-dir',legacyState]);
   await native(blocked.pid,'error',['-ExpectedText','不同界面版本']);await ended(blocked,1);
   assert(legacy.exitCode===null,'The desktop ended the legacy process.');legacy.kill();await until(()=>legacy.exitCode!==null||legacy.signalCode!==null,'owned legacy cleanup');childProcesses.delete(legacy);
-  report.checks.push('legacy-protocol-instance-explicit-error-without-activation');
+  await checked('legacy-protocol-instance-explicit-error-without-activation');
   const missing=start(['--state-dir',path.join(work,'missing-webview-state'),'--test-force-missing-webview2']);
   await native(missing.pid,'error',['-ExpectedText','MicrosoftEdgeWebView2RuntimeInstallerX64.exe']);await ended(missing,1);
-  report.checks.push('missing-webview2-same-native-error-path-and-instructions');
+  await checked('missing-webview2-same-native-error-path-and-instructions');
   const invalid=path.join(work,'state-is-a-file');await fs.writeFile(invalid,'synthetic');
   const failed=start(['--state-dir',invalid]);
   await native(failed.pid,'error',['-ExpectedText','无法启动']);await ended(failed,1);
-  report.checks.push('state-directory-failure-visible-native-dialog');
+  await checked('state-directory-failure-visible-native-dialog');
   report.passed=true;
 } catch(error) {
   report.passed=false;
   report.failure=String(error.message).replace(/#token=[^\s"<>]+/gi,'#token=[redacted]');
+  await writeReport();
   throw new Error(report.failure);
 } finally {
   await endSession();
   for(const child of childProcesses) if(child.exitCode===null && child.signalCode===null) child.kill();
   for(const pid of owned) {try{process.kill(pid,'SIGKILL');}catch{}}
   driver?.kill();
-  await fs.writeFile(path.join(evidence,'desktop-smoke-report.json'),JSON.stringify(report,null,2));
+  await writeReport();
 }
 console.log(`Native desktop verification passed (${report.checks.length} checks, synthetic inputs only).`);

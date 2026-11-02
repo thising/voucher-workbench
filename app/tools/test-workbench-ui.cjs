@@ -272,6 +272,12 @@ const guard=setTimeout(()=>{console.error('UI state regression timed out');proce
  assert.deepEqual(JSON.parse(JSON.stringify(requests[0].capabilities.alwaysMatch['tauri:options'].args)),['--state-dir=C:\\合成 资料\\处理记录','--test-probe-dir=C:\\合成 探针','--startup-delay-ms=20']);
  const diagnostic=driverContext.safeDriverDiagnostic('version mismatch 152; http://127.0.0.1:1234/#token=synthetic-secret #token=separate-secret '+ 'x'.repeat(5000));
  assert(diagnostic.includes('version mismatch 152'));assert(!diagnostic.includes('synthetic-secret')&&!diagnostic.includes('separate-secret')&&!diagnostic.includes('127.0.0.1'));assert(diagnostic.length<=1600);
+ vm.runInContext(driverSource.slice(driverSource.indexOf('function settle('),driverSource.indexOf('const owned =')),driverContext);
+ const pendingError=new Error('synthetic native controller failure');
+ const earlyFailure=driverContext.settle(Promise.reject(pendingError));
+ await new Promise(resolve=>setImmediate(resolve));
+ const settledFailure=await earlyFailure;assert.equal(settledFailure.ok,false);assert.equal(settledFailure.error,pendingError);
+ await assert.rejects(driverContext.settledValue(Promise.resolve(settledFailure)),/synthetic native controller failure/);
  assert.equal(driverContext.normalizedWindowsPath("\\\\?\\C:\\合成 资料\\save.PDF"),driverContext.normalizedWindowsPath("c:\\合成 资料\\save.pdf"));
  assert.equal(driverContext.normalizedWindowsPath("\\\\?\\UNC\\SERVER\\share\\file.pdf"),driverContext.normalizedWindowsPath("\\\\server\\share\\file.pdf"));
 

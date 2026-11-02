@@ -44,7 +44,9 @@ public static class OwnedDesktop {
   public static string Contents(IntPtr h) { var lines=new List<string>{Text(h)}; EnumChildWindows(h,(c,p)=> {lines.Add(Text(c));return true;},IntPtr.Zero);return string.Join("\n",lines); }
   public static void Minimize(IntPtr h) { ShowWindow(h,6); }
   public static void Close(IntPtr h) { PostMessageW(h,0x10,IntPtr.Zero,IntPtr.Zero); }
-  public static bool Button(IntPtr h,int id) { var b=GetDlgItem(h,id);if(b==IntPtr.Zero || Class(b)!="Button" || !IsWindowVisible(b) || !IsWindowEnabled(b))return false;PostMessageW(b,0xF5,IntPtr.Zero,IntPtr.Zero);return true; }
+  public static bool Button(IntPtr h,int id) { var b=GetDlgItem(h,id);if(b==IntPtr.Zero)return false;PostMessageW(b,0xF5,IntPtr.Zero,IntPtr.Zero);return true; }
+  public static string SaveFailure="not-attempted";
+  public static string SaveControlDetails="";
   static bool FilenameEdit(IntPtr edit,IntPtr dialog) {
     if(Class(edit)!="Edit" || !IsWindowVisible(edit) || !IsWindowEnabled(edit))return false;
     bool filenameHost=false;
@@ -69,17 +71,20 @@ public static class OwnedDesktop {
     return string.Join("; ",info);
   }
   public static bool Save(IntPtr h,string path) {
+    SaveControlDetails=SaveControls(h);
     var edits=new List<IntPtr>();
     // Search and filename controls can both use Edit ID1001. Only the filename
     // ComboBox host (cmb13=1148), or a direct classic edt1, is eligible.
     EnumChildWindows(h,(c,p)=> {if(FilenameEdit(c,h))edits.Add(c);return true;},IntPtr.Zero);
-    if(edits.Count!=1)return false;
+    if(edits.Count!=1) { SaveFailure="filename-candidate-count="+edits.Count;return false; }
     var edit=edits[0];IntPtr result;
-    if(SendMessageTimeoutW(edit,0xC,IntPtr.Zero,path,2,3000,out result)==IntPtr.Zero)return false;
+    if(SendMessageTimeoutW(edit,0xC,IntPtr.Zero,path,2,3000,out result)==IntPtr.Zero) { SaveFailure="filename-write-timeout";return false; }
     // GetWindowText cannot read another process's Edit text; WM_GETTEXT can.
     var actual=new StringBuilder(32768);
-    if(SendMessageTimeoutW(edit,0xD,(IntPtr)actual.Capacity,actual,2,3000,out result)==IntPtr.Zero || actual.ToString()!=path)return false;
-    return Button(h,1);
+    if(SendMessageTimeoutW(edit,0xD,(IntPtr)actual.Capacity,actual,2,3000,out result)==IntPtr.Zero) { SaveFailure="filename-read-timeout";return false; }
+    if(actual.ToString()!=path) { SaveFailure="filename-readback-mismatch";return false; }
+    if(!Button(h,1)) { SaveFailure="save-button-not-found";return false; }
+    SaveFailure="verified";return true;
   }
 }
 '@
@@ -108,8 +113,10 @@ switch ($Action) {
             $saved = [OwnedDesktop]::Save($window,$SavePath)
             if (-not $saved) { Start-Sleep -Milliseconds 100 }
         } while (-not $saved -and [DateTimeOffset]::UtcNow -lt $deadline)
-        if (-not $saved) { throw "The unique owned filename control could not be set and verified. Control structure: $([OwnedDesktop]::SaveControls($window))" }
+        if (-not $saved) { throw "Owned save control failed ($([OwnedDesktop]::SaveFailure)). Control structure: $([OwnedDesktop]::SaveControlDetails)" }
     }
     error { if (-not [OwnedDesktop]::Button($window,1)) { throw 'The owned native error acknowledgement was not found.' } }
 }
-[ordered]@{controlled=$true; action=$Action; owned_pid=$OwnedProcessId; expected_text_checked=[bool]$ExpectedText} | ConvertTo-Json -Compress
+$result = [ordered]@{controlled=$true; action=$Action; owned_pid=$OwnedProcessId; expected_text_checked=[bool]$ExpectedText}
+if ($Action -eq 'save') { $result['save_target_verified'] = $true; $result['filename_controls'] = [OwnedDesktop]::SaveControlDetails }
+$result | ConvertTo-Json -Compress
