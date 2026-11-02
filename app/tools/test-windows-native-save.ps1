@@ -41,6 +41,8 @@ public static class OwnedTaskDialogProbe {
     [DllImport("kernel32.dll")] static extern bool DeactivateActCtx(uint flags, UIntPtr cookie);
     [DllImport("kernel32.dll")] static extern void ReleaseActCtx(IntPtr context);
     [DllImport("comctl32.dll", CharSet=CharSet.Unicode)] static extern int TaskDialog(IntPtr owner, IntPtr instance, string title, string heading, string content, uint buttons, IntPtr icon, out int button);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int MessageBoxW(IntPtr owner, string content, string title, uint flags);
+    public static void ShowError(string content) { MessageBoxW(IntPtr.Zero, content, "PDF native startup error probe", 0x10010); }
     public static int Show(string manifest, string content) {
         Activation context = new Activation(); context.Size = Marshal.SizeOf(typeof(Activation)); context.Source = manifest;
         IntPtr handle = CreateActCtxW(ref context);
@@ -55,9 +57,14 @@ public static class OwnedTaskDialogProbe {
 }
 '@
 $choiceFixture = @'
-param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][int]$ExpectedButton)
+param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][int]$ExpectedButton, [ValidateSet('task','error')][string]$Mode = 'task')
 $ErrorActionPreference = 'Stop'
 Add-Type -Path ([IO.Path]::Combine($Root, 'TaskProbe.cs'))
+if ($Mode -eq 'error') {
+    [OwnedTaskDialogProbe]::ShowError($Text)
+    [IO.File]::WriteAllText([IO.Path]::Combine($Root, 'choice.txt'), 'error-dismissed')
+    exit 0
+}
 $button = [OwnedTaskDialogProbe]::Show([IO.Path]::Combine($Root, 'task.manifest'), $Text)
 if ($button -ne $ExpectedButton) { throw 'Owned task dialog chose a different button.' }
 [IO.File]::WriteAllText([IO.Path]::Combine($Root, 'choice.txt'), [string]$button)
@@ -79,18 +86,19 @@ try {
     if (-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0) { throw 'Owned save fixture did not exit successfully.' }
     if ([IO.File]::ReadAllText($expected) -cne 'synthetic-native-save-probe') { throw 'Owned save destination was not written correctly.' }
     $message = '任务或文件保存仍在进行'
-    foreach ($choice in @(@{action='cancel';button=2},@{action='accept';button=1})) {
+    foreach ($choice in @(@{action='cancel';button=2;mode='task'},@{action='accept';button=1;mode='task'},@{action='error';button=0;mode='error'})) {
         $choiceStart = [Diagnostics.ProcessStartInfo]::new()
         $choiceStart.FileName = $launch.FileName
         $choiceStart.UseShellExecute = $false
         $choiceStart.CreateNoWindow = $true
-        foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-Sta','-File',$choiceFixturePath,'-Root',$work,'-Text',$message,'-ExpectedButton',[string]$choice.button)) { $choiceStart.ArgumentList.Add($argument) }
+        foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-Sta','-File',$choiceFixturePath,'-Root',$work,'-Text',$message,'-ExpectedButton',[string]$choice.button,'-Mode',$choice.mode)) { $choiceStart.ArgumentList.Add($argument) }
         $choiceProcess = [Diagnostics.Process]::Start($choiceStart)
         try {
             $choiceControl = & (Join-Path $PSScriptRoot 'windows-desktop-native.ps1') -OwnedProcessId $choiceProcess.Id -Action $choice.action -ExpectedText $message -TaskButtonId $choice.button | ConvertFrom-Json
             if (-not $choiceControl.controlled -or -not $choiceControl.expected_text_checked) { throw 'Owned task-dialog text and choice were not verified.' }
             if (-not $choiceProcess.WaitForExit(15000) -or $choiceProcess.ExitCode -ne 0) { throw 'Owned task-dialog fixture failed.' }
-            if ([IO.File]::ReadAllText((Join-Path $work 'choice.txt')) -cne [string]$choice.button) { throw 'Owned task-dialog result mismatch.' }
+            $expectedChoice = if ($choice.mode -eq 'error') { 'error-dismissed' } else { [string]$choice.button }
+            if ([IO.File]::ReadAllText((Join-Path $work 'choice.txt')) -cne $expectedChoice) { throw 'Owned native-dialog result mismatch.' }
         } finally {
             if (-not $choiceProcess.HasExited) { $choiceProcess.Kill(); $null = $choiceProcess.WaitForExit(10000) }
             $choiceProcess.Dispose()

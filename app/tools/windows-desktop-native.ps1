@@ -14,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 if ($TaskButtonId -ne 0 -and ($Action -notin @('accept','cancel') -or -not $ExpectedText)) {
     throw 'TaskDialog commands require a declared choice and an exact expected explanation.'
 }
+if ($Action -eq 'error' -and -not $ExpectedText) { throw 'Startup error dismissal requires its expected explanation.' }
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -176,7 +177,13 @@ switch ($Action) {
             if (-not $saveControlResult.controlled -or -not $saveControlResult.save_target_verified) { throw 'Owned UI Automation did not verify the filename target.' }
         } finally { if (-not $uiProcess.HasExited) { $uiProcess.Kill() }; $uiProcess.Dispose() }
     }
-    error { if (-not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) { throw 'The owned native error acknowledgement was not found.' } }
+    error {
+        # Windows startup errors use MB_OK and ignore the dialog return value.
+        # Closing its title-bar X is also a real user dismissal after text proof.
+        if (-not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) {
+            [OwnedDesktop]::Close($window)
+        }
+    }
 }
 $result = [ordered]@{controlled=$true; action=$Action; owned_pid=$OwnedProcessId; expected_text_checked=[bool]$ExpectedText}
 if ($Action -in @('accept','cancel')) { $result['button_source'] = $buttonSource }

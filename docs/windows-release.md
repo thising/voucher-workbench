@@ -87,7 +87,9 @@ NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter
 
 [第十三轮CI #28](https://github.com/thising/voucher-workbench/actions/runs/41515737828)，源码 `05fdc802289c938658e09b0809ab1217ac5988bf`，快速TaskDialog预检未找到通用UIA按钮候选。改为调用[微软TaskDialog专用点击消息](https://learn.microsoft.com/en-us/windows/win32/controls/tdm-click-button)，只对调用方显式声明、PID/根窗口/可见启用和期望正文已验证的TaskDialog发送1126。普通预检按钮1/2；[锁定rfd0.17.2](https://raw.githubusercontent.com/PolyMeilex/rfd/0.17.2/src/backend/win_cid/message_dialog.rs)自定义确认/取消固定1000/1001。保留任务对话框真实返回值/任务继续/取消持久化等核验；移除不适用的UIA按钮假设，正文助手恢复已验证的只读实现，保存控制器不变。
 
-**本轮构件状态：准备第十四轮快速预检及完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
+[第十四轮CI #29](https://github.com/thising/voucher-workbench/actions/runs/41516974844)，源码 `b767c0a8593045f4198b31d506d4447e82e0cb61`，全部快速预检/检查/构建/兼容/5轮复跑及16项原生业务通过，新增OCR继续/安全停止、正常异常重启和两种启动竞态均已验证。旧协议错误的中文提示匹配通过，失败在OK按钮物理句柄查找。源码确认Windows启动错误为MB_OK且忽略返回值；测试在提示已核验后支持真实的标题栏关闭操作，并仍等待错误进程退出码1、检查旧服务未被结束。快速预检增加同类MessageBoxW错误窗口的显示与关闭，未改变用户程序。
+
+**本轮构件状态：准备第十五轮完整CI；完整安装验收、附件/SHA256尚未完成。**
 
 CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 
