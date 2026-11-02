@@ -1,6 +1,22 @@
 # 本地 API 契约（实现接口）
 
-唯一业务规则见 `../openspec/specs/voucher-pdf/spec.md`。服务只监听 127.0.0.1；首次打开的 URL fragment 含 token，前端存 sessionStorage 后移除 fragment。所有 /api 请求带 `X-Session-Token`，拒绝异源请求。请求/响应 JSON；错误 `{error: "中文原因"}`。文件缩略图/原件也需用 fetch + blob（不得 token 放 URL）。静态文件内嵌，离线无 CDN。
+凭证规则见 `../openspec/specs/voucher-pdf/spec.md`，通用规则见 `../openspec/specs/generic-pdf/spec.md`。服务只监听 127.0.0.1；首次打开的 URL fragment 含 token，前端存 sessionStorage 后移除 fragment。所有 /api 请求带 `X-Session-Token`，拒绝异源请求。请求/响应 JSON；错误 `{error: "中文原因"}`。文件缩略图/原件也需用 fetch + blob（不得 token 放 URL）。静态文件内嵌，离线无 CDN。`/`为凭证界面，`/generic`为通用界面；同源页面共享当前标签页sessionStorage。
+
+## 通用PDF模式（0.5.1）
+
+- POST `/api/generic/scan` body `{root,output_dir?:string|null,level?:0..32,exclude_paths?:string[],exclude_globs?:string[],sort?:"natural_asc"|"natural_desc"|"modified_asc"|"modified_desc"}` → GenericPlan。缺省level=0、自然升序；缺省glob为`["**/indexImg/**"]`，显式`[]`取消预设；只扫描PDF。
+- GET `/api/generic/plans` → GenericPlan[]（新到旧）；GET `/api/generic/plans/{id}` → 注册的完整计划。
+- POST `/api/generic/plans/{id}/order` body `{groups:[{group_id,file_ids:string[],output_name?:string}]}` → 新GenericPlan。给出的每组必须完整排列该组全部文件且恰好一次；拒绝跨组、重复、遗漏和未知ID。新plan.id，parent_plan_id指向原计划；组/文件ID保持，sort标记manual；保留旧计划与任务快照。
+- POST `/api/generic/plans/{id}/generate` body `{group_ids?:string[]}` → Job，kind=generic_generate。未传为所有组；包含空组/错误组会拒绝启动，可显式只选有效组。与凭证模式共用单活动任务和线程设置。
+- GET `/api/generic/jobs` → 通用Job[]。GET/POST `/api/jobs/{id}`、cancel、retry、report及outputs沿用公共接口，按job.kind分派。Job.request.voucher_ids在通用模式保存组ID；旧字段保留以兼容已有任务。
+- GET `/api/generic/plans/{id}/files/{file_id}` → 重新核验指纹的PDF原件；未知或非本计划ID拒绝。
+- POST `/api/generic/plans/{id}/open-output` → `{ok:true}`，只打开注册计划中经过校验的输出目录。
+
+GenericPlan字段：`{schema_version:1,mode:"generic_pdf",id,parent_plan_id,created_at,root,output_dir,level,sort,exclude_paths,exclude_globs,groups,issues,exclusions,ignored_files:数量,empty_directories:string[]}`。groups：`{id,relative_path,name,shallow,output_name,output_path,files,pages,issues,empty}`；files：`{id,name,relative_path,bytes,modified_ms,sha256,pages,error}`。issues：`{severity,code,message,path:null|string}`；exclusions：`{rule,kind:"path"|"glob"|"output"|"state",matches:string[]}`。命中目录列一个目录项，不虚报未遍历后代数量。
+
+通用计划持久保存在`state-dir/generic-plans`，任务启动时在reports保存固定计划快照，报告包含分组、范围、排除规则、逐源首末页和SHA256。输出记录带mode=generic_pdf，不采用凭证或外来记录。新顺序/名称不改变旧报告；若成品已更新，旧任务不得下载新成品冒充旧版本。路径名保持原Unicode规范形，比较大小写折叠，不做NFC转换。
+
+## 凭证与公共接口
 
 - GET `/api/status` → `{version, orientation_model, orientation_disclaimer_version, model_ready, model_error, running_jobs}`；方向结果仅在 model 与 orientation_model 精确相等时为当前版本。
 - GET `/api/settings` → `{threads:整数}`；默认1，返回当前全局并行设置。
@@ -32,7 +48,7 @@ Plan.requested_root 保留原先单分项/批次选择，换表重扫使用此�
 
 Plan.orientation_workflow为`{enabled,consent_version,consented_at,analysis_completed}`，manifest同步保存当次值。缺字段旧计划默认enabled、无同意记录且分析阶段未确认完成，保留旧图片证据和人工确认；不会代用户接受新免责声明。启用后所有图片均需要人工确认，算法自身Orientation.needs_review仅代表模型未决。取消/重启中断不能冒充已完成分析。
 
-Job 字段：`{id,plan_id,kind:"analyze"|"generate",status:"queued"|"running"|"completed"|"completed_with_errors"|"cancelled"|"interrupted"|"failed",threads:整数1..10,created_at,updated_at,total,done,current,error:null|string,results:[]}`。
+Job 字段：`{id,plan_id,kind:"analyze"|"generate"|"generic_generate",status:"queued"|"running"|"completed"|"completed_with_errors"|"cancelled"|"interrupted"|"failed",threads:整数1..10,created_at,updated_at,total,done,current,error:null|string,results:[]}`。
 结果字段：`{voucher_id,folder,status:"completed"|"skipped"|"failed",output_path:null|string,pages,error:null|string,needs_review:boolean}`。
 服务重启将残留运行任务标为 interrupted，可以重试；方向选择、计划、结果持久保存在启动参数指定 state-dir。
 

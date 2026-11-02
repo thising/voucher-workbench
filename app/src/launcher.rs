@@ -1,7 +1,56 @@
 //! Resolve installed resources without relying on the shell's working directory.
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+#[derive(Default)]
+pub struct StartupOptions {
+    pub browser_command: Option<PathBuf>,
+    pub startup_delay_ms: u64,
+}
+
+/// Only the original server retains this opener and its authenticated URL.
+/// The optional command is an explicit automation launcher, never an IPC input.
+pub fn browser_opener(command: Option<PathBuf>) -> crate::instance::OpenBrowser {
+    std::sync::Arc::new(move |url| {
+        if let Some(command) = &command {
+            if !command.is_absolute() || !command.is_file() {
+                bail!("指定的浏览器启动器不存在或不是绝对路径，请检查 --browser-command");
+            }
+            let mut child = std::process::Command::new(command)
+                .arg(url)
+                .env("VOUCHER_BROWSER_OWNER_PID", std::process::id().to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("无法运行指定的浏览器启动器，请检查文件权限")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            let status = loop {
+                if let Some(status) = child.try_wait().context("无法读取浏览器启动器状态")?
+                {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // This explicit automation launcher is our own child, never
+                    // an existing workbench or an independently running browser.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("浏览器启动器超时，请检查 --browser-command 指定的快速启动程序后重试");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            if !status.success() {
+                bail!("浏览器启动器返回失败，请检查浏览器设置后重新双击启动入口");
+            }
+        } else {
+            webbrowser::open(url).map_err(|_| {
+                anyhow::anyhow!("系统默认浏览器启动调用失败，请检查HTTP/HTTPS的默认应用设置")
+            })?;
+        }
+        Ok(())
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct LaunchPaths {

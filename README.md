@@ -1,14 +1,25 @@
 # 凭证 PDF 工作台
 
-当前版本是 **Rust 本地服务＋浏览器界面**。按明细账把每个凭证文件夹整理成一份独立 PDF，所有文件、模型推理和处理记录均保留在本机。
+当前版本是 **Rust 本地服务＋浏览器界面**，包含凭证整理和通用PDF合并两种模式。凭证模式按明细账整理；通用模式按自选目录层级合并PDF。所有文件、模型推理和处理记录均保留在本机。
 
-当前有效业务规则：[凭证 PDF 规格](openspec/specs/voucher-pdf/spec.md)。方向识别默认关闭，启用需同意免责声明并在识别后完成全部待输出图片的人工核对。Windows构建与验收状态：[发行说明](docs/windows-release.md)。API契约：[app/API.md](app/API.md)。旧Python流程、旧版规格及私有验收材料仅在本地保留，不纳入本仓库。
+当前有效规则：[凭证 PDF 规格](openspec/specs/voucher-pdf/spec.md)、[通用PDF规格](openspec/specs/generic-pdf/spec.md)及[Windows启动与发行规格](openspec/specs/windows-distribution/spec.md)。凭证方向识别默认关闭，启用需同意免责声明并在识别后完成全部待输出图片的人工核对。通用模式不使用明细账和OCR。[通用模式说明](docs/generic-pdf-mode.md)、[发行验收记录](docs/windows-release.md)、[API契约](app/API.md)。旧Python流程、旧版规格及私有验收材料仅在本地保留，不纳入本仓库。
 
 ## Windows使用
 
-目标为Windows10/11 x64，采用ZIP测试包。[0.5.0测试构件](https://github.com/thising/voucher-workbench/actions/runs/41375857170/artifacts/13112005182)已通过Windows CI，支持手动选择1–10线程并行。构件需登录GitHub下载、保留14天，校验值及验证范围见[发行说明](docs/windows-release.md)；客户Windows10实机试用待反馈。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
+当前目标为0.5.1 Windows10/11 x64 ZIP测试包，含通用PDF模式和重复启动复用。构建、下载及校验值以[发行说明](docs/windows-release.md)中的实际状态为准；客户Windows10实机试用单独验收。解压整个程序目录后双击 `启动凭证工作台.cmd`，自动打开本机浏览器。再次双击会由原服务重新开网页，任务继续；原服务启动中短暂等待。保留控制台窗口，退出时按 `Ctrl+C`；关闭网页不会停止任务。
 
-随包提供CPU OCR模型和ONNX Runtime；方向识别仍默认关闭。Windows VC++运行库要求及缺失处理见[发行说明](docs/windows-release.md)。处理记录默认保存在 `%LOCALAPPDATA%\VoucherWorkbench`，移动或替换程序目录不会删除记录；输入与PDF输出仍在选择的资料目录。
+随包提供CPU OCR模型和ONNX Runtime；方向识别仍默认关闭。Windows VC++运行库要求及缺失处理见[发行说明](docs/windows-release.md)。处理记录默认保存在 `%LOCALAPPDATA%\VoucherWorkbench`，移动或替换程序目录不会删除记录；升级前先在旧版服务窗口退出，再启动新版。旧版占锁或无法联系时，新版显示中文处理步骤；不会自动结束旧进程、删除锁文件或改用新记录目录。
+
+## 通用PDF合并
+
+1. 在左侧选择“通用 PDF 合并”，指定包含PDF的本地资料文件夹和输出目录。输出留空时默认在资料目录同级建立“资料名-合并PDF”。
+2. 选择分组层级：0将目录递归合成一份；1每个直接子文件夹一份；2按第二层分组，最多32层。未达到所选层级的文件另列浅层组，不静默遗漏。
+3. 设置明确排除的相对路径、受限glob与自然/修改时间顺序。可编辑的默认排除规则为`**/indexImg/**`；嵌套输出与本程序记录目录自动排除。
+4. 扫描后核对全部分组、源PDF、页数、排除结果与输出名称；可逐文件排除、拖动或上下移动，并更改输出文件名。保存后形成新计划；范围修改后须重新扫描。
+5. 勾选要生成的有效组，核对确认窗口后生成。1–10线程按组并行，单组内原PDF页序、页尺寸和旋转保持；不增加页眉页脚、分隔页等内容。
+6. 在通用处理记录查看任务、下载PDF/报告、取消或重试。重试保持原计划与线程数；未知/修改过的输出不覆盖，已拥有的旧结果更新前保留历史。
+
+本版用于普通静态PDF；加密、表单、签名、脚本、嵌入文件和不支持的文档结构会明确提示。仅支持真实本地磁盘，不跟随符号链接、目录联接或云占位文件，不支持UNC/映射网络盘。更多边界见[通用规格](openspec/specs/generic-pdf/spec.md)。
 
 ## 开发运行
 
@@ -62,7 +73,7 @@ cargo build --release --locked --manifest-path app/Cargo.toml
 .\app\target\release\voucher-workbench.exe --model app/models/title-ocr --runtime C:\path\to\onnxruntime.dll
 ```
 
-模型来源、固定版本、hash及预处理见 [模型说明](app/models/README.md)。`--port` 可指定端口，`--no-browser` 不自动开网页，`--state-dir` 指定状态目录；非Windows开发默认状态 `.voucher-state/`，Windows默认 `%LOCALAPPDATA%\VoucherWorkbench`。一个状态目录只允许一个服务实例。`--check-runtime` 实际加载模型及原生库并输出JSON诊断，不创建状态或启动服务。
+模型来源、固定版本、hash及预处理见 [模型说明](app/models/README.md)。`--port` 可指定端口，`--no-browser` 不自动开网页（已有实例时仅确认存活），`--state-dir` 指定状态目录；非Windows开发默认状态 `.voucher-state/`，Windows默认 `%LOCALAPPDATA%\VoucherWorkbench`。一个状态目录只允许一个服务实例，新版重复启动复用原服务。目录权限、端口占用及浏览器失败有不同中文提示。`--check-runtime` 实际加载模型及原生库并输出JSON诊断，不创建状态或启动服务。
 
 ## 开发验证
 

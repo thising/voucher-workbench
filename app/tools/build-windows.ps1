@@ -65,10 +65,12 @@ try {
     Invoke-Cargo -ArgumentList @('fmt', '--manifest-path', $manifestPath, '--all', '--', '--check')
     Invoke-Cargo -ArgumentList @('clippy', '--manifest-path', $manifestPath, '--locked', '--all-targets', '--target', $target, '--target-dir', $targetDirectory, '--', '-D', 'warnings')
     Invoke-Cargo -ArgumentList @('test', '--manifest-path', $manifestPath, '--locked', '--all-targets', '--target', $target, '--target-dir', $targetDirectory)
+    & node --check (Join-Path $app 'web/generic.js')
+    if ($LASTEXITCODE -ne 0) { throw 'Generic-mode JavaScript syntax check failed.' }
     & node --check (Join-Path $app 'web/app.js')
     if ($LASTEXITCODE -ne 0) { throw 'Frontend JavaScript syntax check failed.' }
     if ($CheckOnly) { Write-Host 'Windows checks passed. No package was produced.'; return }
-    Invoke-Cargo -ArgumentList @('build', '--manifest-path', $manifestPath, '--release', '--locked', '--target', $target, '--target-dir', $targetDirectory, '--bin', 'voucher-workbench', '--example', 'package_fixture')
+    Invoke-Cargo -ArgumentList @('build', '--manifest-path', $manifestPath, '--release', '--locked', '--target', $target, '--target-dir', $targetDirectory, '--bin', 'voucher-workbench', '--example', 'package_fixture', '--example', 'startup_probe')
     $metadataText = & cargo "+$toolchain" metadata --manifest-path $manifestPath --locked --format-version 1 --filter-platform $target
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed.' }
     $metadata = ($metadataText -join "`n") | ConvertFrom-Json

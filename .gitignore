@@ -9,8 +9,10 @@
 !/tools/public-source.json
 !/tools/prepare-source.py
 !/docs/windows-release.md
+!/docs/generic-pdf-mode.md
 !/openspec/specs/voucher-pdf/spec.md
 !/openspec/specs/windows-distribution/spec.md
+!/openspec/specs/generic-pdf/spec.md
 !/app/Cargo.toml
 !/app/Cargo.lock
 !/app/LICENSE
@@ -23,6 +25,9 @@
 !/app/web/index.html
 !/app/web/app.js
 !/app/web/style.css
+!/app/web/generic.html
+!/app/web/generic.js
+!/app/web/generic.css
 !/app/tools/cargo-local.sh
 !/app/tools/dev.sh
 !/app/tools/fetch-title-models.sh

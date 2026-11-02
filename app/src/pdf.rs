@@ -6,7 +6,7 @@ use lopdf::{
     content::{Content, Operation},
     dictionary, Dictionary, Document, Object, ObjectId, Stream,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -53,13 +53,22 @@ pub struct BuildResult {
     pub skipped: bool,
 }
 
+pub(crate) trait RecordHash {
+    fn output_hash(&self) -> &str;
+}
+impl RecordHash for Manifest {
+    fn output_hash(&self) -> &str {
+        &self.output_sha256
+    }
+}
+
 #[derive(Serialize, Deserialize)]
-struct Transaction {
-    temporary: String,
-    output: String,
-    backup: Option<String>,
-    previous_hash: Option<String>,
-    manifest: Manifest,
+pub(crate) struct Transaction<M = Manifest> {
+    pub(crate) temporary: String,
+    pub(crate) output: String,
+    pub(crate) backup: Option<String>,
+    pub(crate) previous_hash: Option<String>,
+    pub(crate) manifest: M,
 }
 
 fn transaction_path(directory: &Path, output: &str) -> PathBuf {
@@ -85,7 +94,7 @@ pub fn manifest_path(state_dir: &Path, output: &Path) -> Result<PathBuf> {
     Ok(state_dir.join("outputs").join(key).join("manifest.json"))
 }
 
-struct OutputRecords {
+pub(crate) struct OutputRecords {
     output: PathBuf,
     // None is only used to finish an interrupted pre-0.4.1 transaction before
     // its verified sidecar is migrated. New transactions always use state_dir.
@@ -93,7 +102,7 @@ struct OutputRecords {
 }
 
 impl OutputRecords {
-    fn new(state_dir: &Path, output: &Path) -> Result<Self> {
+    pub(crate) fn new(state_dir: &Path, output: &Path) -> Result<Self> {
         fs::create_dir_all(state_dir)?;
         let state = state_dir.canonicalize()?;
         let manifest = manifest_path(&state, output)?;
@@ -118,14 +127,14 @@ impl OutputRecords {
         }
     }
 
-    fn manifest(&self) -> PathBuf {
+    pub(crate) fn manifest(&self) -> PathBuf {
         self.directory.as_ref().map_or_else(
             || self.output.with_extension("manifest.json"),
             |directory| directory.join("manifest.json"),
         )
     }
 
-    fn journal(&self) -> PathBuf {
+    pub(crate) fn journal(&self) -> PathBuf {
         self.directory.as_ref().map_or_else(
             || {
                 transaction_path(
@@ -237,7 +246,7 @@ fn migrate_legacy_manifest(records: &OutputRecords, plan: &Plan, voucher: &Vouch
     Ok(())
 }
 
-fn checked_output_child(directory: &Path, relative: &str) -> Result<PathBuf> {
+pub(crate) fn checked_output_child(directory: &Path, relative: &str) -> Result<PathBuf> {
     let rel = Path::new(relative);
     if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
         bail!("输出事务路径无效");
@@ -253,12 +262,20 @@ fn checked_output_child(directory: &Path, relative: &str) -> Result<PathBuf> {
 // A tiny write-ahead journal makes the PDF + manifest pair recoverable on both
 // Windows and Unix. Once commit starts, cancellation only stops the next voucher.
 fn recover_transaction(directory: &Path, output_name: &str, records: &OutputRecords) -> Result<()> {
+    recover_record_transaction::<Manifest>(directory, output_name, records)
+}
+
+pub(crate) fn recover_record_transaction<M: DeserializeOwned + Serialize + RecordHash>(
+    directory: &Path,
+    output_name: &str,
+    records: &OutputRecords,
+) -> Result<()> {
     let journal = records.journal();
     recover_atomic_record(&journal)?;
     if !journal.exists() {
         return Ok(());
     }
-    let transaction: Transaction = serde_json::from_slice(&fs::read(&journal)?)?;
+    let transaction: Transaction<M> = serde_json::from_slice(&fs::read(&journal)?)?;
     if transaction.output != output_name {
         bail!("输出事务与目标文件不符");
     }
@@ -271,23 +288,29 @@ fn recover_transaction(directory: &Path, output_name: &str, records: &OutputReco
         .as_deref()
         .map(|s| checked_output_child(directory, s))
         .transpose()?;
-    let target_hash = &transaction.manifest.output_sha256;
+    let target_hash = transaction.manifest.output_hash();
     let current_hash = if output.exists() {
         Some(sha256_file(&output)?)
     } else {
         None
     };
+    // For a first commit, rename consumes the pending file. Equal bytes alone
+    // are not evidence that this journal owns a newly appeared destination.
+    // Another state directory/process may have produced the same PDF bytes.
+    if current_hash.is_some() && current_hash != transaction.previous_hash && temporary.exists() {
+        bail!("提交发现新出现的输出且待提交文件仍在，无法证明归属；保留双方文件及事务，请改名或核对处理记录");
+    }
     // A workflow/consent-only change can produce identical PDF bytes. The old
     // PDF + manifest must still be archived before replacing the manifest; a
     // matching target hash alone does not mean this transaction committed.
     let archive_pending = current_hash.is_some()
         && current_hash == transaction.previous_hash
         && backup.as_ref().is_some_and(|path| !path.exists());
-    if current_hash.as_deref() != Some(target_hash.as_str()) || archive_pending {
+    if current_hash.as_deref() != Some(target_hash) || archive_pending {
         if current_hash.is_some() && current_hash != transaction.previous_hash {
             bail!("事务恢复发现输出被外部修改，拒绝覆盖");
         }
-        if !temporary.exists() || sha256_file(&temporary)? != *target_hash {
+        if !temporary.exists() || sha256_file(&temporary)? != target_hash {
             // If the pending artifact disappeared, restore the previous owned output.
             if !output.exists() {
                 if let Some(backup) = &backup {
@@ -463,7 +486,7 @@ fn inherited(doc: &Document, id: ObjectId, key: &[u8]) -> Option<Object> {
     None
 }
 
-fn append_pdf(
+pub(crate) fn append_pdf(
     output: &mut Document,
     page_root: ObjectId,
     kids: &mut Vec<Object>,
@@ -971,6 +994,41 @@ mod transaction_tests {
         let saved: Manifest =
             serde_json::from_slice(&fs::read(records.manifest()).unwrap()).unwrap();
         assert_eq!(saved.output_sha256, hash);
+    }
+    #[test]
+    fn first_commit_never_adopts_equal_bytes_while_pending_still_exists() {
+        for central in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path();
+            let output = dir.join("result.pdf");
+            let records = if central {
+                OutputRecords::new(&dir.join("state"), &output).unwrap()
+            } else {
+                OutputRecords::legacy(&output)
+            };
+            let pending = dir.join(".pending.pdf");
+            fs::write(&pending, b"identical foreign PDF bytes").unwrap();
+            let txn = Transaction {
+                temporary: ".pending.pdf".into(),
+                output: "result.pdf".into(),
+                backup: None,
+                previous_hash: None,
+                manifest: manifest(sha256_file(&pending).unwrap()),
+            };
+            atomic_json(&records.journal(), &txn).unwrap();
+            // A separate state/owner produces byte-for-byte the same result
+            // after our journal is durable but before our rename starts.
+            fs::write(&output, b"identical foreign PDF bytes").unwrap();
+            fs::write(records.manifest(), b"foreign owner record").unwrap();
+            assert!(recover_transaction(dir, "result.pdf", &records).is_err());
+            assert_eq!(fs::read(&output).unwrap(), b"identical foreign PDF bytes");
+            assert_eq!(fs::read(&pending).unwrap(), b"identical foreign PDF bytes");
+            assert_eq!(
+                fs::read(records.manifest()).unwrap(),
+                b"foreign owner record"
+            );
+            assert!(records.journal().exists());
+        }
     }
     #[test]
     fn identical_pdf_bytes_preserve_manifest_history_across_recovery() {

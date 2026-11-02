@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>通用 PDF 合并 · 凭证工作台</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/generic.css">
+  <script src="/generic.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/"><span class="brand-mark">凭</span><span>凭证工作台<small>VOUCHER WORKBENCH</small></span></a>
+      <div class="sidebar-label">本地资料整理</div>
+      <nav aria-label="主导航">
+        <a class="nav-button" href="/">凭证整理</a>
+        <button class="nav-button active" id="nav-work" type="button">通用 PDF 合并<span class="nav-dot"></span></button>
+        <button class="nav-button" id="nav-history" type="button">通用处理记录<span class="nav-count" id="history-count">0</span></button>
+      </nav>
+      <div class="workflow-map"><div class="sidebar-label">处理流程</div><ol><li class="current"><span>1</span><div>选择范围<small>层级 · 排除 · 输出位置</small></div></li><li><span>2</span><div>核对顺序<small>分组 · 页数 · 文件名</small></div></li><li><span>3</span><div>生成 PDF<small>每个分组合成一份</small></div></li></ol></div>
+      <div class="local-note"><strong>资料只在本机处理</strong><p>适用于普通静态 PDF。<br>不需要明细账或方向识别。</p><span id="server-version">本地服务</span></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><span class="eyebrow">GENERAL PDF WORKSPACE</span><h1>按你的目录，合成 PDF</h1><p>先核对分组和页序，再把每一组交付成一份文件。</p></div><span class="connection" id="connection"><i></i>正在连接</span></header>
+      <div id="global-alert" class="alert error" role="alert" hidden></div>
+      <div id="external-job" class="alert warning" role="status" hidden></div>
+      <section id="work-view">
+        <section class="card source-card" aria-labelledby="source-title">
+          <div class="section-heading"><div><span class="section-number">01</span><h2 id="source-title">合并范围</h2></div><span class="status-pill">PDF 文件</span></div>
+          <form id="source-form">
+            <div class="source-fields">
+              <label class="field"><span>资料文件夹 <em>必填</em></span><div class="input-with-button"><input id="root-path" placeholder="选择包含 PDF 的本地文件夹" required autocomplete="off"><button type="button" class="input-button" id="browse-root">浏览</button></div></label>
+              <label class="field"><span>输出文件夹 <small>留空时放在资料目录同级</small></span><div class="input-with-button"><input id="output-path" placeholder="默认：资料文件夹名-合并PDF" autocomplete="off"><button type="button" class="input-button" id="browse-output">浏览</button></div></label>
+            </div>
+            <div class="generic-options">
+              <label class="field"><span>按第几层文件夹分组</span><input id="merge-level" type="number" min="0" max="32" step="1" value="0" required aria-describedby="level-hint"></label>
+              <label class="field"><span>组内文件顺序</span><select id="merge-sort"><option value="natural_asc">相对路径 · 自然升序（2 在 10 前）</option><option value="natural_desc">相对路径 · 自然降序</option><option value="modified_asc">修改时间 · 从早到晚</option><option value="modified_desc">修改时间 · 从晚到早</option><option value="manual" disabled>已保存手动顺序（重扫将按自然升序）</option></select></label>
+            </div>
+            <p id="level-hint" class="generic-hint">0：递归合成一份；1：每个直接子文件夹各一份；2：每个第二层文件夹各一份。达不到所选层级的 PDF 会单独列组，供你核对。</p>
+            <details class="generic-excludes"><summary>排除文件与文件夹</summary><div class="source-fields">
+              <label class="field"><span>排除规则 <small>每行一条，可编辑预设</small></span><textarea id="exclude-globs" rows="3" spellcheck="false">**/indexImg/**</textarea></label>
+              <label class="field"><span>明确排除的相对路径 <small>每行一个文件或目录</small></span><textarea id="exclude-paths" rows="3" placeholder="例如：旧版/封面.pdf" spellcheck="false"></textarea></label>
+            </div><p class="generic-hint">路径相对于资料文件夹；使用 / 分隔。* 匹配当前层，? 匹配一个字符，** 匹配任意层级。只处理 PDF，不跟随符号链接；无匹配的规则会提示。</p></details>
+            <div class="source-footer"><p>选择本地磁盘资料。扫描和生成均保留原文件；大型 PDF 需要更多内存和时间。</p><button class="primary-button" id="scan-button" type="submit">扫描并预览</button></div>
+          </form>
+        </section>
+        <section class="card processing-settings" aria-label="并行处理设置"><div class="processing-setting-control"><label for="processing-threads">并行线程数</label><select id="processing-threads" disabled></select><span id="settings-status" role="status">正在读取设置…</span></div><p>默认 1，可选 1–10；按分组并行，同一 PDF 内页序不变。更多线程会增加内存和 CPU 占用，单个分组不会因增加线程而拆分处理。</p></section>
+        <section id="welcome" class="welcome generic-welcome"><div class="generic-papers" aria-hidden="true"><span>PDF</span><span>PDF</span><span>→</span><strong>PDF</strong></div><h2>合并之前，先看清楚</h2><p>扫描后可检查每组文件、页码范围和输出名称，<br>拖动文件或用上下移动调整顺序。</p><div class="welcome-tags"><span>保留原页尺寸</span><span>原文件不改动</span><span>不增加附加页</span></div></section>
+        <div id="workspace" hidden>
+          <div id="draft-alert" class="alert warning" role="status" hidden></div>
+          <section class="stats" aria-label="合并概况"><article class="stat"><span>分组合并</span><strong id="stat-groups">—</strong><small id="stat-selected">—</small></article><article class="stat"><span>源 PDF</span><strong id="stat-files">—</strong><small id="stat-pages">—</small></article><article class="stat attention"><span>需处理的问题</span><strong id="stat-issues">—</strong><small>错误组不可生成</small></article><article class="stat"><span>排除与跳过</span><strong id="stat-excluded">—</strong><small>展开扫描详情查看</small></article></section>
+          <details class="card issue-panel" id="scan-details"><summary>扫描详情与排除记录</summary><div id="scan-issues"></div><div id="scan-exclusions"></div></details>
+          <section class="card generic-batch"><div><label><input type="checkbox" id="select-all"> 选择所有可生成组</label><p id="plan-output" class="generic-hint"></p></div><div class="batch-actions"><button type="button" class="secondary-button" id="save-order" hidden>保存顺序与名称</button><button type="button" class="primary-button" id="generate-button" disabled>生成所选组</button></div></section>
+          <div class="generic-workspace">
+            <aside class="card generic-groups" aria-label="分组清单"><div class="panel-title"><h2>分组清单</h2><span id="group-count" class="count-pill">0</span></div><label class="search-input"><input id="group-search" type="search" placeholder="搜索分组路径" aria-label="搜索分组"></label><div id="group-list"></div></aside>
+            <section class="card generic-group-detail" aria-label="分组文件与顺序"><div id="group-detail"></div></section>
+          </div>
+        </div>
+        <section class="card job-panel" id="job-panel" hidden><div class="job-heading"><div><span class="section-number">03</span><h2>PDF 合并进度</h2><span class="status-pill" id="job-status"></span><span class="job-thread-note" id="job-threads"></span></div><div class="job-actions"><button type="button" class="secondary-button compact" id="cancel-job">取消任务</button><button type="button" class="secondary-button compact" id="retry-job" hidden>继续 / 重试</button><button type="button" class="text-button" id="download-report" hidden>下载报告</button></div></div><div class="progress-meta"><span id="job-current">准备中</span><strong id="job-progress-text">0 / 0</strong></div><div class="progress-track"><div id="job-progress"></div></div><div id="job-error" class="alert error" hidden></div><div id="job-results" class="job-results"></div><div class="output-actions"><button type="button" class="secondary-button compact" id="open-output" hidden>打开输出文件夹</button></div></section>
+      </section>
+      <section id="history-view" hidden><div class="history-intro"><h2>通用处理记录</h2><p>历史计划保留当时的范围、顺序、名称和任务线程数。</p><button type="button" class="secondary-button compact" id="refresh-history">刷新记录</button></div><div id="history-list"></div></section>
+      <footer class="page-footer"><span>凭证工作台 · 通用 PDF 合并</span><span>合并结果交付前，请核对内容与页序。</span></footer>
+    </main>
+  </div>
+  <dialog id="browser-dialog" class="dialog browser-dialog"><div class="dialog-heading"><h2 id="browser-title">选择文件夹</h2><button type="button" class="icon-button" id="close-browser" aria-label="关闭">×</button></div><form id="browser-path-form" class="browser-path"><button type="button" class="icon-button" id="browser-up" title="上一级">↑</button><input id="browser-path-input" aria-label="当前路径" autocomplete="off"><button type="submit" class="secondary-button compact">前往</button></form><div id="browser-error" class="alert error" hidden></div><div id="browser-entries" class="browser-entries"></div><div class="dialog-footer"><span id="browser-selected">选择文件夹</span><button type="button" class="primary-button" id="browser-choose">选择此文件夹</button></div></dialog>
+  <dialog id="generate-dialog" class="dialog"><div class="dialog-heading"><h2>核对本次合并</h2><button type="button" class="icon-button" id="close-generate" aria-label="关闭">×</button></div><div id="generate-summary" class="generate-summary"></div><div class="dialog-footer"><span>不增加页眉、页脚或分隔页</span><button type="button" class="primary-button" id="start-generate">开始生成</button></div></dialog>
+  <dialog id="preview-dialog" class="dialog generic-preview"><div class="dialog-heading"><h2 id="preview-name">PDF 原件</h2><button type="button" class="icon-button" id="close-preview" aria-label="关闭预览">×</button></div><p class="generic-hint">预览由浏览器提供；如未显示，请下载后核对。</p><div id="preview-stage"></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

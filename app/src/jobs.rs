@@ -1,4 +1,4 @@
-use crate::{model::*, orientation::Engine, pdf, workers};
+use crate::{generic, model::*, orientation::Engine, pdf, workers};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,6 +76,7 @@ impl Job {
 }
 pub struct Data {
     pub plans: HashMap<String, Plan>,
+    pub generic_plans: HashMap<String, generic::Plan>,
     pub jobs: HashMap<String, Job>,
     pub cancels: HashMap<String, Arc<AtomicBool>>,
     pub settings: ProcessingSettings,
@@ -112,9 +113,11 @@ impl AppState {
     pub fn load(dir: PathBuf, model: &Path, runtime: Option<&Path>) -> Result<Arc<Self>> {
         fs::create_dir_all(dir.join("plans"))?;
         fs::create_dir_all(dir.join("jobs"))?;
+        fs::create_dir_all(dir.join("generic-plans"))?;
         fs::create_dir_all(dir.join("reports"))?;
         recover_json_directory(&dir.join("plans"))?;
         recover_json_directory(&dir.join("jobs"))?;
+        recover_json_directory(&dir.join("generic-plans"))?;
         recover_json_directory(&dir)?;
         let settings_path = dir.join("settings.json");
         let settings: ProcessingSettings = if settings_path.exists() {
@@ -126,6 +129,7 @@ impl AppState {
         settings.validate()?;
         let mut data = Data {
             plans: HashMap::new(),
+            generic_plans: HashMap::new(),
             jobs: HashMap::new(),
             cancels: HashMap::new(),
             settings,
@@ -138,6 +142,15 @@ impl AppState {
             let p: Plan = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("计划文件损坏：{}", path.display()))?;
             data.plans.insert(p.id.clone(), p);
+        }
+        for entry in fs::read_dir(dir.join("generic-plans"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let plan: generic::Plan = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("通用计划文件损坏：{}", path.display()))?;
+            data.generic_plans.insert(plan.id.clone(), plan);
         }
         for entry in fs::read_dir(dir.join("jobs"))? {
             let path = entry?.path();
@@ -210,6 +223,30 @@ impl AppState {
             .insert(p.id.clone(), p.clone());
         Ok(p)
     }
+    pub fn insert_generic_plan(&self, plan: generic::Plan) -> Result<generic::Plan> {
+        let mut data = self.data.lock().unwrap();
+        if data.generic_plans.contains_key(&plan.id) {
+            bail!("计划已存在，不能改写不可变预览");
+        }
+        pdf::atomic_json(
+            &self
+                .dir
+                .join("generic-plans")
+                .join(format!("{}.json", plan.id)),
+            &plan,
+        )?;
+        data.generic_plans.insert(plan.id.clone(), plan.clone());
+        Ok(plan)
+    }
+    pub fn generic_plan(&self, id: &str) -> Result<generic::Plan> {
+        self.data
+            .lock()
+            .unwrap()
+            .generic_plans
+            .get(id)
+            .cloned()
+            .context("通用计划不存在，请重新扫描")
+    }
     pub fn plan(&self, id: &str) -> Result<Plan> {
         self.data
             .lock()
@@ -228,7 +265,7 @@ impl AppState {
             .cloned()
             .context("任务不存在")
     }
-    fn update_job(&self, id: &str, update: impl FnOnce(&mut Job)) -> Result<()> {
+    pub(crate) fn update_job(&self, id: &str, update: impl FnOnce(&mut Job)) -> Result<()> {
         let mut data = self.data.lock().unwrap();
         let j = data.jobs.get_mut(id).context("任务不存在")?;
         update(j);
@@ -349,7 +386,7 @@ impl AppState {
         let mut data = self.data.lock().unwrap();
         let threads = threads.unwrap_or(data.settings.threads);
         ProcessingSettings { threads }.validate()?;
-        if !matches!(kind, "analyze" | "generate") {
+        if !matches!(kind, "analyze" | "generate" | "generic_generate") {
             bail!("未知任务类型");
         }
         if request.allow_unreviewed {
@@ -358,74 +395,80 @@ impl AppState {
         if data.jobs.values().any(Job::active) {
             bail!("已有任务运行，请完成或取消后再启动");
         }
-        let plan = data.plans.get(plan_id).context("计划不存在")?;
-        if plan.issues.iter().any(|i| i.severity == "error") && kind == "generate" {
-            bail!("资料目录存在扫描错误，请修正后重新扫描");
-        }
-        if kind == "analyze" {
-            if !plan.orientation_workflow.enabled
-                || !plan.orientation_workflow.has_current_consent()
-            {
-                bail!("请先启用标题方向识别并同意当前免责声明");
-            }
-            if plan
-                .vouchers
-                .iter()
-                .flat_map(|v| &v.files)
-                .any(pdf::needs_analysis)
-                && self.model_error.is_some()
-            {
-                bail!(
-                    "方向模型未就绪：{}",
-                    self.model_error.as_deref().unwrap_or_default()
-                );
-            }
+        let total = if kind == "generic_generate" {
+            let plan = data.generic_plans.get(plan_id).context("通用计划不存在")?;
+            generic::validate_generation(plan, &request)?
         } else {
-            pdf::validate_generation_workflow(plan)?;
-            if plan
-                .vouchers
-                .iter()
-                .filter(|v| {
-                    request
-                        .voucher_ids
-                        .as_ref()
-                        .map(|ids| ids.contains(&v.id))
-                        .unwrap_or(true)
-                })
-                .flat_map(|v| &v.files)
-                .any(|f| pdf::requires_manual_review(plan, f))
-            {
-                bail!("所选凭证的所有图片均须在识别完成后人工核对修正并确认");
+            let plan = data.plans.get(plan_id).context("计划不存在")?;
+            if plan.issues.iter().any(|i| i.severity == "error") && kind == "generate" {
+                bail!("资料目录存在扫描错误，请修正后重新扫描");
             }
-        }
-        if let Some(ids) = &request.voucher_ids {
-            if ids.is_empty()
-                || ids
+            if kind == "analyze" {
+                if !plan.orientation_workflow.enabled
+                    || !plan.orientation_workflow.has_current_consent()
+                {
+                    bail!("请先启用标题方向识别并同意当前免责声明");
+                }
+                if plan
+                    .vouchers
                     .iter()
-                    .any(|id| !plan.vouchers.iter().any(|v| &v.id == id))
-            {
-                bail!("请选择本计划中的有效凭证");
+                    .flat_map(|v| &v.files)
+                    .any(pdf::needs_analysis)
+                    && self.model_error.is_some()
+                {
+                    bail!(
+                        "方向模型未就绪：{}",
+                        self.model_error.as_deref().unwrap_or_default()
+                    );
+                }
+            } else {
+                pdf::validate_generation_workflow(plan)?;
+                if plan
+                    .vouchers
+                    .iter()
+                    .filter(|v| {
+                        request
+                            .voucher_ids
+                            .as_ref()
+                            .map(|ids| ids.contains(&v.id))
+                            .unwrap_or(true)
+                    })
+                    .flat_map(|v| &v.files)
+                    .any(|f| pdf::requires_manual_review(plan, f))
+                {
+                    bail!("所选凭证的所有图片均须在识别完成后人工核对修正并确认");
+                }
             }
-        }
-        let total = if kind == "analyze" {
-            plan.vouchers
-                .iter()
-                .flat_map(|v| &v.files)
-                .filter(|f| pdf::needs_analysis(f))
-                .count() as u32
-        } else {
-            plan.vouchers
-                .iter()
-                .filter(|v| {
-                    request
-                        .voucher_ids
-                        .as_ref()
-                        .map(|ids| ids.contains(&v.id))
-                        .unwrap_or(true)
-                })
-                .flat_map(|v| &v.files)
-                .map(|f| f.pages)
-                .sum()
+            if let Some(ids) = &request.voucher_ids {
+                if ids.is_empty()
+                    || ids
+                        .iter()
+                        .any(|id| !plan.vouchers.iter().any(|v| &v.id == id))
+                {
+                    bail!("请选择本计划中的有效凭证");
+                }
+            }
+            let total = if kind == "analyze" {
+                plan.vouchers
+                    .iter()
+                    .flat_map(|v| &v.files)
+                    .filter(|f| pdf::needs_analysis(f))
+                    .count() as u32
+            } else {
+                plan.vouchers
+                    .iter()
+                    .filter(|v| {
+                        request
+                            .voucher_ids
+                            .as_ref()
+                            .map(|ids| ids.contains(&v.id))
+                            .unwrap_or(true)
+                    })
+                    .flat_map(|v| &v.files)
+                    .map(|f| f.pages)
+                    .sum()
+            };
+            total
         };
         let j = Job {
             id: uuid::Uuid::new_v4().to_string(),
@@ -443,7 +486,7 @@ impl AppState {
             threads,
         };
         if kind == "analyze" {
-            let mut updated = plan.clone();
+            let mut updated = data.plans.get(plan_id).context("计划不存在")?.clone();
             updated.orientation_workflow.analysis_completed = false;
             self.save_plan(&updated)?;
             data.plans.insert(plan_id.into(), updated);
@@ -465,16 +508,21 @@ impl AppState {
                 Err(_) => Some("任务内部异常；源文件未改动，可检查后重试".into()),
             };
             let _ = state.update_job(&task.id, |j| {
+                let unit = if task.kind == "generic_generate" {
+                    "分组"
+                } else {
+                    "凭证"
+                };
                 if cancel.load(Ordering::Relaxed) {
                     j.status = "cancelled".into();
-                    j.current = "已取消，完成的凭证保留，可重试继续".into();
+                    j.current = format!("已取消，完成的{unit}保留，可重试继续");
                 } else if let Some(err) = error {
                     j.status = "failed".into();
                     j.error = Some(err);
                     j.current = "任务失败".into();
                 } else if j.results.iter().any(|r| r.status == "failed") {
                     j.status = "completed_with_errors".into();
-                    j.current = "处理结束，部分凭证需要处理后重试".into();
+                    j.current = format!("处理结束，部分{unit}需要处理后重试");
                 } else {
                     j.status = "completed".into();
                     j.current = "处理完成".into();
@@ -509,6 +557,9 @@ impl AppState {
     }
     fn execute(&self, job: &Job, cancel: &AtomicBool) -> Result<()> {
         self.update_job(&job.id, |j| j.status = "running".into())?;
+        if job.kind == "generic_generate" {
+            return generic::execute(self, job, cancel);
+        }
         let plan = self.plan(&job.plan_id)?;
         if job.kind == "analyze" {
             self.execute_analysis(job, &plan, cancel)

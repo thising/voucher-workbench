@@ -756,13 +756,13 @@ async function pollJob() {
 function renderJob() {
   const job=state.job;if(!job)return;
   $('job-panel').hidden=false;
-  $('job-title').textContent=job.kind==='analyze'?'标题文字方向识别':'PDF 生成进度';
+  $('job-title').textContent=job.kind==='generic_generate'?'通用 PDF 合并进度':job.kind==='analyze'?'标题文字方向识别':'PDF 生成进度';
   $('job-status').textContent=statusLabels[job.status]||job.status;
   $('job-threads').textContent=`并行上限 ${jobThreads(job)} 线程`;
   $('job-status').className='status-pill'+(['failed','completed_with_errors'].includes(job.status)?' error':['cancelled','interrupted'].includes(job.status)?' warning':'');
   const active=activeStatuses.has(job.status);
   $('cancel-job').hidden=!active;
-  $('retry-job').hidden=active||job.status==='completed';
+  $('retry-job').hidden=active||job.status==='completed'||job.kind==='generic_generate';
   $('download-report').hidden=active;
   $('job-current').textContent=job.current|| (active?'正在准备…':statusLabels[job.status]||'处理结束');
   $('job-progress-text').textContent=`${fmt(job.done)} / ${fmt(job.total)}`;
@@ -780,6 +780,9 @@ function renderJob() {
     return row;
   }));
   const outputs=$('output-actions');outputs.replaceChildren();
+  if(job.kind==='generic_generate'){
+    const link=el('a','secondary-button compact','前往通用模式查看计划与重试');link.href='/generic';outputs.append(link);
+  }
   if (job.kind==='generate' && state.plan?.id===job.plan_id) {
     const successIds=new Set((job.results||[]).filter(result=>result.output_path&&result.status!=='failed').map(result=>result.voucher_id));
     const items=[...new Set(state.plan.vouchers.filter(item=>successIds.has(item.id)).map(item=>item.item))];
@@ -857,9 +860,10 @@ function renderHistory() {
     }));
     card.append(info,button);list.append(card);
   }
-  if(state.jobs.length) {
+  const voucherJobs=state.jobs.filter(job=>job.kind!=='generic_generate');
+  if(voucherJobs.length) {
     const block=el('section','history-jobs');block.append(el('h2','','最近任务'));const rows=el('div','card');
-    for(const job of state.jobs.slice(0,40)) {
+    for(const job of voucherJobs.slice(0,40)) {
       const row=el('div','history-job');const info=el('div');
       info.append(document.createTextNode(`${job.kind==='analyze'?'方向识别':'PDF 生成'} · ${statusLabels[job.status]||job.status}`),el('small','',`${time(job.created_at)} · ${fmt(job.done)} / ${fmt(job.total)} · ${jobThreads(job)} 线程`));
       const button=el('button','text-button','查看任务');button.type='button';
@@ -885,7 +889,7 @@ async function initialize() {
     $('server-version').textContent=`v${state.status.version} · 离线工作台`;
     await refreshHistory(false);
     const running=state.jobs.find(job=>activeStatuses.has(job.status));
-    if(running){acceptPlan(await api(`/plans/${running.plan_id}`));trackJob(running);}
+    if(running){if(running.kind!=='generic_generate')acceptPlan(await api(`/plans/${running.plan_id}`));trackJob(running);}
     state.syncTimer=setInterval(syncExternalJobs,5000);
     controls();
   }catch(error){$('connection').classList.add('offline');$('connection').replaceChildren(el('i'),document.createTextNode('连接失败'));state.settingsError='设置尚未就绪，请刷新页面后重试。';showError(error);controls();}

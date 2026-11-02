@@ -305,6 +305,9 @@ async fn retry(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiRes
 }
 async fn report(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let job = s.job(&id)?;
+    if job.kind == "generic_generate" {
+        return Ok(Json(crate::generic::report(&s, &job)?));
+    }
     let plan = s.plan(&job.plan_id)?;
     let mut manifests = vec![];
     for result in &job.results {
@@ -327,6 +330,13 @@ async fn output(
     Path((job_id, voucher_id)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     let job = s.job(&job_id)?;
+    if job.kind == "generic_generate" {
+        let path = crate::generic::output(&s, &job, &voucher_id)?;
+        return Ok(bytes_response(
+            tokio::fs::read(path).await?,
+            "application/pdf",
+        ));
+    }
     let result = job
         .results
         .iter()
@@ -420,6 +430,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/retry", post(retry))
         .route("/jobs/{id}/report", get(report))
         .route("/jobs/{job}/outputs/{voucher}", get(output))
+        .nest("/generic", crate::generic::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
         .route(
@@ -432,6 +443,28 @@ pub fn router(state: Arc<AppState>) -> Router {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("../web/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/generic",
+            get(|| async { axum::response::Html(include_str!("../web/generic.html")) }),
+        )
+        .route(
+            "/generic.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/generic.js"),
+                )
+            }),
+        )
+        .route(
+            "/generic.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../web/generic.css"),
                 )
             }),
         )
@@ -456,49 +489,87 @@ pub async fn run(
     runtime: Option<PathBuf>,
     open: bool,
 ) -> Result<()> {
-    fs::create_dir_all(&dir)?;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("instance.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("同一状态目录已有服务运行；请关闭旧服务或指定另一 --state-dir")?;
-    let state = AppState::load(dir, &model, runtime.as_deref())?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .context("本地端口无法监听")?;
-    let url = format!(
-        "http://127.0.0.1:{}/#token={}",
-        listener.local_addr()?.port(),
-        state.token
-    );
-    println!("凭证 PDF 工作台：{url}");
-    println!("仅在本机访问；按 Ctrl+C 停止。任务和复核记录将保留。");
-    if let Some(error) = &state.model_error {
-        eprintln!("方向模型暂不可用：{error}");
+    run_with_options(
+        port,
+        dir,
+        model,
+        runtime,
+        open,
+        crate::launcher::StartupOptions::default(),
+    )
+    .await
+}
+
+pub async fn run_with_options(
+    port: u16,
+    dir: PathBuf,
+    model: PathBuf,
+    runtime: Option<PathBuf>,
+    open: bool,
+    options: crate::launcher::StartupOptions,
+) -> Result<()> {
+    if options.startup_delay_ms > 10_000 {
+        anyhow::bail!("启动延迟参数不能超过10000毫秒");
     }
-    if open {
-        if let Err(error) = webbrowser::open(&url) {
-            eprintln!("无法自动打开浏览器，请复制上方链接：{error}");
+    let opener = crate::launcher::browser_opener(options.browser_command);
+    let primary = match crate::instance::enter(&dir, open, opener.clone()).await? {
+        crate::instance::Entry::Reused => return Ok(()),
+        crate::instance::Entry::Primary(primary) => primary,
+    };
+    let result = async {
+        // The protected activation endpoint already exists while state/models
+        // initialize. A second click waits rather than racing another service.
+        if options.startup_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(options.startup_delay_ms)).await;
         }
-    }
-    axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            for cancel in state.data.lock().unwrap().cancels.values() {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await.map_err(|error| {
+                let advice = if error.kind() == std::io::ErrorKind::AddrInUse {
+                    format!("本地端口{port}已被占用。请检查占用该端口的应用，或手动使用 --port 0 分配可用端口后重新启动；原处理记录目录保持不变")
+                } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "当前账号无权监听本地端口。请检查安全软件或单位策略对本程序的限制，联系管理员确认后重试".into()
+                } else {
+                    "本地端口无法监听。请检查本机网络/安全策略和端口设置后重试，不会自动结束其他程序".into()
+                };
+                anyhow::Error::from(error).context(advice)
+            })?;
+        let state = tokio::task::spawn_blocking(move || AppState::load(dir, &model, runtime.as_deref()))
+            .await.context("处理记录载入线程异常，请保留现有记录并重新启动")?
+            .context("无法载入处理记录。请检查记录目录权限、可用磁盘空间及上方具体原因；保留记录并反馈错误，不要删除锁文件或清空记录")?;
+        let url = format!("http://127.0.0.1:{}/#token={}", listener.local_addr()?.port(), state.token);
+        primary.ready(url.clone());
+        println!("凭证 PDF 工作台：{url}");
+        println!("仅在本机访问。请保留此窗口，结束时按 Ctrl+C；重复双击启动入口可重新打开已有工作台，任务继续运行。");
+        if let Some(error) = &state.model_error {
+            eprintln!("方向模型暂不可用：{error}。可关闭方向识别或使用通用PDF模式；其他处理功能仍可使用。");
+        }
+        if open {
+            let opened = tokio::task::spawn_blocking(move || opener(&url)).await;
+            if !matches!(opened, Ok(Ok(()))) {
+                eprintln!("浏览器打开失败，服务已经启动并保持运行。请检查系统默认浏览器设置，或复制本窗口上方的完整网址手动打开；也可修复浏览器设置后再次双击启动入口。结束服务请按 Ctrl+C。");
             }
-            // Give the worker time to finish its current page/commit and persist cancellation.
-            for _ in 0..150 {
-                if !state.data.lock().unwrap().jobs.values().any(Job::active) {
-                    break;
+        }
+        let closing = primary.closing_notifier();
+        axum::serve(listener, router(state.clone()))
+            .with_graceful_shutdown(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                closing();
+                for cancel in state.data.lock().unwrap().cancels.values() {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        })
-        .await?;
-    Ok(())
+                for _ in 0..150 {
+                    if !state.data.lock().unwrap().jobs.values().any(Job::active) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            })
+            .await.context("本地服务运行失败。请保留处理记录和错误信息，等待原服务窗口结束后重新启动")?;
+        Ok(())
+    }.await;
+    // Close all IPC handles before the state-directory lock is released.
+    primary.close().await;
+    result
 }
 
 #[cfg(test)]
@@ -517,51 +588,53 @@ mod tests {
         )
         .unwrap();
         let app = router(state.clone());
-        for (host, token, origin, expected) in [
-            (
-                "127.0.0.1:43127",
-                state.token.as_str(),
-                None,
-                StatusCode::OK,
-            ),
-            ("127.0.0.1:43127", "", None, StatusCode::FORBIDDEN),
-            (
-                "attacker.invalid:43127",
-                state.token.as_str(),
-                None,
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                "127.0.0.1:43127",
-                state.token.as_str(),
-                Some("https://attacker.invalid"),
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                "127.0.0.1:43127",
-                state.token.as_str(),
-                Some("http://127.0.0.1:43127"),
-                StatusCode::OK,
-            ),
-        ] {
-            let mut req = Request::builder()
-                .uri("/api/status")
-                .header("host", host)
-                .header("x-session-token", token);
-            if let Some(origin) = origin {
-                req = req.header("origin", origin);
-            }
-            let response = app
-                .clone()
-                .oneshot(req.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), expected);
-            assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
-            if expected == StatusCode::OK {
-                let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                let status: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(status["model_ready"], false);
+        for uri in ["/api/status", "/api/generic/plans"] {
+            for (host, token, origin, expected) in [
+                (
+                    "127.0.0.1:43127",
+                    state.token.as_str(),
+                    None,
+                    StatusCode::OK,
+                ),
+                ("127.0.0.1:43127", "", None, StatusCode::FORBIDDEN),
+                (
+                    "attacker.invalid:43127",
+                    state.token.as_str(),
+                    None,
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "127.0.0.1:43127",
+                    state.token.as_str(),
+                    Some("https://attacker.invalid"),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "127.0.0.1:43127",
+                    state.token.as_str(),
+                    Some("http://127.0.0.1:43127"),
+                    StatusCode::OK,
+                ),
+            ] {
+                let mut req = Request::builder()
+                    .uri(uri)
+                    .header("host", host)
+                    .header("x-session-token", token);
+                if let Some(origin) = origin {
+                    req = req.header("origin", origin);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+                assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+                if expected == StatusCode::OK && uri == "/api/status" {
+                    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                    let status: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(status["model_ready"], false);
+                }
             }
         }
     }

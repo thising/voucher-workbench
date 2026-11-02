@@ -150,6 +150,77 @@ function Invoke-Fixture([string]$Command, [string]$Root, [string]$Mode = '', [st
     return ($output -join "`n") | ConvertFrom-Json -Depth 30
 }
 
+function Copy-TaggedSyntheticPdf([string]$Source, [string]$Destination, [string]$Tag) {
+    # Replace four ASCII bytes in the generated, uncompressed fixture text.
+    # Equal lengths preserve stream lengths and xref offsets, and distinct
+    # labels let the downloaded PDF's actual page tree prove file/page order.
+    Assert-True ($Tag -cmatch '^[AB][0-9]{3}$') 'Invalid synthetic PDF label.'
+    $bytes = [IO.File]::ReadAllBytes($Source)
+    $text = [Text.Encoding]::Latin1.GetString($bytes)
+    Assert-True ([regex]::Matches($text, 'SYNTHETIC PAGE [12]').Count -eq 2) 'The generated PDF fixture text changed.'
+    $tagged = [Text.Encoding]::Latin1.GetBytes($text.Replace('SYNTHETIC PAGE', "SYNTHETIC $Tag"))
+    Assert-True ($tagged.Length -eq $bytes.Length) 'Synthetic labels changed PDF byte offsets.'
+    [IO.File]::WriteAllBytes($Destination, $tagged)
+}
+
+function Save-SmokePdf($Service, [string]$ApiPath, [string]$Destination, [string]$ExpectedHash) {
+    $response = Invoke-WebRequest -Uri "$($Service.BaseUrl)/api$ApiPath" -Method GET -Headers @{ 'X-Session-Token' = $Service.Token } -TimeoutSec 60 -SkipHttpErrorCheck -NoProxy -OutFile $Destination -PassThru
+    Assert-True ([int]$response.StatusCode -eq 200) 'The common PDF download endpoint rejected a synthetic output.'
+    Assert-True ([string]$response.Headers['Content-Type'] -match '^application/pdf') 'The PDF download returned the wrong content type.'
+    Assert-True ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant() -eq $ExpectedHash.ToLowerInvariant()) 'Downloaded PDF bytes did not match the saved output fingerprint.'
+}
+
+function Get-SyntheticPdfPageLabels([string]$Path) {
+    # This deliberately small reader applies only to our known, plain-object
+    # fixture PDFs. It follows /Kids and /Contents rather than file byte order.
+    $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($Path))
+    Assert-True ($text.StartsWith('%PDF-')) 'Downloaded output is not a PDF.'
+    $objects = @{}
+    foreach ($object in [regex]::Matches($text, '(?ms)(\d+)\s+0\s+obj\s*(.*?)\s*endobj')) {
+        $objects[$object.Groups[1].Value] = $object.Groups[2].Value
+    }
+    $roots = @($objects.Values | Where-Object { $_ -match '/Type\s*/Pages\b' })
+    Assert-True ($roots.Count -eq 1) 'The synthetic merged PDF did not have one page-tree root.'
+    $kids = [regex]::Match($roots[0], '(?s)/Kids\s*\[(.*?)\]').Groups[1].Value
+    $references = @([regex]::Matches($kids, '(\d+)\s+0\s+R'))
+    Assert-True ($references.Count -eq 4) 'The downloaded generic output did not contain four actual PDF pages.'
+    foreach ($reference in $references) {
+        $page = $objects[$reference.Groups[1].Value]
+        Assert-True ($page -match '/Type\s*/Page\b') 'A synthetic page-tree child was not a page.'
+        $content = [regex]::Match($page, '/Contents\s+(\d+)\s+0\s+R')
+        Assert-True ($content.Success) 'A synthetic PDF page lost its content reference.'
+        $label = [regex]::Match($objects[$content.Groups[1].Value], 'SYNTHETIC ([AB][0-9]{3}) ([12])')
+        Assert-True ($label.Success) 'The downloaded PDF lost a synthetic source-page label.'
+        Write-Output "$($label.Groups[1].Value)-$($label.Groups[2].Value)"
+    }
+}
+
+function Assert-GenericOutput($Service, $Job, $Plan, [string]$Downloads, $Tags) {
+    $snapshot = Invoke-SmokeApi $Service 'GET' "/jobs/$($Job.id)/report"
+    Assert-True ($snapshot.mode -eq 'generic_pdf' -and $snapshot.plan_id -eq $Plan.id -and $snapshot.successful_pages -eq 8) 'The common report lost the generic task snapshot or page total.'
+    Assert-True ($snapshot.level -eq 1 -and $snapshot.sort -eq $Plan.sort -and @($snapshot.manifests).Count -eq 2) 'The generic report lost grouping or sort rules.'
+    foreach ($group in $Plan.groups) {
+        $manifest = @($snapshot.manifests | Where-Object group_key -EQ $group.relative_path)
+        Assert-True ($manifest.Count -eq 1) 'A generic group is missing from the output report.'
+        $manifest = $manifest[0]
+        Assert-True ($manifest.mode -eq 'generic_pdf' -and $manifest.pages -eq 4 -and $manifest.output_name -eq $group.output_name -and @($manifest.sources).Count -eq 2) 'A generic output manifest lost its name or pages.'
+        $expectedLabels = @()
+        for ($index = 0; $index -lt 2; $index++) {
+            $file = $group.files[$index]
+            $mapping = $manifest.sources[$index]
+            Assert-True ($mapping.source -eq $file.relative_path -and $mapping.sha256 -eq $file.sha256 -and $mapping.pages -eq 2 -and $mapping.first_page -eq 1 + $index * 2 -and $mapping.last_page -eq 2 + $index * 2) 'Generic source order or output page mapping is incorrect.'
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $Plan.root $file.relative_path) -Algorithm SHA256).Hash.ToLowerInvariant() -eq $file.sha256) 'Generic merging modified a source PDF.'
+            $tag = $Tags[$file.relative_path]
+            Assert-True (-not [string]::IsNullOrWhiteSpace($tag)) 'Unknown synthetic generic source.'
+            $expectedLabels += @("$tag-1", "$tag-2")
+        }
+        $download = Join-Path $Downloads "$($Job.id)-$($group.id).pdf"
+        Save-SmokePdf $Service "/jobs/$($Job.id)/outputs/$($group.id)" $download $manifest.output_sha256
+        $labels = @(Get-SyntheticPdfPageLabels $download)
+        Assert-True (($labels -join ',') -ceq ($expectedLabels -join ',')) 'The downloaded PDF page tree does not follow the requested file order.'
+    }
+}
+
 $ZipPath = (Resolve-Path -LiteralPath $ZipPath).Path
 $FixtureExecutable = (Resolve-Path -LiteralPath $FixtureExecutable).Path
 if ([string]::IsNullOrWhiteSpace($WorkDirectory)) {
@@ -256,6 +327,56 @@ try {
     $report.checks += 'consent-analysis-inference-manual-gates-and-corrected-output'
     [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 1 })
 
+    Write-Host 'Package scenario: generic PDF grouping, exclusions, manual order and downloads.'
+    $genericRoot = Join-Path $WorkDirectory '通用 合成资料'
+    $genericOutput = Join-Path $genericRoot 'groupA/交付/最终 PDF'
+    $genericDownloads = Join-Path $WorkDirectory '通用 下载核验'
+    [void](New-Item -ItemType Directory -Path $genericOutput, (Join-Path $genericRoot 'groupB/indexImg'), (Join-Path $genericRoot '忽略整组'), $genericDownloads)
+    $nativeFixture = Join-Path $fixtureRoot '合成分项/260101-00001/2601_00001_3.pdf'
+    $genericTags = @{ 'groupA/2.pdf' = 'A002'; 'groupA/10.pdf' = 'A010'; 'groupB/3.pdf' = 'B003'; 'groupB/20.pdf' = 'B020' }
+    foreach ($relative in $genericTags.Keys) {
+        Copy-TaggedSyntheticPdf $nativeFixture (Join-Path $genericRoot $relative) $genericTags[$relative]
+    }
+    Copy-Item -LiteralPath $nativeFixture -Destination (Join-Path $genericRoot 'groupA/跳过.pdf')
+    Copy-Item -LiteralPath $nativeFixture -Destination (Join-Path $genericRoot '忽略整组/排除.pdf')
+    Copy-Item -LiteralPath $nativeFixture -Destination (Join-Path $genericOutput '历史排除.pdf')
+    [IO.File]::WriteAllText((Join-Path $genericRoot 'groupB/indexImg/不能纳入.pdf'), 'SYNTHETIC INVALID PDF; MUST BE EXCLUDED BEFORE PARSING')
+    $genericRequest = @{ root = $genericRoot; output_dir = $genericOutput; level = 1; exclude_paths = @('groupA/跳过.pdf', '忽略整组'); sort = 'natural_asc' }
+    $genericPlan = Invoke-SmokeApi $service 'POST' '/generic/scan' $genericRequest
+    $genericPlanId = $genericPlan.id
+    Assert-True ($genericPlan.mode -eq 'generic_pdf' -and $genericPlan.level -eq 1 -and @($genericPlan.groups).Count -eq 2) 'Generic level-one scan did not produce the two expected groups.'
+    Assert-True ((Get-ComparablePath $genericPlan.output_dir) -eq (Get-ComparablePath $genericOutput)) 'The custom nested generic output directory was not retained.'
+    Assert-True (@($genericPlan.issues | Where-Object severity -EQ 'error').Count -eq 0) 'Synthetic generic scan unexpectedly reported an error.'
+    Assert-True (($genericPlan.groups[0].files.name -join ',') -eq '2.pdf,10.pdf' -and ($genericPlan.groups[1].files.name -join ',') -eq '3.pdf,20.pdf') 'Generic natural sorting or file exclusions are incorrect.'
+    Assert-True (@($genericPlan.exclude_globs) -contains '**/indexImg/**') 'The generic indexImg exclusion preset was not applied by default.'
+    Assert-True (@($genericPlan.exclusions | Where-Object { $_.kind -eq 'path' -and @($_.matches).Count -gt 0 }).Count -eq 2) 'An explicit generic file/directory exclusion did not match.'
+    Assert-True (@($genericPlan.exclusions | Where-Object { $_.kind -eq 'glob' -and $_.rule -eq '**/indexImg/**' -and @($_.matches).Count -gt 0 }).Count -eq 1) 'The indexImg preset did not exclude its invalid PDF.'
+    Assert-True (@($genericPlan.exclusions | Where-Object { $_.kind -eq 'output' -and @($_.matches).Count -gt 0 }).Count -eq 1) 'The nested generic output directory was scanned as input.'
+    $genericOne = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/generic/plans/$genericPlanId/generate" @{})
+    Assert-True ($genericOne.kind -eq 'generic_generate' -and $genericOne.total -eq 8 -and $genericOne.threads -eq 1 -and @($genericOne.results | Where-Object status -EQ 'completed').Count -eq 2) 'Single-thread generic generation did not produce both four-page outputs.'
+    Assert-GenericOutput $service $genericOne $genericPlan $genericDownloads $genericTags
+    $report.checks += 'generic-level-output-exclusion-preset-natural-order-single-thread-and-real-pdf-pages'
+
+    $genericOrders = @($genericPlan.groups | ForEach-Object {
+        $ids = @($_.files | Select-Object -ExpandProperty id)
+        [array]::Reverse($ids)
+        $name = if ($_.relative_path -eq 'groupA') { '甲组倒序.pdf' } else { '乙组倒序.pdf' }
+        @{ group_id = $_.id; file_ids = $ids; output_name = $name }
+    })
+    $genericManual = Invoke-SmokeApi $service 'POST' "/generic/plans/$genericPlanId/order" @{ groups = $genericOrders }
+    $genericManualId = $genericManual.id
+    Assert-True ($genericManual.id -ne $genericPlanId -and $genericManual.parent_plan_id -eq $genericPlanId -and $genericManual.sort -eq 'manual') 'Generic ordering did not create an immutable derived plan.'
+    Assert-True (($genericManual.groups[0].files.name -join ',') -eq '10.pdf,2.pdf' -and $genericManual.groups[0].output_name -eq '甲组倒序.pdf' -and ($genericManual.groups[1].files.name -join ',') -eq '20.pdf,3.pdf') 'The requested manual order or renamed output was lost.'
+    $genericOriginal = Invoke-SmokeApi $service 'GET' "/generic/plans/$genericPlanId"
+    Assert-True ($genericOriginal.sort -eq 'natural_asc' -and ($genericOriginal.groups[0].files.name -join ',') -eq '2.pdf,10.pdf' -and $genericOriginal.groups[0].output_name -eq 'groupA.pdf') 'Editing a generic plan changed the original historical plan.'
+    [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 10 })
+    $genericTen = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/generic/plans/$genericManualId/generate" @{})
+    Assert-True ($genericTen.total -eq 8 -and $genericTen.threads -eq 10 -and @($genericTen.results | Where-Object status -EQ 'completed').Count -eq 2) 'Ten-thread generic generation did not retain its requested thread limit.'
+    Assert-GenericOutput $service $genericTen $genericManual $genericDownloads $genericTags
+    Assert-GenericOutput $service $genericOne $genericPlan $genericDownloads $genericTags
+    [void](Invoke-SmokeApi $service 'PATCH' '/settings' @{ threads = 1 })
+    $report.checks += 'generic-immutable-manual-order-rename-ten-threads-report-and-output-downloads'
+
 
     Stop-SmokeProcess $service.Process
     $service = $null
@@ -281,6 +402,20 @@ try {
     Assert-True (@($latestReport.manifests).Count -eq 2 -and $latestReport.manifests[0].orientation_workflow.enabled -eq $true) 'Latest report download failed after metadata separation.'
     Assert-True (@($latestReport.manifests[0].sources).Count -eq 3 -and $latestReport.manifests[0].pages -eq 4) 'Latest report lost source/page mappings.'
     $report.checks += 'metadata-outside-output-and-job-report-snapshots'
+
+    $genericResumed = Invoke-SmokeApi $service 'GET' "/generic/plans/$genericManualId"
+    Assert-True ($genericResumed.parent_plan_id -eq $genericPlanId -and $genericResumed.sort -eq 'manual' -and ($genericResumed.groups[0].files.name -join ',') -eq '10.pdf,2.pdf') 'The manual generic plan did not survive restart.'
+    $genericHistory = @(Invoke-SmokeApi $service 'GET' '/generic/jobs')
+    Assert-True (@($genericHistory | Where-Object { $_.id -eq $genericTen.id -and $_.status -eq 'completed' -and $_.threads -eq 10 }).Count -eq 1) 'Generic completed history or thread snapshot did not survive restart.'
+    $genericReuse = Wait-SmokeJob $service (Invoke-SmokeApi $service 'POST' "/generic/plans/$genericManualId/generate" @{})
+    Assert-True ($genericReuse.total -eq 8 -and $genericReuse.threads -eq 1 -and @($genericReuse.results | Where-Object status -EQ 'skipped').Count -eq 2) 'Restart did not reuse both verified generic outputs with the current single-thread preference.'
+    Assert-GenericOutput $service $genericReuse $genericResumed $genericDownloads $genericTags
+    Assert-GenericOutput $service $genericTen $genericManual $genericDownloads $genericTags
+    Assert-GenericOutput $service $genericOne $genericPlan $genericDownloads $genericTags
+    $genericRescan = Invoke-SmokeApi $service 'POST' '/generic/scan' $genericRequest
+    Assert-True (@($genericRescan.groups).Count -eq 2 -and @($genericRescan.groups | ForEach-Object { $_.files }).Count -eq 4) 'Rescanning reingested the nested generic outputs.'
+    Assert-True (@(Get-ChildItem -LiteralPath $genericOutput -File | Where-Object Extension -NE '.pdf').Count -eq 0) 'The generic output directory contains bookkeeping instead of only PDFs.'
+    $report.checks += 'generic-restart-preserves-history-and-manual-plan-reuses-output-and-excludes-output-on-rescan'
     $report.passed = $true
 }
 finally {
@@ -290,5 +425,5 @@ finally {
     $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $WorkDirectory 'smoke-summary.json') -Encoding utf8
 }
 
-Write-Host 'Windows package smoke passed: synthetic 2 vouchers, 4 images + 4 native PDF pages; runtime, consent, confirmation, correction, restart, reuse, separate metadata/report snapshots and one-to-ten-thread settings verified.'
+Write-Host 'Windows package smoke passed: synthetic voucher workflow and generic PDF merging; runtime, orientation review, manual file order, grouping/exclusions, real PDF page-tree/download checks, restart/history/reuse, separate reports and one-to-ten-thread settings verified.'
 Write-Output (Join-Path $WorkDirectory 'smoke-summary.json')

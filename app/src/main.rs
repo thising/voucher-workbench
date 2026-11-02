@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::{path::PathBuf, process::ExitCode};
-use voucher_workbench::launcher::{LaunchPaths, RuntimeDiagnostic};
+use voucher_workbench::launcher::{LaunchPaths, RuntimeDiagnostic, StartupOptions};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "本地凭证 PDF 工作台", args_override_self = true)]
@@ -20,6 +20,10 @@ struct Args {
     no_browser: bool,
     #[arg(long, help = "检查并加载本地OCR组件，输出JSON后退出，不创建处理记录")]
     check_runtime: bool,
+    #[arg(long, hide = true)]
+    browser_command: Option<PathBuf>,
+    #[arg(long, hide = true, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=10000))]
+    startup_delay_ms: u64,
 }
 
 #[tokio::main]
@@ -48,12 +52,16 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match voucher_workbench::server::run(
+    match voucher_workbench::server::run_with_options(
         args.port,
         paths.state_dir,
         paths.model,
         args.runtime,
         !args.no_browser,
+        StartupOptions {
+            browser_command: args.browser_command,
+            startup_delay_ms: args.startup_delay_ms,
+        },
     )
     .await
     {

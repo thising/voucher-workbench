@@ -50,6 +50,14 @@ jobs:
           if ($archives.Count -ne 1) { throw 'Expected exactly one Windows test package.' }
           ./app/tools/smoke-windows.ps1 -ZipPath $archives[0].FullName -FixtureExecutable "$env:GITHUB_WORKSPACE/app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe"
 
+      - name: Exercise the real packaged CMD entry in isolated Windows consoles
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          $archives = @(Get-ChildItem dist/voucher-workbench-*-windows-x64.zip)
+          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows test package.' }
+          $examples = "$env:GITHUB_WORKSPACE/app/target/windows-dist/x86_64-pc-windows-msvc/release/examples"
+          ./app/tools/smoke-windows-launcher.ps1 -ZipPath $archives[0].FullName -FixtureExecutable "$examples/package_fixture.exe" -ProbeExecutable "$examples/startup_probe.exe"
+
       - name: Upload verified test package
         if: success() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
