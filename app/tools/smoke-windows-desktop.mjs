@@ -108,7 +108,7 @@ async function native(pid,action,extra=[]) {
   const result=await exec('pwsh',['-NoProfile','-File',nativeScript,'-OwnedProcessId',String(pid),'-Action',action,...extra],{windowsHide:true,timeout:35000,maxBuffer:100000});
   const control=JSON.parse(result.stdout);
   assert(control.controlled,'Owned native control did not confirm its action.');
-  report.last_native_action={action,state:'controlled',save_target_verified:control.save_target_verified,filename_controls:control.filename_controls};await writeReport();
+  report.last_native_action={action,state:'controlled',save_target_verified:control.save_target_verified,filename_controls:control.filename_controls,expected_text_source:control.expected_text_source,button_source:control.button_source};await writeReport();
 }
 function start(args) {
   const child=spawn(exe,args,{stdio:['ignore','pipe','pipe'],windowsHide:false});
@@ -325,10 +325,10 @@ try {
   assert(['queued','running'].includes(busyAfter.status),'Synthetic OCR finished before the task-running activation could be verified.');
   assert(busyAfter.done>=busyBefore.done,'Repeated startup reset task progress.');
   await native(pid,'close');
-  await native(pid,'cancel',['-ExpectedText','任务或文件保存仍在进行']);
+  await native(pid,'cancel',['-ExpectedText','任务或文件保存仍在进行','-ButtonText','继续处理']);
   await until(async()=>(await probe(probes)).event==='close_cancelled_task_continues','native continue choice');
   assert(['queued','running'].includes((await api(`/jobs/${busyJob.id}`)).status),'Continue choice stopped the task.');
-  await native(pid,'close');await native(pid,'accept',['-ExpectedText','安全停止并退出']);
+  await native(pid,'close');await native(pid,'accept',['-ExpectedText','安全停止并退出','-ButtonText','安全停止并退出']);
   await exited(pid);await endSession();
   const stopped=JSON.parse(await fs.readFile(path.join(state,'jobs',`${busyJob.id}.json`),'utf8'));
   assert.equal(stopped.status,'cancelled','Safe close did not persist a cancelled task.');

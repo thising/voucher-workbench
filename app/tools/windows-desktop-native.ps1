@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory)][int]$OwnedProcessId,
     [Parameter(Mandatory)][ValidateSet('minimize','close','cancel','accept','save','error')][string]$Action,
     [string]$SavePath,
-    [string]$ExpectedText
+    [string]$ExpectedText,
+    [string]$ButtonText
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -23,6 +24,7 @@ public static class OwnedDesktop {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
   [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr h);
   [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
@@ -39,7 +41,18 @@ public static class OwnedDesktop {
   public static string Contents(IntPtr h) { var lines=new List<string>{Text(h)}; EnumChildWindows(h,(c,p)=> {lines.Add(Text(c));return true;},IntPtr.Zero);return string.Join("\n",lines); }
   public static void Minimize(IntPtr h) { ShowWindow(h,6); }
   public static void Close(IntPtr h) { PostMessageW(h,0x10,IntPtr.Zero,IntPtr.Zero); }
-  public static bool Button(IntPtr h,int id) { var b=GetDlgItem(h,id);if(b==IntPtr.Zero)return false;PostMessageW(b,0xF5,IntPtr.Zero,IntPtr.Zero);return true; }
+  public static bool Button(IntPtr h,int id,int pid) {
+    uint rootPid;GetWindowThreadProcessId(h,out rootPid);
+    if(rootPid!=(uint)pid || Class(h)!="#32770" || !IsWindowVisible(h) || !IsWindowEnabled(h))throw new InvalidOperationException("Owned native dialog is no longer interactive.");
+    var candidates=new List<IntPtr>();
+    EnumChildWindows(h,(c,p)=> {uint owner;GetWindowThreadProcessId(c,out owner);
+      if(owner==(uint)pid && Class(c)=="Button" && GetDlgCtrlID(c)==id && IsWindowVisible(c) && IsWindowEnabled(c))candidates.Add(c);
+      return candidates.Count<2;},IntPtr.Zero);
+    if(candidates.Count>1)throw new InvalidOperationException("Owned native button ID is ambiguous.");
+    if(candidates.Count==0)return false;
+    if(!PostMessageW(candidates[0],0xF5,IntPtr.Zero,IntPtr.Zero))throw new InvalidOperationException("Owned native button invocation failed.");
+    return true;
+  }
   public static string SaveControls(IntPtr h) {
     var info=new List<string>();
     EnumChildWindows(h,(c,p)=> {
@@ -66,12 +79,8 @@ do {
     Start-Sleep -Milliseconds 100
 } while ([DateTimeOffset]::UtcNow -lt $deadline)
 if ($window -eq [IntPtr]::Zero) { throw 'The expected owned native window did not appear.' }
-$contents = if ($dialog) { [OwnedDesktop]::Contents($window) } else { '' }
-$textSource = 'win32'
-$textControlsChecked = 0
-if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]::Ordinal)) {
-    # Modern TaskDialog text can be a virtual DirectUI element. Retain the exact
-    # text assertion, using a read-only .NET Framework UIA client in this HWND.
+function Invoke-OwnedDialogUia([string]$RequestedButton = '') {
+    if (-not $ExpectedText) { throw 'Owned dialog UIA requires the expected explanation.' }
     $textStart = [Diagnostics.ProcessStartInfo]::new()
     $textStart.FileName = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'
     $textStart.UseShellExecute = $false
@@ -81,6 +90,7 @@ if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]:
     $textStart.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $textStart.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-Mta','-File',(Join-Path $PSScriptRoot 'windows-dialog-text-uia.ps1'),'-OwnedProcessId',[string]$OwnedProcessId,'-OwnedWindowHandle',$window.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture),'-ExpectedText',$ExpectedText)) { $textStart.ArgumentList.Add($argument) }
+    if ($RequestedButton) { $textStart.ArgumentList.Add('-ButtonText'); $textStart.ArgumentList.Add($RequestedButton) }
     $textProcess = [Diagnostics.Process]::Start($textStart)
     try {
         $textOutput = $textProcess.StandardOutput.ReadToEndAsync()
@@ -97,15 +107,37 @@ if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]:
             $textFailure = if ([string]$textResult.failure -match '^[a-z0-9-]{1,80}$') { [string]$textResult.failure } else { 'assertion-failed' }
             throw "The owned dialog did not contain the expected Chinese explanation ($textFailure)."
         }
-        $textSource = 'uia'
-        $textControlsChecked = [Math]::Min(512,[Math]::Max(0,[int]$textResult.controls_checked))
+        if ($RequestedButton -and (-not $textResult.PSObject.Properties['activated'] -or
+            $textResult.activated -isnot [bool] -or $textResult.activated -ne $true)) {
+            throw 'Owned dialog UIA did not activate the exact requested button.'
+        }
+        return $textResult
     } finally { if (-not $textProcess.HasExited) { $textProcess.Kill() }; $textProcess.Dispose() }
+}
+$contents = if ($dialog) { [OwnedDesktop]::Contents($window) } else { '' }
+$textSource = 'win32'
+$textControlsChecked = 0
+if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]::Ordinal)) {
+    # Text-only fallback remains read-only, even if ButtonText was supplied.
+    $textResult = Invoke-OwnedDialogUia
+    $textSource = 'uia'
+    $textControlsChecked = [Math]::Min(512,[Math]::Max(0,[int]$textResult.controls_checked))
 }
 switch ($Action) {
     minimize { [OwnedDesktop]::Minimize($window) }
     close { [OwnedDesktop]::Close($window) }
-    cancel { if (-not [OwnedDesktop]::Button($window,1001) -and -not [OwnedDesktop]::Button($window,2)) { [OwnedDesktop]::Close($window) } }
-    accept { if (-not [OwnedDesktop]::Button($window,1000) -and -not [OwnedDesktop]::Button($window,1)) { throw 'The owned confirmation button was not found.' } }
+    cancel {
+        if (-not [OwnedDesktop]::Button($window,1001,$OwnedProcessId) -and -not [OwnedDesktop]::Button($window,2,$OwnedProcessId)) {
+            if ($ButtonText) { $null = Invoke-OwnedDialogUia $ButtonText }
+            else { [OwnedDesktop]::Close($window) }
+        }
+    }
+    accept {
+        if (-not [OwnedDesktop]::Button($window,1000,$OwnedProcessId) -and -not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) {
+            if ($ButtonText) { $null = Invoke-OwnedDialogUia $ButtonText }
+            else { throw 'The owned confirmation button was not found.' }
+        }
+    }
     save {
         if (-not $SavePath -or -not [IO.Path]::IsPathFullyQualified($SavePath)) { throw 'Native save test requires an absolute owned fixture path.' }
         # Modern IFileSaveDialog exposes virtual UIA filename controls whose
@@ -132,7 +164,7 @@ switch ($Action) {
             if (-not $saveControlResult.controlled -or -not $saveControlResult.save_target_verified) { throw 'Owned UI Automation did not verify the filename target.' }
         } finally { if (-not $uiProcess.HasExited) { $uiProcess.Kill() }; $uiProcess.Dispose() }
     }
-    error { if (-not [OwnedDesktop]::Button($window,1)) { throw 'The owned native error acknowledgement was not found.' } }
+    error { if (-not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) { throw 'The owned native error acknowledgement was not found.' } }
 }
 $result = [ordered]@{controlled=$true; action=$Action; owned_pid=$OwnedProcessId; expected_text_checked=[bool]$ExpectedText}
 if ($ExpectedText) { $result['expected_text_source'] = $textSource; $result['text_controls_checked'] = $textControlsChecked }

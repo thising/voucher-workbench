@@ -83,7 +83,9 @@ NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter
 
 [第十一轮CI #26](https://github.com/thising/voucher-workbench/actions/runs/41511261964)，源码 `e054c6af1bfb7fd17f3621c424096ff0ac3d4e2a`，完整检查/构建、兼容和5轮并发复跑通过。11项真实业务通过，含Tauri PDF/报告原生保存、真实路径与bytes、执行时同名所有选择且无备份、重复启动唤回；原地卸载亦过。OCR中关闭确认的期望正文与源码一致，但Win32读取未命中现代TaskDialog的虚拟文字。测试助手现在仅在原读取不命中时用exact owned UIA Name进行有界精确Contains比较，仅返回布尔与计数、不输出正文；快速预检增加真实common-controls TaskDialog取消/确认及中文正文校验。已通过本地C#5、11份PowerShell语法检查。
 
-**本轮构件状态：准备第十二轮快速对话框预检和完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
+[第十二轮CI #27](https://github.com/thising/voucher-workbench/actions/runs/41514251194)，源码 `71fa933e543e6a04d5d2a2dca24644f948a5b727`，快速预检的保存、中文正文及取消通过，确认按钮未由直接child GetDlgItem找到。测试现在传入明确按钮名称，保留原生句柄优先，并对虚拟按钮使用exact owned root内唯一可见可用、Name完全相同的InvokePattern；调用后仍验证实际确认/取消结果及产品任务状态。
+
+**本轮构件状态：准备第十三轮快速预检与完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
 
 CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 
