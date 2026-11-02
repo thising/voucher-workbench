@@ -2,7 +2,7 @@
 
 **PDF工作台 0.6.0** 是在本机独立窗口运行的图片与 PDF 批量整理工具，采用 Tauri＋Rust，不需要外部浏览器、Office、Python、Node 或 Docker。资料、图片方向识别和处理记录均在本机处理，运行不使用 CDN。
 
-当前有效依据只有[批量合并规格](openspec/specs/batch-merge/spec.md)及[桌面与 Windows 发行规格](openspec/specs/windows-distribution/spec.md)；旧凭证、旧通用 PDF 规格仅用于 0.5.x 记录与接口兼容。本轮已获准按固定 **0.6.0 Windows 10/11 x64** 基线进入 CI 构建和客户包整理，构建结果、附件及校验值统一见[发行验收记录](docs/windows-release.md)。客户 Windows 10 的实际双击、组件安装、单位策略及真实资料验收单独记录，不能由本机验证或 CI 代替。
+当前有效依据只有[批量合并规格](openspec/specs/batch-merge/spec.md)及[桌面与 Windows 发行规格](openspec/specs/windows-distribution/spec.md)；旧凭证、旧通用 PDF 规格仅用于 0.5.x 记录与接口兼容。当前发行基线为 **0.6.0 Windows 10/11 x64**，构建结果、附件及校验值统一见[发行验收记录](docs/windows-release.md)。客户 Windows 10 的实际双击、组件安装、单位策略及真实资料验收单独记录，不能由本机验证或 CI 代替。
 
 ## 使用流程
 
