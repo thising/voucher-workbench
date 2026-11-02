@@ -260,7 +260,7 @@ mod tests {
                 &request,
                 serde_json::to_vec(&serde_json::json!({
                     "entry": entry,
-                    "arguments": [input.to_string_lossy(), "argument with spaces".into()],
+                    "arguments": [input.to_string_lossy(), "argument with spaces"],
                     "cwd": temp.path(),
                     "code_page": code_page,
                     "environment": {}
