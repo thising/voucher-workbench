@@ -193,6 +193,10 @@ fn reject_network(path: &Path) -> Result<()> {
 }
 fn absolute_checked(path: &Path, must_exist: bool) -> Result<PathBuf> {
     reject_network(path)?;
+    #[cfg(windows)]
+    if matches!(path.components().next(), Some(Component::Prefix(_))) && !path.is_absolute() {
+        bail!("盘符路径必须包含完整根目录，例如C:\\资料；不支持C:资料这样的盘符相对路径");
+    }
     let path = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -202,6 +206,13 @@ fn absolute_checked(path: &Path, must_exist: bool) -> Result<PathBuf> {
     for part in path.components() {
         match part {
             Component::CurDir => continue,
+            // A drive prefix (especially \\?\C:) is not a complete root
+            // until the next RootDir component has been appended. Querying it
+            // alone returns ERROR_INVALID_FUNCTION on Windows.
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
             Component::ParentDir => {
                 if !current.pop() {
                     bail!("路径超出文件系统根目录");
@@ -1124,6 +1135,15 @@ pub fn validate_generation(plan: &Plan, request: &GenerateRequest) -> Result<u32
 }
 
 fn check_file(plan: &Plan, file: &File) -> Result<PathBuf> {
+    check_file_content(plan, file).with_context(|| {
+        format!(
+            "来源PDF无法访问或已变化，请检查该文件并重新扫描：{}",
+            file.relative_path
+        )
+    })
+}
+
+fn check_file_content(plan: &Plan, file: &File) -> Result<PathBuf> {
     let root = absolute_checked(Path::new(&plan.root), true)?;
     if path_key(&root) != path_key(Path::new(&plan.root)) {
         bail!("资料目录已变化，请重新扫描");

@@ -552,6 +552,9 @@ fn source_change_with_same_size_and_timestamp_is_rejected_and_failure_is_group_l
         .unwrap();
     let job = generate(&state, plan, 2);
     assert_eq!(job.status, "completed_with_errors");
+    let failure = job.results.iter().find(|r| r.status == "failed").unwrap();
+    let error = failure.error.as_deref().unwrap();
+    assert!(error.contains("请检查该文件并重新扫描") && error.contains("A/1.pdf"));
     assert_eq!(
         job.results.iter().filter(|r| r.status == "failed").count(),
         1
@@ -1030,6 +1033,28 @@ fn shared_job_gate_restart_and_retry_preserve_original_thread_snapshot() {
         req.root = path.into();
         assert!(generic::scan(req).unwrap_err().to_string().contains("本地"));
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_drive_and_verbatim_roots_are_checked_only_when_complete() {
+    let f = Fixture::new();
+    f.pdf("1.pdf", 1);
+    let verbatim = f.request(0);
+    assert!(verbatim.root.starts_with(r"\\?\"));
+    assert_eq!(generic::scan(verbatim.clone()).unwrap().groups[0].pages, 1);
+    let mut ordinary = verbatim.clone();
+    ordinary.root = ordinary.root.strip_prefix(r"\\?\").unwrap().into();
+    ordinary.output_dir = ordinary
+        .output_dir
+        .map(|p| p.strip_prefix(r"\\?\").unwrap().into());
+    assert_eq!(generic::scan(ordinary).unwrap().groups[0].pages, 1);
+    let mut drive_relative = verbatim;
+    drive_relative.root = "C:relative".into();
+    assert!(generic::scan(drive_relative)
+        .unwrap_err()
+        .to_string()
+        .contains("盘符路径必须包含完整根目录"));
 }
 
 #[cfg(windows)]
