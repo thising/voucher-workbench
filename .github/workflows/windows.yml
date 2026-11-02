@@ -64,6 +64,17 @@ jobs:
           if ($archives.Count -ne 1) { throw 'Expected exactly one Windows test package.' }
           ./app/tools/smoke-windows.ps1 -ZipPath $archives[0].FullName -FixtureExecutable "$env:GITHUB_WORKSPACE/app/target/windows-dist/x86_64-pc-windows-msvc/release/examples/package_fixture.exe"
 
+      - name: Check repeated parallel PDF compatibility jobs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          $settings = Get-Content app/distribution/windows-dependencies.json -Raw | ConvertFrom-Json
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          foreach ($iteration in 1..5) {
+            Write-Host "Parallel PDF compatibility pass $iteration of 5"
+            & cargo "+$($settings.rust_toolchain)" test --manifest-path app/Cargo.toml --locked --target $settings.target --target-dir app/target/windows-dist --test generic
+            if ($LASTEXITCODE -ne 0) { throw "Parallel PDF compatibility pass $iteration failed." }
+          }
+
       - name: Prepare pinned native WebDriver and matching Microsoft EdgeDriver
         if: github.event_name == 'workflow_dispatch'
         run: |

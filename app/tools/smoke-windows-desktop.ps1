@@ -48,6 +48,7 @@ try {
     if (-not $installation.WaitForExit(180000) -or $installation.ExitCode -ne 0) { throw 'Current-user NSIS installation failed.' }
     $installedExe = Join-Path $installed 'pdf-workbench.exe'
     if (-not (Test-Path -LiteralPath $installedExe)) { throw 'Installer did not place the desktop executable at the requested owned path.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $installed 'uninstall.exe'))) { throw 'Installer did not provide its current-user uninstaller.' }
     $installedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash.ToLowerInvariant()
     $portableHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($installedHash -ne $portableHash) { throw "Portable and installed GUI binaries differ: portable SHA256=$portableHash, installed SHA256=$installedHash." }
@@ -114,12 +115,21 @@ try {
     if (Test-Path -LiteralPath $uninstaller) {
         $removeInfo = [Diagnostics.ProcessStartInfo]::new()
         $removeInfo.FileName = $uninstaller
-        $removeInfo.ArgumentList.Add('/S')
+        # NSIS otherwise starts a temporary copy and returns before uninstall
+        # finishes. Its documented _?= argument must be last and unquoted.
+        $removeInfo.Arguments = "/S _?=$installed"
         $removeInfo.UseShellExecute = $false
         $remove = [Diagnostics.Process]::Start($removeInfo)
-        if (-not $remove.WaitForExit(120000)) { throw 'Owned current-user test uninstall did not finish.' }
-        if ($remove.ExitCode -ne 0) { throw 'Owned current-user test uninstall failed.' }
-        $remove.Dispose()
+        try {
+            if (-not $remove.WaitForExit(120000)) { throw 'Owned current-user test uninstall did not finish.' }
+            if ($remove.ExitCode -ne 0) { throw 'Owned current-user test uninstall failed.' }
+            if (Test-Path -LiteralPath $installedExe) { throw 'Owned installed executable remains after uninstall.' }
+        } finally { if (-not $remove.HasExited) { $remove.Kill() }; $remove.Dispose() }
+        # In-place NSIS cannot remove its own image until it has exited.
+        Remove-Item -LiteralPath $uninstaller -Force
+        $report = Get-Content -LiteralPath $reportFile -Raw -Encoding utf8 | ConvertFrom-Json
+        $report.checks += 'current-user-uninstall-completed-and-main-executable-removed'
+        $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8NoBOM
     }
   } catch {
     Write-DesktopResult $false 'cleanup-failed' $_.Exception.Message

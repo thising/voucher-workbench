@@ -65,7 +65,11 @@ CI仅上传受限合成截图与摘要，不上传含token的原始服务日志�
 
 [第五轮CI #20](https://github.com/thising/voucher-workbench/actions/runs/41497787382)，源码 `1f4b344e7f6e2402a6223780d22c9e7029bb52c9`，真实窗口8项已通过，窄屏无横向溢出；checkpoint保留的明确原因是另存文件名候选数0，物理控件链为Edit1001→ComboBox0。现改用Windows内置.NET Framework UI Automation，在确切测试PID/HWND内按FileNameControlHost查找可写编辑控件，SetValue后精确读回，再调用Save；不依赖搜索框顺序或物理ComboBox编号。独立无窗口客户端采用[微软建议的MTA线程](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)，只输出结构化有界证据。9份PowerShell语法检查、C#控制器编译、外层报告保留与59API/193DOM回归通过；真实UIA行为待下一轮Windows验证。
 
-**本轮构件状态：第六轮测试助手修订已完成本地检查，待固定源码并运行CI；附件和SHA256待完整通过并独立验包后填写。**
+[第六轮CI #21](https://github.com/thising/voucher-workbench/actions/runs/41502187192)，源码 `08099da3471c4e9d034e58f41ef97854bb1a96d9`，50项lib、43项batch及15项generic已通过；generic重启重试用例出现completed_with_errors，未到原生UIA验证。原断言未输出分组错误，原因待查；已加强失败诊断，不跳过或放宽用例。下一轮在原全套检查之外，另完整重复5轮默认并发generic suite，验证重启重试与同进程其他并发测试；没有证据前不改业务代码。
+
+NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter3.html#3.2.2)使用末尾不带引号的 `_?=` 原地卸载，等待其完成并断言安装EXE消失，避免只等待转交给临时副本的启动进程。该修订仅作用于CI测试助手。
+
+**本轮构件状态：已补充分组诊断、5轮并发兼容稳定性门禁与卸载完成检查，待固定第七轮源码并运行CI；Windows原生另存及附件/SHA256仍待完整CI与独立验包。**
 
 开发重建入口：`pwsh -File app/tools/build-windows-desktop.ps1`；`-CheckOnly`只检查，输出与缓存支持隔离目录，同名发行文件拒绝覆盖。准确依赖许可与源码归档地址随包提供。
 

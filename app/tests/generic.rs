@@ -1028,7 +1028,10 @@ fn shared_job_gate_restart_and_retry_preserve_original_thread_snapshot() {
     let retry = loaded.retry(&interrupted.id).unwrap();
     assert_eq!(retry.threads, 7);
     let completed = wait(&loaded, &retry.id);
-    assert_eq!(completed.status, "completed");
+    assert_eq!(
+        completed.status, "completed",
+        "retry job and per-group results: {completed:#?}"
+    );
     assert_eq!(completed.results.len(), 2);
     for path in ["\\\\server\\share", "\\\\?\\UNC\\server\\share"] {
         let mut req = f.request(0);
