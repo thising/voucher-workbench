@@ -2200,7 +2200,11 @@ mod path_observation_tests {
         })
         .unwrap_err();
         assert_eq!(observations, 2);
-        assert!(error.to_string().contains("重解析点"));
+        let reason = error.to_string();
+        assert!(
+            reason.contains("符号链接") || reason.contains("重解析点"),
+            "junction must be rejected as a link or reparse point: {error:#}"
+        );
         fs::remove_dir(junction).unwrap();
     }
 

@@ -79,7 +79,9 @@ NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter
 
 [第九轮CI #24](https://github.com/thising/voucher-workbench/actions/runs/41509095101)，源码 `d4c4235e587197a5e4e55627197ea3e4cdd97908`，快速预检已精确匹配主机范围内的原生Edit；FromHandle却仍将其标为Pane且没有ValuePattern，显式加载Framework proxies后亦相同。原生PID/HWND/结构匹配通过，尚无产品运行结果。测试现保留ValuePattern优先，缺失时仅向该唯一受检Edit发送聚焦/选择/UTF16字符消息、精确WM_GETTEXT读回，单消息及总耗时有界，每字符重验边界、只读和归属；没有全局输入。
 
-**本轮构件状态：准备第十轮快速预检及完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
+[第十轮CI #25](https://github.com/thising/voucher-workbench/actions/runs/41509972932)，源码 `77f35047dec7567b7f4c2bc0e78f510e78330d53`，现代保存预检已通过并实际落盘至指定位置。Windows库53项通过，新增junction用例因仅接受“重解析点”文案失败：函数已经返回拒绝错误，但未接受同样有效的“符号链接”拒绝分支。测试现接受这两种安全拒绝并打印未知错误，不改变程序保护或放行junction。
+
+**本轮构件状态：准备第十一轮完整CI；保存控制器已验证，完整产品验收、附件/SHA256尚未完成。**
 
 CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 
