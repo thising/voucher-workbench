@@ -77,7 +77,9 @@ NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter
 
 文件名测试助手已增加精确UIA主机矩形→同PID原生Edit/ComboBox树→FromHandle可写ValuePattern桥接，必要时仅对自有ID1保存按钮投递消息；所有权、唯一性、物理像素边界和读回均须通过。C#5真实定义编译及10份PowerShell解析通过，Windows行为仍待快速预检和完整随包测试。
 
-**本轮构件状态：准备固定第九轮测试助手；共享路径补丁本机已过，完整Windows CI、附件/SHA256尚未完成。**
+[第九轮CI #24](https://github.com/thising/voucher-workbench/actions/runs/41509095101)，源码 `d4c4235e587197a5e4e55627197ea3e4cdd97908`，快速预检已精确匹配主机范围内的原生Edit；FromHandle却仍将其标为Pane且没有ValuePattern，显式加载Framework proxies后亦相同。原生PID/HWND/结构匹配通过，尚无产品运行结果。测试现保留ValuePattern优先，缺失时仅向该唯一受检Edit发送聚焦/选择/UTF16字符消息、精确WM_GETTEXT读回，单消息及总耗时有界，每字符重验边界、只读和归属；没有全局输入。
+
+**本轮构件状态：准备第十轮快速预检及完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
 
 CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 

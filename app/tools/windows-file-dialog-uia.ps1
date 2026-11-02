@@ -16,8 +16,8 @@ $script:FailureCode = 'initialization'
 $script:FilenameControls = @()
 $script:ClientsideProvidersLoaded = $false
 
-# Framework CodeDom-compatible C#: no global input, text retrieval or desktop
-# enumeration. Native controls must be children of the caller's exact dialog.
+# Framework CodeDom-compatible C#: no global input or desktop enumeration.
+# Text readback is limited to the exact, structurally verified filename child.
 $nativeDefinition = @'
 using System;
 using System.Collections.Generic;
@@ -30,6 +30,8 @@ public static class PdfWorkbenchDialogBridge {
     [DllImport("user32.dll")] static extern bool IsChild(IntPtr parent, IntPtr child);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsWindowUnicode(IntPtr window);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLongW(IntPtr window, int index);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr window);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr window);
@@ -39,6 +41,7 @@ public static class PdfWorkbenchDialogBridge {
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, IntPtr wparam, StringBuilder lparam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     static string ClassOf(IntPtr window) { StringBuilder text = new StringBuilder(128); GetClassNameW(window, text, text.Capacity); return text.ToString(); }
     static bool SameProcess(IntPtr window, int process) { uint actual; GetWindowThreadProcessId(window, out actual); return IsWindow(window) && actual == (uint)process; }
@@ -64,7 +67,8 @@ public static class PdfWorkbenchDialogBridge {
     }
     public static bool Filename(long handle, long root, int process, double left, double top, double right, double bottom) {
         IntPtr edit = new IntPtr(handle), dialog = new IntPtr(root);
-        if (!Root(root, process) || !Child(edit, dialog, process) || ClassOf(edit) != "Edit") return false;
+        if (!Root(root, process) || !Child(edit, dialog, process) || ClassOf(edit) != "Edit" ||
+            !IsWindowUnicode(edit) || (GetWindowLongW(edit, -16) & 0x800) != 0) return false;
         bool combo = false; bool reached = false; IntPtr parent = GetParent(edit);
         for (int depth = 0; depth < 20 && parent != IntPtr.Zero; depth++, parent = GetParent(parent)) {
             if (parent == dialog) { reached = true; break; }
@@ -75,6 +79,27 @@ public static class PdfWorkbenchDialogBridge {
         double[] rect = Bounds(handle); if (rect == null || rect[2] <= rect[0] || rect[3] <= rect[1]) return false;
         // Two physical pixels tolerate fractional UIA border rounding only.
         return rect[0] >= left - 2 && rect[1] >= top - 2 && rect[2] <= right + 2 && rect[3] <= bottom + 2;
+    }
+    public static bool SelectFilename(long handle, long root, int process, double left, double top, double right, double bottom) {
+        if (!Filename(handle, root, process, left, top, right, bottom)) return false;
+        IntPtr result;
+        if (SendMessageTimeoutW(new IntPtr(root), 0x28, new IntPtr(handle), new IntPtr(1), 2, 1000, out result) == IntPtr.Zero) return false;
+        if (!Filename(handle, root, process, left, top, right, bottom)) return false;
+        // EM_SETSEL selects this Edit's existing text, not a global key chord.
+        return SendMessageTimeoutW(new IntPtr(handle), 0xB1, IntPtr.Zero, new IntPtr(-1), 2, 1000, out result) != IntPtr.Zero;
+    }
+    public static bool FilenameChar(long handle, long root, int process, double left, double top, double right, double bottom, int utf16) {
+        if (utf16 < 0 || utf16 > 65535 || !Filename(handle, root, process, left, top, right, bottom)) return false;
+        IntPtr result;
+        // Directed Unicode WM_CHAR gives Edit/ComboBox their normal change
+        // notifications. There is no SendInput, clipboard or global keyboard.
+        return SendMessageTimeoutW(new IntPtr(handle), 0x102, new IntPtr(utf16), new IntPtr(1), 2, 1000, out result) != IntPtr.Zero;
+    }
+    public static bool VerifyFilename(long handle, long root, int process, double left, double top, double right, double bottom, string expected) {
+        if (expected == null || !Filename(handle, root, process, left, top, right, bottom)) return false;
+        StringBuilder actual = new StringBuilder(expected.Length + 2); IntPtr result;
+        if (SendMessageTimeoutW(new IntPtr(handle), 0xD, new IntPtr(actual.Capacity), actual, 2, 1000, out result) == IntPtr.Zero) return false;
+        return String.Equals(actual.ToString(), expected, StringComparison.Ordinal);
     }
     public static string[] Chain(long handle, long root, int process) {
         List<string> result = new List<string>(); IntPtr cursor = new IntPtr(handle), dialog = new IntPtr(root);
@@ -206,6 +231,17 @@ function Get-FilenameHost($Element, $Root) {
     return $null
 }
 
+function Get-VerifiedNativeBounds($Candidate, $Root) {
+    $null = Get-OwnedRoot
+    $hostScope = Get-ScopedAncestry $Candidate.host $Root
+    $bounds = Get-UiaBounds $Candidate.host
+    if (-not $hostScope.inside -or -not (Test-FilenameHost $Candidate.host.Current) -or
+        -not $Candidate.host.Current.IsEnabled -or $Candidate.host.Current.IsOffscreen -or $null -eq $bounds -or
+        -not [PdfWorkbenchDialogBridge]::Filename($Candidate.native_handle, $OwnedWindowHandle, $OwnedProcessId,
+            $bounds[0], $bounds[1], $bounds[2], $bounds[3])) { Stop-UiaSave 'filename-native-scope-changed' }
+    return ,$bounds
+}
+
 try {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { Stop-UiaSave 'windows-required' }
     if ($PSVersionTable.PSEdition -ne 'Desktop') { Stop-UiaSave 'windows-powershell-framework-required' }
@@ -316,6 +352,7 @@ try {
         $bridgeInfo = [pscustomobject]@{
             kind = 'owned-win32-bridge'; host = Get-ControlStructure $hostElement
             host_bounds = $hostBounds; native_controls = @(); from_handle = $null
+            input_mode = $null; readback_verified = $false
         }
         $script:FilenameControls = @($script:FilenameControls) + @($bridgeInfo)
         $nativeEdits = @([PdfWorkbenchDialogBridge]::VisibleEdits($OwnedWindowHandle, $OwnedProcessId))
@@ -347,11 +384,13 @@ try {
             control = Get-ControlStructure $nativeElement; ancestry = Get-ScopedAncestry $nativeElement $root
             value_pattern = [bool]$hasValue; read_only = if ($hasValue) { [bool]$valuePattern.Current.IsReadOnly } else { $null }
         }
-        if ($current.ProcessId -ne $OwnedProcessId -or $current.ControlType -ne [System.Windows.Automation.ControlType]::Edit -or
+        # The managed UIA proxy can report Pane/no patterns for this verified
+        # native Edit. Its exact HWND/PID identity remains mandatory.
+        if ($current.ProcessId -ne $OwnedProcessId -or
             (([long]$current.NativeWindowHandle -band 4294967295L) -ne ($nativeHandle -band 4294967295L))) {
             Stop-UiaSave 'filename-from-handle-identity-mismatch'
         }
-        if (-not $current.IsEnabled -or $current.IsOffscreen -or -not $hasValue -or $valuePattern.Current.IsReadOnly) {
+        if (-not $current.IsEnabled -or $current.IsOffscreen -or ($hasValue -and $valuePattern.Current.IsReadOnly)) {
             Stop-UiaSave 'filename-from-handle-not-writable'
         }
         [void]$candidates.Add([pscustomobject]@{
@@ -398,12 +437,7 @@ try {
     if ($filename.native_handle -ne 0) {
         # A native proxy may have no managed UIA-host ancestor. Revalidate its
         # HWND ancestry and exact physical relationship to the known UIA host.
-        $hostScope = Get-ScopedAncestry $filename.host $root
-        $hostBounds = Get-UiaBounds $filename.host
-        if (-not $hostScope.inside -or -not (Test-FilenameHost $filename.host.Current) -or
-            -not $filename.host.Current.IsEnabled -or $filename.host.Current.IsOffscreen -or $null -eq $hostBounds -or
-            -not [PdfWorkbenchDialogBridge]::Filename($filename.native_handle, $OwnedWindowHandle, $OwnedProcessId,
-                $hostBounds[0], $hostBounds[1], $hostBounds[2], $hostBounds[3])) { Stop-UiaSave 'filename-native-scope-changed' }
+        $hostBounds = Get-VerifiedNativeBounds $filename $root
     } else {
         $currentHost = Get-FilenameHost $filename.element $root
         if ($null -eq $currentHost -or -not [System.Windows.Automation.Automation]::Compare($currentHost, $filename.host)) {
@@ -411,14 +445,41 @@ try {
         }
     }
     if (-not $filename.element.Current.IsEnabled -or $filename.element.Current.IsOffscreen -or
-        $filename.pattern.Current.IsReadOnly) { Stop-UiaSave 'filename-not-writable' }
-    $script:FailureCode = 'filename-focus'
-    $filename.element.SetFocus()
-    $script:FailureCode = 'filename-write'
-    $filename.pattern.SetValue($SavePath)
-    $script:FailureCode = 'filename-readback'
-    if (-not [string]::Equals($filename.pattern.Current.Value, $SavePath, [StringComparison]::Ordinal)) {
-        Stop-UiaSave 'filename-readback-mismatch'
+        ($null -ne $filename.pattern -and $filename.pattern.Current.IsReadOnly)) { Stop-UiaSave 'filename-not-writable' }
+    if ($null -eq $filename.pattern -and $filename.native_handle -ne 0) {
+        $bridgeInfo.input_mode = 'owned-edit-wm-char'
+        $script:FailureCode = 'filename-native-focus-select'
+        $hostBounds = Get-VerifiedNativeBounds $filename $root
+        if (-not [PdfWorkbenchDialogBridge]::SelectFilename($filename.native_handle, $OwnedWindowHandle, $OwnedProcessId,
+            $hostBounds[0], $hostBounds[1], $hostBounds[2], $hostBounds[3])) { Stop-UiaSave 'filename-native-focus-select-failed' }
+        $inputClock = [Diagnostics.Stopwatch]::StartNew()
+        foreach ($unit in $SavePath.ToCharArray()) {
+            $script:FailureCode = 'filename-native-character-input'
+            if ($inputClock.ElapsedMilliseconds -gt 20000) { Stop-UiaSave 'filename-native-input-deadline' }
+            # Refresh the exact host rectangle/ownership before every UTF-16
+            # code unit; C# rechecks the HWND, parents, readonly style and bounds.
+            $hostBounds = Get-VerifiedNativeBounds $filename $root
+            if (-not [PdfWorkbenchDialogBridge]::FilenameChar($filename.native_handle, $OwnedWindowHandle, $OwnedProcessId,
+                $hostBounds[0], $hostBounds[1], $hostBounds[2], $hostBounds[3], [int]$unit)) {
+                Stop-UiaSave 'filename-native-character-input-failed'
+            }
+        }
+        $script:FailureCode = 'filename-native-readback'
+        $hostBounds = Get-VerifiedNativeBounds $filename $root
+        if (-not [PdfWorkbenchDialogBridge]::VerifyFilename($filename.native_handle, $OwnedWindowHandle, $OwnedProcessId,
+            $hostBounds[0], $hostBounds[1], $hostBounds[2], $hostBounds[3], $SavePath)) { Stop-UiaSave 'filename-native-readback-mismatch' }
+        $bridgeInfo.readback_verified = $true
+    } else {
+        if ($filename.native_handle -ne 0) { $bridgeInfo.input_mode = 'uia-value-pattern' }
+        $script:FailureCode = 'filename-focus'
+        $filename.element.SetFocus()
+        $script:FailureCode = 'filename-write'
+        $filename.pattern.SetValue($SavePath)
+        $script:FailureCode = 'filename-readback'
+        if (-not [string]::Equals($filename.pattern.Current.Value, $SavePath, [StringComparison]::Ordinal)) {
+            Stop-UiaSave 'filename-readback-mismatch'
+        }
+        if ($filename.native_handle -ne 0) { $bridgeInfo.readback_verified = $true }
     }
     # Focus commits the filename edit before invoking Save. Capture all evidence
     # first: invoking Save can destroy the dialog and invalidate every element.
