@@ -31,15 +31,19 @@ async function freePort() {
   const listener=net.createServer(); await new Promise(resolve=>listener.listen(0,'127.0.0.1',resolve));
   const port=listener.address().port; await new Promise(resolve=>listener.close(resolve)); return port;
 }
+function safeDriverDiagnostic(value) {
+  return String(value || '').replace(/#token=[^\s"<>]+/gi,'#token=[redacted]')
+    .replace(/https?:\/\/[^\s"<>]+/gi,'[URL hidden]').slice(0,1600);
+}
 async function wd(method, endpoint, body) {
   const response=await fetch(`http://127.0.0.1:${driverPort}${endpoint}`,{
     method,headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),
     signal:AbortSignal.timeout(180000)});
   const result=await response.json();
   if(!response.ok || result.value?.error) {
-    // Never echo native driver messages or a document URL: a failing WebView
-    // attach may include an authentication fragment in diagnostic text.
-    throw new Error(`Native WebDriver ${method} failed (${response.status}, ${String(result.value?.error||'unknown').replace(/[^a-z -]/gi,'')}).`);
+    // Preserve a bounded cause while removing URLs/session fragments before
+    // it can reach the report or public CI log.
+    throw new Error(`Native WebDriver ${method} failed (${response.status}, ${String(result.value?.error||'unknown').replace(/[^a-z -]/gi,'')}). ${safeDriverDiagnostic(result.value?.message)}`);
   }
   return result.value;
 }
@@ -112,7 +116,9 @@ async function open(state,probeDirectory,extra=[]) {
   // prior PID as evidence for a newly launched application.
   await fs.rm(path.join(probeDirectory,'desktop-probe.json'),{force:true});
   const result=await wd('POST','/session',{capabilities:{alwaysMatch:{'tauri:options':{
-    application:exe,args:['--state-dir',state,'--test-probe-dir',probeDirectory,...extra]}}}});
+    // EdgeDriver treats args as switches; values must use '=' so a Chinese or
+    // space-containing path is not parsed as another standalone switch.
+    application:exe,args:[`--state-dir=${state}`,`--test-probe-dir=${probeDirectory}`,...extra]}}}});
   session=result.sessionId;
   assert(session,'Native WebDriver did not return a session.');
   await wd('POST',`/session/${session}/timeouts`,{script:90000,pageLoad:90000,implicit:0});

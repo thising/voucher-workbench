@@ -4,7 +4,7 @@
 
 ## 当前状态（2026-11-03）
 
-用户已明确授权固定当前功能基线、统一文档、运行Windows CI并准备客户软件包，之前的CI暂停要求已解除。本机功能和原生窗口验证已完成。首次固定源码 `e232dac028befd6a79cadfee36e4e789dcd06865` 的[Windows CI #16](https://github.com/thising/voucher-workbench/actions/runs/41480619765)通过167项Rust测试（核心165、桌面2，另1项私有OCR跳过）、启动矩阵、构建及headless兼容；真实桌面阶段在便携/安装版EXE一致性处失败，未交付附件。打包修复已准备重跑，尚不标记为发行通过。客户Windows10实际双击、组件安装、单位安全策略和真实资料验收始终单列，不以CI代替。
+用户已明确授权固定当前功能基线、统一文档、运行Windows CI并准备客户软件包，之前的CI暂停要求已解除。本机功能和原生窗口验证已完成。首次固定源码 `e232dac028befd6a79cadfee36e4e789dcd06865` 的[Windows CI #16](https://github.com/thising/voucher-workbench/actions/runs/41480619765)通过167项Rust测试（核心165、桌面2，另1项私有OCR跳过）、启动矩阵、构建及headless兼容；真实桌面阶段在便携/安装版EXE一致性处失败，未交付附件。[第二轮CI #17](https://github.com/thising/voucher-workbench/actions/runs/41484740038)，源码 `d280a292f4fa90b759c2a8186eedc682ecdc41eb`，已通过便携/安装EXE一致性，但首次WebDriver会话创建失败。现已修订测试驱动参数并准备第三轮，尚不标记为发行通过。客户Windows10实际双击、组件安装、单位安全策略和真实资料验收始终单列，不以CI代替。
 
 版本固定为0.6.0；构件准确源码以随包 `release-source.json` 的 `source_commit` 及同轮CI为准，ZIP逐文件清单在 `package-manifest.json`，附件大小、SHA256及双Cargo.lock摘要在 `pdf-workbench-0.6.0-windows-x64-release.json`。完成CI和独立验包后再补充本页的构建来源、附件及校验结果。
 
@@ -55,7 +55,9 @@ WebView2已安装直接使用；安装包缺少时按需下载微软官方引导
 
 CI仅上传受限合成截图与摘要，不上传含token的原始服务日志。成功后下载附件，独立核对ZIP全文件SHA/大小/白名单、Windows x64 GUI子系统PE、便携与安装版一致证据、来源提交、双锁、模型/运行库/许可及离线附件签名检查结果，再整理客户目录及总校验表。真实界面截图须查看，不以编译或替身代替。
 
-**本轮构件状态：首次原生验收失败，已准备打包修复重跑；附件和SHA256待完整通过并独立验包后填写。**
+第二轮还发现测试启动参数按普通argv拆分传递，违反[微软EdgeOptions约定](https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge-options)：带值开关应为 `--name=value`。测试已修正中文/空格路径参数，补充实际会话边界回归及有界脱敏驱动错误，外层报告保留内层原因。该修复未改业务或桌面运行时代码；本次会话失败的最终归因和完整原生结果待重验。
+
+**本轮构件状态：准备第三轮CI；附件和SHA256待完整通过并独立验包后填写。**
 
 开发重建入口：`pwsh -File app/tools/build-windows-desktop.ps1`；`-CheckOnly`只检查，输出与缓存支持隔离目录，同名发行文件拒绝覆盖。准确依赖许可与源码归档地址随包提供。
 

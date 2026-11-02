@@ -23,7 +23,10 @@ function Write-DesktopResult([bool]$Passed, [string]$Phase, [string]$Failure = '
     } else { @{ checks = @() } }
     $result['passed'] = $Passed
     $result['phase'] = $Phase
-    if ($Failure) { $result['failure'] = $Failure -replace '#token=[^\s"<>]+', '#token=[redacted]' }
+    if ($Failure) {
+        $detail = $Failure -replace '#token=[^\s"<>]+', '#token=[redacted]'
+        if ($result['failure']) { $result['outer_failure'] = $detail } else { $result['failure'] = $detail }
+    }
     $result | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8NoBOM
 }
 if (Test-Path -LiteralPath $WorkDirectory) { throw 'The desktop test directory already exists; refusing to reuse data.' }
