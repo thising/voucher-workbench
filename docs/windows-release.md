@@ -4,7 +4,7 @@
 
 ## 当前状态（2026-11-03）
 
-用户已明确授权固定当前功能基线、统一文档、运行Windows CI并准备客户软件包，之前的CI暂停要求已解除。本机功能和原生窗口验证已完成。首次固定源码 `e232dac028befd6a79cadfee36e4e789dcd06865` 的[Windows CI #16](https://github.com/thising/voucher-workbench/actions/runs/41480619765)通过167项Rust测试（核心165、桌面2，另1项私有OCR跳过）、启动矩阵、构建及headless兼容；真实桌面阶段在便携/安装版EXE一致性处失败，未交付附件。[第二轮CI #17](https://github.com/thising/voucher-workbench/actions/runs/41484740038)，源码 `d280a292f4fa90b759c2a8186eedc682ecdc41eb`，已通过便携/安装EXE一致性，但首次WebDriver会话创建失败。现已修订测试驱动参数并准备第三轮，尚不标记为发行通过。客户Windows10实际双击、组件安装、单位安全策略和真实资料验收始终单列，不以CI代替。
+用户已明确授权固定当前功能基线、统一文档、运行Windows CI并准备客户软件包，之前的CI暂停要求已解除。本机功能和原生窗口验证已完成。首次固定源码 `e232dac028befd6a79cadfee36e4e789dcd06865` 的[Windows CI #16](https://github.com/thising/voucher-workbench/actions/runs/41480619765)通过167项Rust测试（核心165、桌面2，另1项私有OCR跳过）、启动矩阵、构建及headless兼容；真实桌面阶段在便携/安装版EXE一致性处失败，未交付附件。[第二轮CI #17](https://github.com/thising/voucher-workbench/actions/runs/41484740038)，源码 `d280a292f4fa90b759c2a8186eedc682ecdc41eb`，已通过便携/安装EXE一致性，但首次WebDriver会话创建失败。[第三轮CI #18](https://github.com/thising/voucher-workbench/actions/runs/41487723974)，源码 `6de1db38eebe8b10f93fa7691ecbc6aa55d470e6`，已通过7项真实窗口/三栏/PDF预览旋转/Pointer排序/重命名与合并，失败停在原生另存副本未抵达指定位置。该轮仍不作客户交付。客户Windows10实际双击、组件安装、单位安全策略和真实资料验收始终单列，不以CI代替。
 
 版本固定为0.6.0；构件准确源码以随包 `release-source.json` 的 `source_commit` 及同轮CI为准，ZIP逐文件清单在 `package-manifest.json`，附件大小、SHA256及双Cargo.lock摘要在 `pdf-workbench-0.6.0-windows-x64-release.json`。完成CI和独立验包后再补充本页的构建来源、附件及校验结果。
 
@@ -40,7 +40,7 @@ WebView2已安装直接使用；安装包缺少时按需下载微软官方引导
 - 前端59次API、193个DOM控件及Pointer捕获/21类取消回归通过。真实原生手柄排序、外部释放取消、PDF页码保留、同记录重启、命名清错、移除/恢复、原生保存和任务退出保护已验。
 - 5张合成图真实OCR首次调整1/未变4，颜色与方向详情只列该图；缓存重跑调整0/未变5，角度保持。原生窗口及最终release业务API均验证。
 - 合成既存PDF实际直接覆盖2份5页，无旧PDF/登记副本及临时残留，5个来源摘要不变；全部5页经Poppler渲染并查看，顺序与角度正确。最终release API成品与原生输出摘要相同。另有混合PDF/图片6份10页及4例签名外观逐像素一致证据，未覆盖客户成品。
-- 原本地入口 `.local/pdf-workbench-trial/启动PDF工作台.command` 已更新为release，更新前23个记录文件字节保持，原3条历史和最新计划可继续，HTML/JS/CSS与最终源码一致。后续用户试用可新增记录，不将23视为永久文件数。
+- 2026-11-02原本地入口 `.local/pdf-workbench-trial/启动PDF工作台.command` 已更新为release，更新前23个记录文件字节保持，原3条历史和最新计划可继续，HTML/JS/CSS与当时本机验证源码一致。后续用户试用可新增记录，不将23视为永久文件数。当前Windows基线另含下述窄屏CSS修正，现有Mac窗口未因此重启换版。
 - 现有Windows GNU目标全目标编译检查通过；这只证明条件编译，不替代Windows MSVC、WebView2或安装器实测。
 
 扫描性能证据仅限本机暖缓存：3274个来源一次只读核心扫描约2.486秒，保留完整SHA与解析检查；不包含窗口、索引和记录写入，不代表客户PC耗时或整批加速倍数。此前2份签名拒绝是修订前规则；现已按上述静态外观导入。原始证据、截图和指纹保留在本地验收目录，不公开业务数据。
@@ -55,9 +55,13 @@ WebView2已安装直接使用；安装包缺少时按需下载微软官方引导
 
 CI仅上传受限合成截图与摘要，不上传含token的原始服务日志。成功后下载附件，独立核对ZIP全文件SHA/大小/白名单、Windows x64 GUI子系统PE、便携与安装版一致证据、来源提交、双锁、模型/运行库/许可及离线附件签名检查结果，再整理客户目录及总校验表。真实界面截图须查看，不以编译或替身代替。
 
-第二轮还发现测试启动参数按普通argv拆分传递，违反[微软EdgeOptions约定](https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge-options)：带值开关应为 `--name=value`。测试已修正中文/空格路径参数，补充实际会话边界回归及有界脱敏驱动错误，外层报告保留内层原因。该修复未改业务或桌面运行时代码；本次会话失败的最终归因和完整原生结果待重验。
+第二轮还发现测试启动参数按普通argv拆分传递，违反[微软EdgeOptions约定](https://learn.microsoft.com/en-us/microsoft-edge/webdriver/capabilities-edge-options)：带值开关应为 `--name=value`。测试已修正中文/空格路径参数，补充实际会话边界回归及有界脱敏驱动错误，外层报告保留内层原因。第三轮实际会话及后续7项原生检查已通过，验证了该驱动参数修订。业务和桌面运行时代码未改。
 
-**本轮构件状态：准备第三轮CI；附件和SHA256待完整通过并独立验包后填写。**
+第三轮另存自动化使用第一个可见Edit ID1001，存在误选搜索框的风险；保存返回成功却未落在请求路径。测试助手现仅接受唯一的文件名主机（cmb13=1148祖先，或直接经典edt1）下的编辑控件，写入后以有超时的WM_GETTEXT精确读回，并在核验文件SHA前独立比对native返回路径。C#控制器编译、路径命名空间/大小写归一化及59API/193DOM回归通过；完整原生结果待第四轮验证，产品功能未改。
+
+第三轮真实Windows截图还发现1000px视口三栏最小宽度约1003px，而内容区约945px，导致右栏裁切。仅在现有窄屏规则内收窄列最小宽度并允许预览控件换行，加入工作区横向溢出及放大按钮右边界断言；Rust/前端业务逻辑保持冻结。该CSS修正待第四轮截图及断言复核。
+
+**本轮构件状态：准备第四轮CI；附件和SHA256待完整通过并独立验包后填写。**
 
 开发重建入口：`pwsh -File app/tools/build-windows-desktop.ps1`；`-CheckOnly`只检查，输出与缓存支持隔离目录，同名发行文件拒绝覆盖。准确依赖许可与源码归档地址随包提供。
 
@@ -71,4 +75,4 @@ CI仅上传受限合成截图与摘要，不上传含token的原始服务日志�
 - 0.5.0线程版：[CI #8](https://github.com/thising/voucher-workbench/actions/runs/41375857170)，源码196f3ca，旧规格历史。
 - 前轮150/2回归及覆盖归档证据属于旧修订，当前覆盖已不保留副本；已有历史归档保留，不将旧验证冒充当前无备份行为。
 
-本轮空间清理只处理已核实可再生成的项目构建缓存和重复下载/解压材料；保留源码、原件、输出、处理记录、有效运行依赖、当前试用入口、必要验收证据及历史交付。实际删除清单、前后占用及释放量在本地验收目录记录，完成后补记本页结果。
+本轮已清理8处可再生成的项目debug/GNU构建缓存、旧验包解压目录及重复工具压缩包，目录占用合计16.44GiB，实测磁盘可用空间增加16.07GiB。删除前确认缓存无进程占用；当前试用EXE、运行中release、模型/运行库及3个历史客户包共8个保护文件SHA256保持。源码、输入、输出PDF、处理记录、有效工具链及验收证据均保留。清理独立于待完成的远端GUI驱动验收，详细清单和空间测量在本地 `.local/windows-060-qualification/cleanup-result.json`。

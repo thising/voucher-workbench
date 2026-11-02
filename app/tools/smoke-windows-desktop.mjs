@@ -35,6 +35,12 @@ function safeDriverDiagnostic(value) {
   return String(value || '').replace(/#token=[^\s"<>]+/gi,'#token=[redacted]')
     .replace(/https?:\/\/[^\s"<>]+/gi,'[URL hidden]').slice(0,1600);
 }
+function normalizedWindowsPath(value) {
+  let text=String(value || '');
+  if(text.toUpperCase().startsWith('\\\\?\\UNC\\'))text='\\\\'+text.slice(8);
+  else if(text.startsWith('\\\\?\\'))text=text.slice(4);
+  return path.win32.normalize(text).toLowerCase();
+}
 async function wd(method, endpoint, body) {
   const response=await fetch(`http://127.0.0.1:${driverPort}${endpoint}`,{
     method,headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),
@@ -190,6 +196,12 @@ try {
   assert.equal(await js(`return document.querySelector('#reviewed-file')===null;`),true);
   await screenshot('desktop-window.png');
   report.checks.push('offline-pdfjs-real-canvas-and-per-page-manual-rotation');
+  const viewport=await js(`const area=document.querySelector('.work-area'),pane=document.querySelector('.preview-pane').getBoundingClientRect(),zoom=document.querySelector('#zoom-in').getBoundingClientRect();return {width:innerWidth,height:innerHeight,work_area_width:area.clientWidth,work_area_scroll_width:area.scrollWidth,preview_right:pane.right,zoom_right:zoom.right};`);
+  assert(viewport.width>=1000,'The native host did not provide the supported minimum viewport.');
+  assert(viewport.work_area_scroll_width<=viewport.work_area_width+1,'The three panes overflow the native viewport.');
+  assert(viewport.preview_right<=viewport.width && viewport.zoom_right<=viewport.preview_right,'Native preview controls are clipped.');
+  report.viewport=viewport;
+  report.checks.push('real-ui-three-pane-and-preview-controls-visible-at-native-viewport');
 
   // Exercise the native pointer gesture, then the existing move/top buttons.
   await dragFileHandle(2,0);
@@ -219,10 +231,14 @@ try {
 
   const savedPDF=path.join(work,'原生另存 副本.pdf');
   const copy=await nativeSave(pid,'save_job_output',{jobId:completed.id,groupId:delivered.voucher_id},savedPDF);
-  assert(copy.ok && copy.value.saved);assert.equal(hash(await fs.readFile(savedPDF)),hash(outputBytes));
+  assert(copy.ok && copy.value.saved);
+  assert.equal(normalizedWindowsPath(copy.value.path),normalizedWindowsPath(savedPDF),'Native PDF save selected an unexpected destination.');
+  assert.equal(hash(await fs.readFile(savedPDF)),hash(outputBytes));
   const savedReport=path.join(work,'原生另存 报告.json');
   const saved=await nativeSave(pid,'save_job_report',{jobId:completed.id},savedReport);
-  assert(saved.ok && saved.value.saved);assert.equal(JSON.parse(await fs.readFile(savedReport,'utf8')).job.id,completed.id);
+  assert(saved.ok && saved.value.saved);
+  assert.equal(normalizedWindowsPath(saved.value.path),normalizedWindowsPath(savedReport),'Native report save selected an unexpected destination.');
+  assert.equal(JSON.parse(await fs.readFile(savedReport,'utf8')).job.id,completed.id);
   report.checks.push('real-native-save-pdf-and-report-verified-bytes');
 
   // Existing destinations are runtime decisions, including outputs produced

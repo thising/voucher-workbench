@@ -272,5 +272,8 @@ const guard=setTimeout(()=>{console.error('UI state regression timed out');proce
  assert.deepEqual(JSON.parse(JSON.stringify(requests[0].capabilities.alwaysMatch['tauri:options'].args)),['--state-dir=C:\\合成 资料\\处理记录','--test-probe-dir=C:\\合成 探针','--startup-delay-ms=20']);
  const diagnostic=driverContext.safeDriverDiagnostic('version mismatch 152; http://127.0.0.1:1234/#token=synthetic-secret #token=separate-secret '+ 'x'.repeat(5000));
  assert(diagnostic.includes('version mismatch 152'));assert(!diagnostic.includes('synthetic-secret')&&!diagnostic.includes('separate-secret')&&!diagnostic.includes('127.0.0.1'));assert(diagnostic.length<=1600);
+ assert.equal(driverContext.normalizedWindowsPath("\\\\?\\C:\\合成 资料\\save.PDF"),driverContext.normalizedWindowsPath("c:\\合成 资料\\save.pdf"));
+ assert.equal(driverContext.normalizedWindowsPath("\\\\?\\UNC\\SERVER\\share\\file.pdf"),driverContext.normalizedWindowsPath("\\\\server\\share\\file.pdf"));
+
  clearTimeout(guard);console.log(`PDF workbench UI state regression passed: ${calls.length} API calls; ${ids.length} DOM IDs. Covers rename defaults/toggle/stale responses, async scan, current errors, remove/undo, output recovery, autosave focus/page, registered Pointer Events/capture/hit-test stubs, rotation, consent, threads/retry/native saves, runtime output decisions/races/cancel, actual rotation-change-only colors/logs/results, summary/legacy/cancel, signed-PDF warnings, native-session switch/diagnostic contracts and safe text rendering. Native pointer dragging remains a separate acceptance check.`);
 })().catch(error=>{clearTimeout(guard);console.error(error);process.exitCode=1;});

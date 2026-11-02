@@ -450,7 +450,8 @@ details[open] > summary::before { transform: rotate(90deg); }
   .source-grid { grid-template-columns: 1fr; gap: 15px; }
   .source-level .level-selection select { width: 210px; }
   .rename-preview-row { grid-template-columns: minmax(140px,.85fr) minmax(240px,1.5fr) minmax(135px,1fr); }
-  .three-pane { grid-template-columns: 235px 340px minmax(400px,1fr); }
+  .three-pane { min-width: 0; grid-template-columns: 210px 300px minmax(350px,1fr); }
+  .preview-controls { flex-wrap: wrap; }
   .review-legend > span:last-child { margin-left: 0; }
   .overview { gap: 17px; }
 }
