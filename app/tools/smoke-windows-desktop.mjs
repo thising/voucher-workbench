@@ -325,10 +325,10 @@ try {
   assert(['queued','running'].includes(busyAfter.status),'Synthetic OCR finished before the task-running activation could be verified.');
   assert(busyAfter.done>=busyBefore.done,'Repeated startup reset task progress.');
   await native(pid,'close');
-  await native(pid,'cancel',['-ExpectedText','任务或文件保存仍在进行','-ButtonText','继续处理']);
+  await native(pid,'cancel',['-ExpectedText','任务或文件保存仍在进行','-TaskButtonId','1001']);
   await until(async()=>(await probe(probes)).event==='close_cancelled_task_continues','native continue choice');
   assert(['queued','running'].includes((await api(`/jobs/${busyJob.id}`)).status),'Continue choice stopped the task.');
-  await native(pid,'close');await native(pid,'accept',['-ExpectedText','安全停止并退出','-ButtonText','安全停止并退出']);
+  await native(pid,'close');await native(pid,'accept',['-ExpectedText','安全停止并退出','-TaskButtonId','1000']);
   await exited(pid);await endSession();
   const stopped=JSON.parse(await fs.readFile(path.join(state,'jobs',`${busyJob.id}.json`),'utf8'));
   assert.equal(stopped.status,'cancelled','Safe close did not persist a cancelled task.');

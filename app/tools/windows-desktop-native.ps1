@@ -7,10 +7,13 @@ param(
     [Parameter(Mandatory)][ValidateSet('minimize','close','cancel','accept','save','error')][string]$Action,
     [string]$SavePath,
     [string]$ExpectedText,
-    [string]$ButtonText
+    [ValidateSet(0,1,2,1000,1001)][int]$TaskButtonId = 0
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($TaskButtonId -ne 0 -and ($Action -notin @('accept','cancel') -or -not $ExpectedText)) {
+    throw 'TaskDialog commands require a declared choice and an exact expected explanation.'
+}
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -53,6 +56,14 @@ public static class OwnedDesktop {
     if(!PostMessageW(candidates[0],0xF5,IntPtr.Zero,IntPtr.Zero))throw new InvalidOperationException("Owned native button invocation failed.");
     return true;
   }
+  public static bool TaskButton(IntPtr h,int id,int pid) {
+    uint owner;GetWindowThreadProcessId(h,out owner);
+    if(owner!=(uint)pid || Class(h)!="#32770" || !IsWindowVisible(h) || !IsWindowEnabled(h))return false;
+    if(id!=1 && id!=2 && id!=1000 && id!=1001)return false;
+    // Caller explicitly declares a TaskDialog and checks its exact text first.
+    // TDM_CLICK_BUTTON (WM_USER+102) triggers the real TaskDialog callback.
+    return PostMessageW(h,1126,new IntPtr(id),IntPtr.Zero);
+  }
   public static string SaveControls(IntPtr h) {
     var info=new List<string>();
     EnumChildWindows(h,(c,p)=> {
@@ -79,7 +90,7 @@ do {
     Start-Sleep -Milliseconds 100
 } while ([DateTimeOffset]::UtcNow -lt $deadline)
 if ($window -eq [IntPtr]::Zero) { throw 'The expected owned native window did not appear.' }
-function Invoke-OwnedDialogUia([string]$RequestedButton = '') {
+function Invoke-OwnedDialogUia {
     if (-not $ExpectedText) { throw 'Owned dialog UIA requires the expected explanation.' }
     $textStart = [Diagnostics.ProcessStartInfo]::new()
     $textStart.FileName = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'
@@ -90,7 +101,6 @@ function Invoke-OwnedDialogUia([string]$RequestedButton = '') {
     $textStart.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $textStart.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-Mta','-File',(Join-Path $PSScriptRoot 'windows-dialog-text-uia.ps1'),'-OwnedProcessId',[string]$OwnedProcessId,'-OwnedWindowHandle',$window.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture),'-ExpectedText',$ExpectedText)) { $textStart.ArgumentList.Add($argument) }
-    if ($RequestedButton) { $textStart.ArgumentList.Add('-ButtonText'); $textStart.ArgumentList.Add($RequestedButton) }
     $textProcess = [Diagnostics.Process]::Start($textStart)
     try {
         $textOutput = $textProcess.StandardOutput.ReadToEndAsync()
@@ -107,10 +117,6 @@ function Invoke-OwnedDialogUia([string]$RequestedButton = '') {
             $textFailure = if ([string]$textResult.failure -match '^[a-z0-9-]{1,80}$') { [string]$textResult.failure } else { 'assertion-failed' }
             throw "The owned dialog did not contain the expected Chinese explanation ($textFailure)."
         }
-        if ($RequestedButton -and (-not $textResult.PSObject.Properties['activated'] -or
-            $textResult.activated -isnot [bool] -or $textResult.activated -ne $true)) {
-            throw 'Owned dialog UIA did not activate the exact requested button.'
-        }
         return $textResult
     } finally { if (-not $textProcess.HasExited) { $textProcess.Kill() }; $textProcess.Dispose() }
 }
@@ -123,19 +129,25 @@ if ($ExpectedText -and -not $contents.Contains($ExpectedText,[StringComparison]:
     $textSource = 'uia'
     $textControlsChecked = [Math]::Min(512,[Math]::Max(0,[int]$textResult.controls_checked))
 }
+$buttonSource = 'win32'
 switch ($Action) {
     minimize { [OwnedDesktop]::Minimize($window) }
     close { [OwnedDesktop]::Close($window) }
     cancel {
-        if (-not [OwnedDesktop]::Button($window,1001,$OwnedProcessId) -and -not [OwnedDesktop]::Button($window,2,$OwnedProcessId)) {
-            if ($ButtonText) { $null = Invoke-OwnedDialogUia $ButtonText }
-            else { [OwnedDesktop]::Close($window) }
+        if ($TaskButtonId -ne 0) {
+            if (-not [OwnedDesktop]::TaskButton($window,$TaskButtonId,$OwnedProcessId)) { throw 'Owned TaskDialog command was not accepted.' }
+            $buttonSource = 'task-dialog-message'
+        } elseif (-not [OwnedDesktop]::Button($window,1001,$OwnedProcessId) -and -not [OwnedDesktop]::Button($window,2,$OwnedProcessId)) {
+            [OwnedDesktop]::Close($window)
+            $buttonSource = 'close-message'
         }
     }
     accept {
-        if (-not [OwnedDesktop]::Button($window,1000,$OwnedProcessId) -and -not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) {
-            if ($ButtonText) { $null = Invoke-OwnedDialogUia $ButtonText }
-            else { throw 'The owned confirmation button was not found.' }
+        if ($TaskButtonId -ne 0) {
+            if (-not [OwnedDesktop]::TaskButton($window,$TaskButtonId,$OwnedProcessId)) { throw 'Owned TaskDialog command was not accepted.' }
+            $buttonSource = 'task-dialog-message'
+        } elseif (-not [OwnedDesktop]::Button($window,1000,$OwnedProcessId) -and -not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) {
+            throw 'The owned confirmation button was not found.'
         }
     }
     save {
@@ -167,6 +179,7 @@ switch ($Action) {
     error { if (-not [OwnedDesktop]::Button($window,1,$OwnedProcessId)) { throw 'The owned native error acknowledgement was not found.' } }
 }
 $result = [ordered]@{controlled=$true; action=$Action; owned_pid=$OwnedProcessId; expected_text_checked=[bool]$ExpectedText}
+if ($Action -in @('accept','cancel')) { $result['button_source'] = $buttonSource }
 if ($ExpectedText) { $result['expected_text_source'] = $textSource; $result['text_controls_checked'] = $textControlsChecked }
 if ($Action -eq 'save') { $result['save_target_verified'] = $true; $result['filename_controls'] = $saveControlResult.filename_controls }
 $result | ConvertTo-Json -Depth 10 -Compress

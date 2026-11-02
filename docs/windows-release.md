@@ -85,7 +85,9 @@ NSIS卸载验收另按[官方命令行](https://nsis.sourceforge.io/Docs/Chapter
 
 [第十二轮CI #27](https://github.com/thising/voucher-workbench/actions/runs/41514251194)，源码 `71fa933e543e6a04d5d2a2dca24644f948a5b727`，快速预检的保存、中文正文及取消通过，确认按钮未由直接child GetDlgItem找到。测试现在传入明确按钮名称，保留原生句柄优先，并对虚拟按钮使用exact owned root内唯一可见可用、Name完全相同的InvokePattern；调用后仍验证实际确认/取消结果及产品任务状态。
 
-**本轮构件状态：准备第十三轮快速预检与完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
+[第十三轮CI #28](https://github.com/thising/voucher-workbench/actions/runs/41515737828)，源码 `05fdc802289c938658e09b0809ab1217ac5988bf`，快速TaskDialog预检未找到通用UIA按钮候选。改为调用[微软TaskDialog专用点击消息](https://learn.microsoft.com/en-us/windows/win32/controls/tdm-click-button)，只对调用方显式声明、PID/根窗口/可见启用和期望正文已验证的TaskDialog发送1126。普通预检按钮1/2；[锁定rfd0.17.2](https://raw.githubusercontent.com/PolyMeilex/rfd/0.17.2/src/backend/win_cid/message_dialog.rs)自定义确认/取消固定1000/1001。保留任务对话框真实返回值/任务继续/取消持久化等核验；移除不适用的UIA按钮假设，正文助手恢复已验证的只读实现，保存控制器不变。
+
+**本轮构件状态：准备第十四轮快速预检及完整CI；完整Windows产品验收、附件/SHA256尚未完成。**
 
 CI在昂贵构建之前增加独立、仅控测试自有窗口的现代另存对话框预检：验证文件名控制器的真实写入、读回和落盘位置，快速暴露UIA适配问题。该预检不能代替后面的随包Tauri真实保存；完整Rust、兼容、5轮并发稳定性、便携与安装窗口门禁全部保留。10份PowerShell语法及actionlint通过。
 

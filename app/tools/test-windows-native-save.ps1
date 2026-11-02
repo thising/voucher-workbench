@@ -79,7 +79,7 @@ try {
     if (-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0) { throw 'Owned save fixture did not exit successfully.' }
     if ([IO.File]::ReadAllText($expected) -cne 'synthetic-native-save-probe') { throw 'Owned save destination was not written correctly.' }
     $message = '任务或文件保存仍在进行'
-    foreach ($choice in @(@{action='cancel';button=2;label='Cancel'},@{action='accept';button=1;label='OK'})) {
+    foreach ($choice in @(@{action='cancel';button=2},@{action='accept';button=1})) {
         $choiceStart = [Diagnostics.ProcessStartInfo]::new()
         $choiceStart.FileName = $launch.FileName
         $choiceStart.UseShellExecute = $false
@@ -87,7 +87,7 @@ try {
         foreach ($argument in @('-NoLogo','-NoProfile','-NonInteractive','-Sta','-File',$choiceFixturePath,'-Root',$work,'-Text',$message,'-ExpectedButton',[string]$choice.button)) { $choiceStart.ArgumentList.Add($argument) }
         $choiceProcess = [Diagnostics.Process]::Start($choiceStart)
         try {
-            $choiceControl = & (Join-Path $PSScriptRoot 'windows-desktop-native.ps1') -OwnedProcessId $choiceProcess.Id -Action $choice.action -ExpectedText $message -ButtonText $choice.label | ConvertFrom-Json
+            $choiceControl = & (Join-Path $PSScriptRoot 'windows-desktop-native.ps1') -OwnedProcessId $choiceProcess.Id -Action $choice.action -ExpectedText $message -TaskButtonId $choice.button | ConvertFrom-Json
             if (-not $choiceControl.controlled -or -not $choiceControl.expected_text_checked) { throw 'Owned task-dialog text and choice were not verified.' }
             if (-not $choiceProcess.WaitForExit(15000) -or $choiceProcess.ExitCode -ne 0) { throw 'Owned task-dialog fixture failed.' }
             if ([IO.File]::ReadAllText((Join-Path $work 'choice.txt')) -cne [string]$choice.button) { throw 'Owned task-dialog result mismatch.' }
